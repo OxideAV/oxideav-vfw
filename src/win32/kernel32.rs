@@ -1592,15 +1592,36 @@ fn stub_close_handle(
     Ok(1)
 }
 
-/// `HANDLE CreateFileMappingA(...)`. Returns NULL → "no file
-/// mapping created" — the codec falls back to its in-memory path.
+/// `HANDLE CreateFileMappingA(HANDLE hFile, LPSECURITY_ATTRIBUTES,
+/// DWORD flProtect, DWORD dwMaxSizeHigh, DWORD dwMaxSizeLow,
+/// LPCSTR lpName)`. Round 12 — for `hFile == INVALID_HANDLE_VALUE`
+/// (-1) the call requests a pagefile-backed anonymous mapping;
+/// `IR50_32.DLL` uses this to share its huffman / DCT tables
+/// between concurrent decoder instances. Our sandbox is
+/// single-instance so we just allocate a fresh buffer of size
+/// `dwMaxSizeLow` and return its address as the handle. The
+/// matching `MapViewOfFile` returns the same address.
 fn stub_create_file_mapping_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let _h_file = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    let _attrs = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    let _protect = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    let _size_hi = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    let size_lo = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    let _name = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    if size_lo == 0 {
+        return Ok(0);
+    }
+    let addr = bump_alloc(state, size_lo)?;
+    let buf = vec![0u8; size_lo as usize];
+    mmu.write_initializer(addr, &buf)
+        .map_err(|t| trap_to_win32("CreateFileMappingA", t))?;
+    state.heap.insert(addr, buf);
+    Ok(addr)
 }
 
 /// `HANDLE CreateSemaphoreA(...)`. Returns a non-zero pseudo
@@ -1682,15 +1703,126 @@ fn stub_initialize_critical_section(
     Ok(0)
 }
 
+/// Walk a `IMAGE_RESOURCE_DIRECTORY` looking for an entry matching
+/// `key`. The directory's entries (named first, then ID-keyed) are
+/// laid out immediately after the 16-byte header. `dir_va` is the
+/// VA of the directory itself; `rsrc_base` is the VA of the
+/// top-level resource directory (used to resolve sub-directory
+/// offsets, which are relative to it).
+///
+/// Returns `Some((offset_to_data_or_dir, is_directory))` on match,
+/// where `offset_to_data_or_dir` is relative to `rsrc_base`.
+///
+/// `key` may be either an ID (`name & 0x8000_0000 == 0`, low 16
+/// bits = id) or a string-name (`name & 0x8000_0000 != 0`,
+/// low 31 bits = offset relative to `rsrc_base` of a UTF-16
+/// length-prefixed name). Round 12 only walks ID-keyed entries
+/// because `IR50_32.DLL`'s codec resources are all ID-keyed
+/// (RT_BITMAP / 112).
+fn rsrc_dir_lookup_id(
+    mmu: &Mmu,
+    _rsrc_base: u32,
+    dir_va: u32,
+    target_id: u32,
+) -> Option<(u32, bool)> {
+    // Header: NumberOfNamedEntries at offset 12, NumberOfIdEntries at 14.
+    let n_named = mmu.load16(dir_va + 12).ok()? as u32;
+    let n_id = mmu.load16(dir_va + 14).ok()? as u32;
+    let entries_va = dir_va + 16;
+    // ID entries follow the named ones.
+    for i in 0..n_id {
+        let e_va = entries_va + (n_named + i) * 8;
+        let name = mmu.load32(e_va).ok()?;
+        // Defensive: skip name-keyed entries in the ID table
+        // (PE format guarantees they don't appear there, but
+        // a malformed image shouldn't fault us).
+        if (name & 0x8000_0000) != 0 {
+            continue;
+        }
+        if name == target_id {
+            let off = mmu.load32(e_va + 4).ok()?;
+            let is_dir = (off & 0x8000_0000) != 0;
+            return Some((off & 0x7FFF_FFFF, is_dir));
+        }
+    }
+    None
+}
+
+/// Resolve a `(hModule, lpName, lpType)` triple to the VA of the
+/// `IMAGE_RESOURCE_DATA_ENTRY` for that resource. Returns `None`
+/// if the module has no resource directory or no matching entry.
+///
+/// Both `lpName` and `lpType` are interpreted as
+/// `MAKEINTRESOURCE`-style integers when their high 16 bits are
+/// zero (this is how `IR50_32.DLL` invokes us — type 2 = RT_BITMAP,
+/// name 112). Round 12 doesn't yet support string-keyed
+/// resources; if either argument is a pointer, return `None`.
+pub(crate) fn find_resource_data_entry(
+    state: &HostState,
+    mmu: &Mmu,
+    h_module: u32,
+    lp_name: u32,
+    lp_type: u32,
+) -> Option<u32> {
+    // hModule = 0 means "the calling module" — use the primary.
+    let h = if h_module == 0 {
+        state.primary_module_base
+    } else {
+        h_module
+    };
+    let rsrc_base = *state.module_resource_dirs.get(&h)?;
+    // MAKEINTRESOURCE check: high word zero → integer ID. PE
+    // resource tables store integer IDs as the low 31 bits with
+    // the high bit clear. lpName=112 fits in u16; same for lpType.
+    if lp_name & 0xFFFF_0000 != 0 || lp_type & 0xFFFF_0000 != 0 {
+        return None;
+    }
+    // Top-level: keyed by type. PE format guarantees the high
+    // bit of the offset is set (each top-level entry points to a
+    // sub-directory).
+    let (off_type, is_dir) = rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base, lp_type)?;
+    if !is_dir {
+        return None;
+    }
+    // Second-level: keyed by name (or ID).
+    let (off_name, is_dir) = rsrc_dir_lookup_id(mmu, rsrc_base, rsrc_base + off_type, lp_name)?;
+    if !is_dir {
+        return None;
+    }
+    // Third-level: keyed by language. We pick the first entry
+    // (LANG_NEUTRAL would be ideal but real codecs ship one
+    // language; IR50 ships 1033 = en-US).
+    let lang_dir_va = rsrc_base + off_name;
+    let n_named = mmu.load16(lang_dir_va + 12).ok()? as u32;
+    let n_id = mmu.load16(lang_dir_va + 14).ok()? as u32;
+    if n_named + n_id == 0 {
+        return None;
+    }
+    let first_entry = lang_dir_va + 16;
+    let off = mmu.load32(first_entry + 4).ok()?;
+    if (off & 0x8000_0000) != 0 {
+        // Should be a leaf, not another directory.
+        return None;
+    }
+    Some(rsrc_base + (off & 0x7FFF_FFFF))
+}
+
 /// `HRSRC FindResourceA(HMODULE, LPCSTR lpName, LPCSTR lpType)`.
-/// We have no PE resource table integration; return NULL.
+/// Round-12 walks the PE resource directory of `hModule` (or the
+/// primary module if NULL) looking for an `(lpType, lpName)`
+/// match. Returns the VA of the `IMAGE_RESOURCE_DATA_ENTRY`
+/// (the on-disk struct that points to the actual resource bytes)
+/// — `LoadResource` then dereferences this to a pointer.
 fn stub_find_resource_a(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("FindResourceA", t))?;
+    let lp_name = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("FindResourceA", t))?;
+    let lp_type = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("FindResourceA", t))?;
+    Ok(find_resource_data_entry(state, mmu, h_module, lp_name, lp_type).unwrap_or(0))
 }
 
 /// `BOOL FlushFileBuffers(HANDLE)`. Always succeeds.
@@ -1969,15 +2101,24 @@ fn stub_lc_map_string(
     Ok(0)
 }
 
-/// `HGLOBAL LoadResource(HMODULE hModule, HRSRC hResInfo)`. We
-/// have no resource table; return NULL.
+/// `HGLOBAL LoadResource(HMODULE hModule, HRSRC hResInfo)`.
+/// Round 12 — `hResInfo` is the `IMAGE_RESOURCE_DATA_ENTRY` VA
+/// returned by `FindResourceA`. The Win32 contract is that
+/// `LoadResource` returns an `HGLOBAL` whose only contract is
+/// being a valid argument to `LockResource` / `SizeofResource`;
+/// we simply return `hResInfo` itself (Wine and several MSDN
+/// samples do the same — both `LoadResource` and `LockResource`
+/// are no-ops on modern Windows since the resource bytes are
+/// already memory-mapped).
 fn stub_load_resource(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let _h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadResource", t))?;
+    let h_res_info = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LoadResource", t))?;
+    Ok(h_res_info)
 }
 
 /// `HLOCAL LocalHandle(LPCVOID pMem)`. Round-tripping a
@@ -2015,26 +2156,85 @@ fn stub_local_unlock(
     Ok(1)
 }
 
-/// `LPVOID LockResource(HGLOBAL)`. We never returned a resource
-/// from `LoadResource`; return NULL.
+/// `LPVOID LockResource(HGLOBAL)`. Round 12 — the `HGLOBAL` is
+/// the `IMAGE_RESOURCE_DATA_ENTRY` VA we returned from
+/// `FindResourceA` / `LoadResource`. The first dword of that
+/// struct is `OffsetToData` (an RVA, NOT relative to .rsrc),
+/// the second is `Size`. We resolve the RVA against the module
+/// base — since all sections including `.rsrc` are mapped into
+/// emulator memory at their preferred VA, the resource bytes
+/// are directly addressable.
 fn stub_lock_resource(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
-    _state: &mut HostState,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LockResource", t))?;
+    if h == 0 {
+        return Ok(0);
+    }
+    // First dword of IMAGE_RESOURCE_DATA_ENTRY = RVA.
+    let rva = match mmu.load32(h) {
+        Ok(v) => v,
+        Err(_) => return Ok(0),
+    };
+    // The RVA is relative to the module image base. We don't
+    // know exactly which module the resource belongs to; the
+    // primary module's base is the right answer for a
+    // single-codec sandbox (round 12). For multi-codec we'd
+    // need to thread hModule through.
+    if state.primary_module_base == 0 {
+        return Ok(0);
+    }
+    Ok(state.primary_module_base.wrapping_add(rva))
 }
 
-/// `LPVOID MapViewOfFile(...)`. Return NULL — CreateFileMappingA
-/// already returned NULL.
-fn stub_map_view_of_file(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+/// `DWORD SizeofResource(HMODULE, HRSRC)`. Round 12 — the
+/// `HRSRC` is the `IMAGE_RESOURCE_DATA_ENTRY` VA from
+/// `FindResourceA`; second dword is `Size`. We're asked to
+/// return the byte count. Not currently imported by IR50_32 but
+/// included for round-13 codec compatibility.
+#[allow(dead_code)]
+fn stub_sizeof_resource(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    Ok(0)
+    let _h_module = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SizeofResource", t))?;
+    let h_res_info = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("SizeofResource", t))?;
+    if h_res_info == 0 {
+        return Ok(0);
+    }
+    match mmu.load32(h_res_info + 4) {
+        Ok(v) => Ok(v),
+        Err(_) => Ok(0),
+    }
+}
+
+/// `LPVOID MapViewOfFile(HANDLE hFileMappingObject, DWORD desiredAccess,
+/// DWORD offsetHigh, DWORD offsetLow, SIZE_T numBytesToMap)`. Round
+/// 12 — `CreateFileMappingA` returned the buffer's start VA as
+/// the handle; the view is the entire buffer, so we return
+/// `hFileMappingObject` directly (offset 0, full size). Round-13
+/// might add real offset support if a codec ever calls with
+/// non-zero offset.
+fn stub_map_view_of_file(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
+    let _access = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
+    let _off_hi = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
+    let off_lo = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
+    let _num = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("MapViewOfFile", t))?;
+    if h == 0 {
+        return Ok(0);
+    }
+    Ok(h.wrapping_add(off_lo))
 }
 
 /// `HANDLE OpenFileMappingA(...)`. Return NULL.
@@ -2596,5 +2796,63 @@ mod tests {
         for i in 0..8u32 {
             assert_eq!(mmu.load8(new_addr + i).unwrap(), (i + 1) as u8);
         }
+    }
+
+    /// Round 12 — `FindResourceA` should walk a synthetic
+    /// 3-level resource directory and return the data-entry VA.
+    #[test]
+    fn find_resource_a_walks_synthetic_resource_directory() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // Build a tiny resource directory at 0x10000:
+        //   level 1 (type=2 → level 2)
+        //   level 2 (id=112 → level 3)
+        //   level 3 (lang=1033 → data entry @ 0x10080)
+        // …all relative to 0x10000.
+        // Map a region for it.
+        mmu.map(0x10000, 0x1000, Perm::R | Perm::W);
+        let rsrc_base = 0x10000u32;
+
+        // Level-1 dir at 0x10000 (16-byte hdr + 1 entry @ 0x10010).
+        mmu.store32(rsrc_base, 0).unwrap(); // characteristics
+        mmu.store32(rsrc_base + 4, 0).unwrap(); // timestamp
+        mmu.store32(rsrc_base + 8, 0).unwrap(); // versions (2x u16)
+        mmu.store16(rsrc_base + 12, 0).unwrap(); // num named
+        mmu.store16(rsrc_base + 14, 1).unwrap(); // num id
+        mmu.store32(rsrc_base + 16, 2).unwrap(); // entry: id = 2
+        mmu.store32(rsrc_base + 20, 0x8000_0020).unwrap(); // offset = 0x20, is_dir=1
+
+        // Level-2 dir at 0x10020 (= rsrc_base + 0x20). Same shape.
+        mmu.store16(rsrc_base + 0x20 + 12, 0).unwrap();
+        mmu.store16(rsrc_base + 0x20 + 14, 1).unwrap();
+        mmu.store32(rsrc_base + 0x20 + 16, 112).unwrap(); // id = 112
+        mmu.store32(rsrc_base + 0x20 + 20, 0x8000_0040).unwrap(); // → 0x40, is_dir=1
+
+        // Level-3 dir at 0x10040.
+        mmu.store16(rsrc_base + 0x40 + 12, 0).unwrap();
+        mmu.store16(rsrc_base + 0x40 + 14, 1).unwrap();
+        mmu.store32(rsrc_base + 0x40 + 16, 1033).unwrap(); // lang
+        mmu.store32(rsrc_base + 0x40 + 20, 0x60).unwrap(); // → 0x60, is_data
+
+        // Data entry at 0x10060: rva, size, codepage, reserved.
+        mmu.store32(rsrc_base + 0x60, 0xC000).unwrap();
+        mmu.store32(rsrc_base + 0x60 + 4, 0x1234).unwrap();
+
+        // Register a fake module @ 0x10000000 with rsrc at our test base.
+        let h_module = 0x10000000u32;
+        state.modules.insert("synth.dll".into(), h_module);
+        state.module_resource_dirs.insert(h_module, rsrc_base);
+
+        push_args_and_call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "kernel32.dll",
+            "FindResourceA",
+            &[h_module, 112, 2],
+        )
+        .unwrap();
+        // Should land on the data-entry VA.
+        assert_eq!(cpu.regs.get32(Reg32::Eax), rsrc_base + 0x60);
     }
 }

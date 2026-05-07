@@ -229,6 +229,16 @@ impl<'a> Loader<'a> {
             .modules
             .insert(name.to_ascii_lowercase(), load_base);
 
+        // Round 12 — record the resource directory location so
+        // FindResourceA / LoadResource / LockResource can walk it.
+        // PE/COFF Data Directory entry 2 is the Resource Table.
+        let rsrc = parsed.optional.data_directories[2];
+        if rsrc.virtual_address != 0 && rsrc.size != 0 {
+            self.host
+                .module_resource_dirs
+                .insert(load_base, load_base.wrapping_add(rsrc.virtual_address));
+        }
+
         Ok(image)
     }
 }

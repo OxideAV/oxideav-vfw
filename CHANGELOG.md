@@ -8,6 +8,80 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 12: **`ICDecompress` against `IR50_32.DLL` returns
+  `ICERR_OK` with a populated 320×240 RGB24 buffer.** Round 11
+  plumbed `DRV_LOAD` + `DRV_ENABLE` through `ic_open` so the
+  codec's table-init chain runs at all; round 12 closes the
+  actual gate. Bisecting the round-11 trace ring (4682
+  instructions through `ICDecompress`) located a normal-RET
+  trap at `0x1004f7f7` (`mov eax, -100; ret`), reached via a
+  jump-table at `0x1004f80c[2]` from a deeper validator call
+  whose return value (= 2) the dispatcher mapped to
+  `ICERR_BADIMAGE`. The validator returned 2 because
+  `[0x1009c770]` (the codec's huffman / inverse-DCT table base
+  pointer, set by `0x10001327: mov [0x1009c770], ecx`) was
+  still NULL — `IR50_32.DLL`'s `DRV_LOAD` chain copies those
+  tables out of two `RT_BITMAP` PE resources (RT_BITMAP/112 and
+  /113, 20264 bytes each) which our `kernel32!FindResourceA` /
+  `LoadResource` / `LockResource` stubs returned NULL for.
+  Round 12 implements those three against the loaded PE's
+  resource directory (PE Data Directory entry 2): `FindResourceA`
+  walks the 3-level directory (TYPE → NAME → LANG) honouring
+  `MAKEINTRESOURCE`-style integer keys, returning the
+  `IMAGE_RESOURCE_DATA_ENTRY` VA; `LoadResource` is a passthrough;
+  `LockResource` resolves the entry's RVA against the module's
+  image base. The codec also wraps its huffman-table copy in a
+  named-shared-memory cache (`CreateFileMappingA` /
+  `MapViewOfFile`) shared between concurrent decoder instances;
+  round 12 lifts those two from "return NULL" to "allocate
+  fresh buffer" so the cache-fallback path is exercised. With
+  those five kernel32 stubs functional, `[0x10084790]` (init
+  guard) flips from 0 to 1, `[0x1009c770]` gets a real
+  allocation, and the decode body runs to completion in
+  ~2.94M instructions. No MMX opcodes were exercised — the
+  IV50 decoder for `cat_attack.avi`'s first keyframe is
+  integer-only.
+- `HostState::module_resource_dirs: BTreeMap<u32, u32>` —
+  `image_base → resource_directory_va`, populated by the PE
+  loader from the optional header's Data Directory entry 2.
+- `kernel32::find_resource_data_entry` — public-in-crate helper
+  used by `FindResourceA`; takes `(state, mmu, h_module,
+  lp_name, lp_type)`, returns the `IMAGE_RESOURCE_DATA_ENTRY`
+  VA on match. Walks named-then-id entries per the PE
+  Resource Directory layout in PE/COFF spec §"Resource
+  Directory Table".
+- `find_resource_a_walks_synthetic_resource_directory`
+  unit-test (kernel32) — builds a tiny 3-level rsrc directory
+  in MMU and asserts the lookup lands on the expected data
+  entry.
+- `cat_attack_first_keyframe_post_init_globals_and_decode`
+  regression test (`tests/round11_trace_dump.rs`) — replaces
+  the round-11 investigative trace dump with a focused
+  regression sentinel: asserts `[0x10084790] == 1`,
+  `[0x1009c770] != 0`, and `ICDecompress` returns `ICERR_OK`
+  with non-zero output. Names the codec-init globals
+  explicitly so a future regression points at the right
+  surface.
+
+### Changed
+
+- `kernel32!FindResourceA` no longer returns 0 unconditionally;
+  it walks the loaded PE's resource directory.
+- `kernel32!LoadResource` / `LockResource` no longer return 0
+  / NULL; they unwrap the data-entry VA returned by
+  `FindResourceA`.
+- `kernel32!CreateFileMappingA` / `MapViewOfFile` — for
+  `hFile == INVALID_HANDLE_VALUE` requests an anonymous
+  pagefile-backed mapping; round 12 fulfils these with a
+  bump-allocated buffer and returns the buffer VA as the
+  handle. `MapViewOfFile` returns `handle + offsetLow`. This
+  is the round-12 unblocker for `IR50_32.DLL`'s named-shared-
+  memory cache fallback path.
+- `tests/round8_iv50_decode.rs::cat_attack_first_keyframe_decodes_through_ir50_32_dll`
+  tightens its `lr` assertion from "non-positive" to
+  "exactly `ICERR_OK` (0)" and adds a "≥25% non-zero pixels"
+  guard — the round-12 milestone outcome.
+
 - Round 10: **0x66-prefix honored across the integer ISA, not
   just the MOV family.** Round 9 fixed `0x89` / `0x8B` / `0xC7`;
   round 10 closes the rest of the gap so the IV50 decode body

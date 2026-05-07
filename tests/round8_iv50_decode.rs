@@ -161,27 +161,26 @@ fn cat_attack_first_keyframe_decodes_through_ir50_32_dll() {
         ..Default::default()
     };
 
-    // Round 10 outcome: full IC* sequence runs to completion
-    // through `IR50_32.DLL` without a CPU trap. Round 9 fixed
-    // `0x89` / `0x8B` / `0xC7` MOV variants under 0x66; round 10
-    // fixed the broader 0x66-prefix family (`0x81` / `0x83` group-
-    // 1 immediates, `0x69` / `0x6B` IMUL imm, `0x40..0x5F` INC/
-    // DEC + PUSH/POP r16, `0xB8..0xBF` MOV r16 imm16, `0xF7`
-    // group-3 r/m16, `0xA1` / `0xA3` MOV moffs, `0xA9` TEST
-    // AX,imm16, the entire `0x00..0x3D` even-row r/m / r-rm
-    // ALU-pair under 0x66, group-2 shifts r/m16, MOVSW / STOSW /
-    // LODSW / CMPSW / SCASW under 0x66, push imm16). Round 10
-    // also added an x87 FPU control-word shadow so the
-    // codec-prologue `D9 /5 fldcw` + `D9 /7 fnstcw` round-trip
-    // (used by `ICDecompressBegin`) does not trap.
-    //
-    // The result: `ICDecompressQuery` and `ICDecompressBegin`
-    // both return `0` (ICERR_OK), and `ICDecompress` runs the
-    // codec body cleanly all the way to a normal `RET`,
-    // returning `ICERR_BADIMAGE` (`-100`) without any trap. The
-    // codec rejects the keyframe at a (yet-unidentified)
-    // pre-MMX validation step — round 11's gate is to localise
-    // that path; no MMX semantics were exercised by this run.
+    // Round 12 outcome: full IC* sequence runs end-to-end through
+    // `IR50_32.DLL` and `ICDecompress` returns `ICERR_OK` (0) with
+    // a populated 320×240 RGB24 output buffer. Round 11 plumbed
+    // DRV_LOAD + DRV_ENABLE through `ic_open` so `IR50_32.DLL`'s
+    // codec-init runs at all. Round 12 then closed the actual
+    // gate: `IR50_32.DLL` reads its huffman / inverse-DCT tables
+    // out of two PE RT_BITMAP resources (RT_BITMAP/112 and
+    // RT_BITMAP/113), so `kernel32!FindResourceA` /
+    // `LoadResource` / `LockResource` had to walk the PE
+    // resource directory rather than return NULL stubs. The
+    // codec also wraps its huffman-table copy in a named-
+    // shared-memory cache (`CreateFileMappingA` / `MapViewOfFile`)
+    // shared between concurrent decoder instances; in our
+    // single-instance sandbox we just allocate a fresh buffer
+    // each call. With those four kernel32 stubs lifted from
+    // "return NULL" to actually-functional, the codec's
+    // `[0x10084790]` init guard flips to 1 + `[0x1009c770]`
+    // gets a real allocation, and the decode-body runs to
+    // completion. No MMX opcodes were exercised — the IV50
+    // decoder for cat_attack's first keyframe is integer-only.
     let q = sb.ic_decompress_query(hic, &bih_in, Some(&bih_out)).expect(
         "round-10 milestone: ICDecompressQuery should not trap \
              (re-author this test if the new milestone moved)",
@@ -220,20 +219,18 @@ fn cat_attack_first_keyframe_decodes_through_ir50_32_dll() {
         out.len()
     );
     assert_eq!(out.len(), out_capacity as usize);
-    // The codec returned cleanly (no trap, no positive result =
-    // codec fault). Round-10's bound: lr is non-positive (0 =
-    // ICERR_OK or a documented negative ICERR_*); the headline
-    // is that the codec did NOT trap-out partway through. Round
-    // 11 will close the remaining gap to lr=0 + non-zero pixels
-    // by localising why the codec returns ICERR_BADIMAGE on a
-    // bitstream that is, by inspection of byte 0 (`0x1f` =
-    // PSC=0x1F + frame_type=0 keyframe), a valid IV50 keyframe.
-    let lr_signed = lr as i32;
+    // Round 12: tighten to lr == ICERR_OK + non-zero pixels.
+    assert_eq!(
+        lr, 0,
+        "round-12 expected ICDecompress to return ICERR_OK (0); got {} (signed {})",
+        lr, lr as i32
+    );
     assert!(
-        lr_signed <= 0,
-        "round-10 expected ICDecompress to return a non-positive \
-         lr (ICERR_OK = 0 or a documented negative); got {lr_signed} \
-         (positive => codec faulted)"
+        nonzero > out_capacity as usize / 4,
+        "round-12 expected ICDecompress to populate at least \
+         25% of the output buffer with non-zero pixels; only got \
+         {nonzero}/{} non-zero",
+        out_capacity
     );
 
     let _ = sb.ic_decompress_end(hic);

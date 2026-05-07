@@ -197,6 +197,15 @@ pub struct HostState {
     /// `ICERR_BADIMAGE`. We track per-VA so multi-codec sandboxes
     /// (round 12+) don't double-load the same driver.
     pub loaded_drivers: std::collections::BTreeSet<u32>,
+    /// Per-loaded-module resource directory location:
+    /// `image_base → resource_dir_va`. Empty if the module has no
+    /// `.rsrc` (PE Data Directory entry 2). Round 12 needs this so
+    /// that `kernel32!FindResourceA` on `IR50_32.DLL` can locate
+    /// the RT_BITMAP/112 entry that holds the codec's huffman /
+    /// inverse-DCT tables. Without it the codec's `DRV_LOAD`
+    /// chain bails at `0x10034d31 (jz 0x10034f61)` and
+    /// `[0x1009c770]` stays NULL.
+    pub module_resource_dirs: BTreeMap<u32, u32>,
 }
 
 impl HostState {
@@ -233,6 +242,7 @@ impl HostState {
             trace_stubs: false,
             stub_trace: Vec::new(),
             loaded_drivers: std::collections::BTreeSet::new(),
+            module_resource_dirs: BTreeMap::new(),
         }
     }
 
