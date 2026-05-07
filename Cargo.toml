@@ -1,0 +1,20 @@
+[package]
+name = "oxideav-vfw"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust 32-bit x86 emulator + PE loader + Video for Windows host that lets oxideav delegate decoding to legitimately-licensed Windows codec DLLs on any platform — for rare/legacy codec compatibility, not day-to-day playback. See docs/winmf/winmf-emulator.md for the design contract."
+repository = "https://github.com/OxideAV/oxideav-vfw"
+homepage = "https://github.com/OxideAV/oxideav-vfw"
+readme = "README.md"
+keywords = ["multimedia", "vfw", "x86", "emulator", "oxideav"]
+categories = ["multimedia::encoding", "multimedia::video", "emulators"]
+
+[features]
+default = ["registry"]
+registry = ["dep:oxideav-core"]
+
+[dependencies]
+oxideav-core = { version = "0.1", optional = true }
