@@ -33,6 +33,73 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 5: "DllMain + ICOpen + ICGetInfo + ICClose against
+  Intel IR32_32.DLL" milestone landed.
+  - `emulator::isa_int` learnt all 8-bit primary ALU opcodes
+    (`0x00..=0x05` ADD, `0x08..=0x0D` OR, `0x10..=0x15` ADC,
+    `0x18..=0x1D` SBB, `0x20..=0x25` AND, `0x28..=0x2D` SUB,
+    `0x30..=0x35` XOR, `0x38..=0x3D` CMP) — group-1 (`0x80`)
+    + group-3 r/m8 (`0xF6`) + group-4 INC/DEC r/m8 (`0xFE`).
+  - `emulator::isa_int` learnt group-2 (rotate/shift) `r/m8`
+    forms (`0xC0` imm8, `0xD0` 1, `0xD2` cl) and `r/m32` 1/cl
+    counts (`0xD1` / `0xD3`).
+  - `emulator::isa_int` learnt `IMUL r32, r/m32, imm32`/`imm8`
+    (`0x69` / `0x6B`), `XCHG r/m, r` (`0x86` / `0x87`), `SAHF`
+    / `LAHF` (`0x9E` / `0x9F`), `CMC` (`0xF5`), `PUSHAD` /
+    `POPAD` (`0x60` / `0x61`), `ENTER` (`0xC8`), and the full
+    string-instruction family with REP semantics: `MOVSB` /
+    `MOVSD` / `STOSB` / `STOSD` / `LODSB` / `LODSD` / `CMPSB` /
+    `CMPSD` / `SCASB` / `SCASD` (`0xA4..=0xA7`, `0xAA..=0xAF`).
+  - `emulator::isa_int::dispatch_0f` learnt `CMOVcc r32, r/m32`
+    (`0F 40..4F`), `BT r/m32, r32` (`0F A3`), `BTS r/m32, r32`
+    (`0F AB`), `SHLD` (`0F A4` imm8 / `0F A5` cl), `SHRD`
+    (`0F AC` / `0F AD`), group-8 BT/BTS/BTR/BTC imm8 (`0F BA`),
+    `CMPXCHG` (`0F B1`), `XADD` (`0F C1`), and `BSWAP r32`
+    (`0F C8..CF`).
+  - `Cpu` now models segment-override prefixes properly. The
+    prefix-loop sets `seg_override`, and effective-address
+    resolution applies a per-segment linear base
+    (`set_fs_base` / `set_gs_base`). The `Sandbox` runtime maps
+    a 4 KiB TEB at `0x7FFD_E000`, primes `FS:[0]` (SEH chain
+    end-of-list `-1`) + `FS:[0x18]` (TEB self-pointer), and
+    points FS there. This lets the codec's `_try` / `__except`
+    init read `mov eax, fs:[0]` without a memory fault.
+  - `win32::vfw32` corrected the `ICM_*` numeric values
+    (round-4 used `ICM_USER + N` for several N; the canonical
+    SDK header has `ICM_GETINFO = ICM_RESERVED + 2 = 0x5002`,
+    `ICM_DECOMPRESS_QUERY = ICM_USER + 11 = 0x400B`,
+    `ICM_DECOMPRESS = ICM_USER + 13 = 0x400D`,
+    `ICM_DECOMPRESS_END = ICM_USER + 14 = 0x400E`,
+    `ICM_DECOMPRESS_BEGIN = ICM_USER + 16 = 0x4010`).
+    `vfw32::ICM_RESERVED = 0x5000` is now the documented base.
+  - `win32::vfw32::ic_open` now stages a real 36-byte `ICOPEN`
+    structure (`dwSize / fccType / fccHandler / dwVersion /
+    dwFlags / dwError / pV1Reserved / pV2Reserved / dnDevNode`)
+    in the sandbox arena and passes it as `lParam2`. Round-4
+    passed NULL, which prompted Indeo 3 to return the magic
+    sentinel `0xFFFF_0000` (not a real per-instance pointer).
+  - `win32::vfw32::ic_get_info` falls back to a fcc-derived
+    ASCII rendering when the codec leaves `szName` NUL —
+    real `vfw32!ICGetInfo` populates `szName` /
+    `szDescription` / `szDriver` from registry data BEFORE
+    posting `ICM_GETINFO`, but the sandbox has no registry.
+    Indeo 3 doesn't write `szName` itself.
+  - One bug-fix in the round-4 `0xC6` (MOV r/m8, imm8)
+    handler: the immediate fetch ran BEFORE the operand
+    resolution, so any displacement was misread as the
+    immediate. Round-5 swaps the order, matching the SDM.
+  - `tests/m2_indeo3_driverproc.rs::indeo3_driverproc_open_getinfo_close_smoke`
+    now asserts the round-5 outcome: `DllMain` returns
+    cleanly, `ICOpen('VIDC','IV31',2)` mints a HIC,
+    `ICGetInfo` returns a 568-byte `ICINFO` whose
+    `dwSize / fccType` reflect the codec's reply, `szName`
+    decodes to a non-empty ASCII-printable string, and
+    `ICClose` returns without trapping. (The round-4
+    expected-trap branch is gone.)
+  - 9 new lib unit tests covering the round-5 ISA additions
+    (ALU 8-bit, IMUL imm, REP MOVS, FS segment, CMOV, BSWAP,
+    group-2 r/m8, PUSHAD/POPAD).
+
 - Round 4: "Close the 49 round-3 import gaps" milestone landed.
   The 49 stubs round-3 surfaced from Intel's `IR32_32.DLL`
   (Indeo 3) are all implemented; `Sandbox::load(IR32_32.DLL)`

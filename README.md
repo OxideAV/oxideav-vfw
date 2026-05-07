@@ -9,8 +9,12 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 1 — "Load + DllMain + clean exit" landed.** The full
-design contract is the 659-line document at
+**Round 5 — "DllMain + ICOpen + ICGetInfo + ICClose against Intel
+IR32_32.DLL" landed.** Indeo 3's redistributable DLL now walks the
+end-to-end VfW dispatch in the sandbox: load, run `DllMain` to
+clean exit, install codec, open with `('VIDC','IV31',
+ICMODE_DECOMPRESS)`, read back the `ICINFO` identity card, and
+close. The full design contract is the 659-line document at
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

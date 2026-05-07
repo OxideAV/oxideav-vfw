@@ -64,6 +64,29 @@ pub struct Cpu {
     addr_size_16: bool,
     /// REP / REPE / REPNE prefix.
     rep_prefix: Option<RepPrefix>,
+    /// Active segment-override prefix for the current instruction.
+    /// `None` after each `step` reset; set when the prefix loop
+    /// consumes one of `0x26 / 0x2E / 0x36 / 0x3E / 0x64 / 0x65`.
+    seg_override: Option<Seg>,
+    /// Per-segment linear bases. In flat 32-bit Windows mode, all
+    /// segment bases are 0 except FS (TEB) and GS (rarely used in
+    /// Indeo-era code). The PE loader / Sandbox primes these via
+    /// [`Cpu::set_fs_base`]. References:
+    /// Intel SDM Vol. 1 §3.4.4 (segment registers in 32-bit
+    /// flat mode); Microsoft "TEB" documentation for FS use.
+    fs_base: u32,
+    gs_base: u32,
+}
+
+/// Segment-override prefix selector.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Seg {
+    Es,
+    Cs,
+    Ss,
+    Ds,
+    Fs,
+    Gs,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -87,12 +110,54 @@ impl Cpu {
             op_size_16: false,
             addr_size_16: false,
             rep_prefix: None,
+            seg_override: None,
+            fs_base: 0,
+            gs_base: 0,
         }
     }
 
     /// Override the per-run instruction count limit.
     pub fn set_instr_limit(&mut self, n: u64) {
         self.instr_limit = n;
+    }
+
+    /// Configure the linear base of the FS segment. In 32-bit flat
+    /// mode every segment base is 0 EXCEPT FS, which Windows uses
+    /// to point at the current thread's TEB (Thread Environment
+    /// Block). The runtime calls this after mapping the TEB.
+    pub fn set_fs_base(&mut self, base: u32) {
+        self.fs_base = base;
+    }
+
+    /// Configure the linear base of the GS segment. Almost always
+    /// 0 in user-mode 32-bit Windows; the setter is provided for
+    /// completeness.
+    pub fn set_gs_base(&mut self, base: u32) {
+        self.gs_base = base;
+    }
+
+    /// Translate an effective address according to the current
+    /// segment-override prefix. Called by every memory-touching
+    /// helper. Returns the final linear address.
+    fn seg_translate(&self, ea: u32) -> u32 {
+        match self.seg_override {
+            Some(Seg::Fs) => ea.wrapping_add(self.fs_base),
+            Some(Seg::Gs) => ea.wrapping_add(self.gs_base),
+            // In 32-bit flat mode all other segment bases are 0,
+            // so a CS/DS/ES/SS override is a no-op.
+            _ => ea,
+        }
+    }
+
+    /// Apply the active segment-override to an [`Operand`] —
+    /// memory operands get `seg_base` added; register operands
+    /// pass through unchanged. Use this on every operand returned
+    /// from [`resolve_modrm32`].
+    fn seg_apply(&self, op: Operand) -> Operand {
+        match op {
+            Operand::Mem32(a) => Operand::Mem32(self.seg_translate(a)),
+            other => other,
+        }
     }
 
     /// Run until the instruction at `eip` is the synthetic return
@@ -138,6 +203,7 @@ impl Cpu {
         self.op_size_16 = false;
         self.addr_size_16 = false;
         self.rep_prefix = None;
+        self.seg_override = None;
 
         let entry_eip = self.regs.eip;
 
@@ -162,10 +228,34 @@ impl Cpu {
                     self.rep_prefix = Some(RepPrefix::Repne);
                     self.regs.eip = self.regs.eip.wrapping_add(1);
                 }
-                // Segment-override prefixes — codec DLLs in flat
-                // 32-bit mode never need these to mean anything,
-                // so we silently consume + ignore.
-                0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => {
+                // Segment-override prefixes. In 32-bit flat mode
+                // ES/CS/SS/DS bases are 0 (no-op); FS/GS bases are
+                // primed by the runtime (FS → TEB, GS → user-data
+                // base). All effective addresses computed for this
+                // instruction get `seg_base` added in
+                // [`Self::seg_translate`].
+                0x26 => {
+                    self.seg_override = Some(Seg::Es);
+                    self.regs.eip = self.regs.eip.wrapping_add(1);
+                }
+                0x2E => {
+                    self.seg_override = Some(Seg::Cs);
+                    self.regs.eip = self.regs.eip.wrapping_add(1);
+                }
+                0x36 => {
+                    self.seg_override = Some(Seg::Ss);
+                    self.regs.eip = self.regs.eip.wrapping_add(1);
+                }
+                0x3E => {
+                    self.seg_override = Some(Seg::Ds);
+                    self.regs.eip = self.regs.eip.wrapping_add(1);
+                }
+                0x64 => {
+                    self.seg_override = Some(Seg::Fs);
+                    self.regs.eip = self.regs.eip.wrapping_add(1);
+                }
+                0x65 => {
+                    self.seg_override = Some(Seg::Gs);
                     self.regs.eip = self.regs.eip.wrapping_add(1);
                 }
                 // Lock prefix — accepted; the relevant atomic
@@ -200,33 +290,67 @@ impl Cpu {
         match op {
             // ----------- ALU r/m, r and r, r/m (group on opcode bits) ------
             // 0x00..=0x05 : ADD
+            0x00 => self.alu_rm8_r8(mmu, alu_add_8),
             0x01 => self.alu_rm32_r32(op, mmu, alu_add_32),
+            0x02 => self.alu_r8_rm8(mmu, alu_add_8),
             0x03 => self.alu_r32_rm32(op, mmu, alu_add_32),
+            0x04 => self.alu_al_imm8(mmu, alu_add_8),
             0x05 => self.alu_eax_imm32(mmu, alu_add_32),
 
-            // 0x09 : OR r/m32, r32  ; 0x0B : OR r32, r/m32 ; 0x0D : OR eax, imm32
+            // 0x08..=0x0D : OR
+            0x08 => self.alu_rm8_r8(mmu, alu_or_8),
             0x09 => self.alu_rm32_r32(op, mmu, alu_or_32),
+            0x0A => self.alu_r8_rm8(mmu, alu_or_8),
             0x0B => self.alu_r32_rm32(op, mmu, alu_or_32),
+            0x0C => self.alu_al_imm8(mmu, alu_or_8),
             0x0D => self.alu_eax_imm32(mmu, alu_or_32),
 
-            // 0x21 / 0x23 / 0x25 : AND
+            // 0x10..=0x15 : ADC
+            0x10 => self.alu_rm8_r8(mmu, alu_adc_8),
+            0x11 => self.alu_rm32_r32(op, mmu, alu_adc_32),
+            0x12 => self.alu_r8_rm8(mmu, alu_adc_8),
+            0x13 => self.alu_r32_rm32(op, mmu, alu_adc_32),
+            0x14 => self.alu_al_imm8(mmu, alu_adc_8),
+            0x15 => self.alu_eax_imm32(mmu, alu_adc_32),
+
+            // 0x18..=0x1D : SBB
+            0x18 => self.alu_rm8_r8(mmu, alu_sbb_8),
+            0x19 => self.alu_rm32_r32(op, mmu, alu_sbb_32),
+            0x1A => self.alu_r8_rm8(mmu, alu_sbb_8),
+            0x1B => self.alu_r32_rm32(op, mmu, alu_sbb_32),
+            0x1C => self.alu_al_imm8(mmu, alu_sbb_8),
+            0x1D => self.alu_eax_imm32(mmu, alu_sbb_32),
+
+            // 0x20..=0x25 : AND
+            0x20 => self.alu_rm8_r8(mmu, alu_and_8),
             0x21 => self.alu_rm32_r32(op, mmu, alu_and_32),
+            0x22 => self.alu_r8_rm8(mmu, alu_and_8),
             0x23 => self.alu_r32_rm32(op, mmu, alu_and_32),
+            0x24 => self.alu_al_imm8(mmu, alu_and_8),
             0x25 => self.alu_eax_imm32(mmu, alu_and_32),
 
-            // 0x29 / 0x2B / 0x2D : SUB
+            // 0x28..=0x2D : SUB
+            0x28 => self.alu_rm8_r8(mmu, alu_sub_8),
             0x29 => self.alu_rm32_r32(op, mmu, alu_sub_32),
+            0x2A => self.alu_r8_rm8(mmu, alu_sub_8),
             0x2B => self.alu_r32_rm32(op, mmu, alu_sub_32),
+            0x2C => self.alu_al_imm8(mmu, alu_sub_8),
             0x2D => self.alu_eax_imm32(mmu, alu_sub_32),
 
-            // 0x31 / 0x33 / 0x35 : XOR
+            // 0x30..=0x35 : XOR
+            0x30 => self.alu_rm8_r8(mmu, alu_xor_8),
             0x31 => self.alu_rm32_r32(op, mmu, alu_xor_32),
+            0x32 => self.alu_r8_rm8(mmu, alu_xor_8),
             0x33 => self.alu_r32_rm32(op, mmu, alu_xor_32),
+            0x34 => self.alu_al_imm8(mmu, alu_xor_8),
             0x35 => self.alu_eax_imm32(mmu, alu_xor_32),
 
-            // 0x39 / 0x3B / 0x3D : CMP
+            // 0x38..=0x3D : CMP
+            0x38 => self.alu_rm8_r8(mmu, alu_cmp_8),
             0x39 => self.alu_rm32_r32(op, mmu, alu_cmp_32),
+            0x3A => self.alu_r8_rm8(mmu, alu_cmp_8),
             0x3B => self.alu_r32_rm32(op, mmu, alu_cmp_32),
+            0x3C => self.alu_al_imm8(mmu, alu_cmp_8),
             0x3D => self.alu_eax_imm32(mmu, alu_cmp_32),
 
             // ----------- INC/DEC r32 (single-byte forms 0x40..=0x4F) ------
@@ -247,6 +371,44 @@ impl Cpu {
                 self.regs.set32(r, out);
                 set_flags_inc_dec_32(&mut self.regs.flags, v, 1, out, /*sub*/ true);
                 self.regs.flags.cf = carry_unchanged; // DEC preserves CF
+                Ok(StepOk::Continued)
+            }
+
+            // 0x60 — PUSHAD: push eax, ecx, edx, ebx, original esp, ebp, esi, edi
+            0x60 => {
+                let original_esp = self.regs.esp();
+                let to_push = [
+                    self.regs.get32(Reg32::Eax),
+                    self.regs.get32(Reg32::Ecx),
+                    self.regs.get32(Reg32::Edx),
+                    self.regs.get32(Reg32::Ebx),
+                    original_esp,
+                    self.regs.get32(Reg32::Ebp),
+                    self.regs.get32(Reg32::Esi),
+                    self.regs.get32(Reg32::Edi),
+                ];
+                for v in to_push.iter() {
+                    self.push32(mmu, *v)?;
+                }
+                Ok(StepOk::Continued)
+            }
+            // 0x61 — POPAD: edi, esi, ebp, (skip original esp), ebx, edx, ecx, eax
+            0x61 => {
+                let edi = self.pop32(mmu)?;
+                let esi = self.pop32(mmu)?;
+                let ebp = self.pop32(mmu)?;
+                let _skip_esp = self.pop32(mmu)?;
+                let ebx = self.pop32(mmu)?;
+                let edx = self.pop32(mmu)?;
+                let ecx = self.pop32(mmu)?;
+                let eax = self.pop32(mmu)?;
+                self.regs.set32(Reg32::Edi, edi);
+                self.regs.set32(Reg32::Esi, esi);
+                self.regs.set32(Reg32::Ebp, ebp);
+                self.regs.set32(Reg32::Ebx, ebx);
+                self.regs.set32(Reg32::Edx, edx);
+                self.regs.set32(Reg32::Ecx, ecx);
+                self.regs.set32(Reg32::Eax, eax);
                 Ok(StepOk::Continued)
             }
 
@@ -276,6 +438,45 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
+            // 0x69 — IMUL r32, r/m32, imm32
+            0x69 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let src_op = self.seg_apply(src_op);
+                let imm = self.fetch_imm32(mmu)? as i32 as i64;
+                let dst = Reg32::from_bits(mr.reg);
+                let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
+                let prod = a.wrapping_mul(imm);
+                let trunc = prod as i32 as u32;
+                self.regs.set32(dst, trunc);
+                let overflow = prod != prod as i32 as i64;
+                self.regs.flags.cf = overflow;
+                self.regs.flags.of = overflow;
+                self.regs.flags.set_szp_32(trunc);
+                Ok(StepOk::Continued)
+            }
+            // 0x6B — IMUL r32, r/m32, imm8 (sign-extended)
+            0x6B => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let src_op = self.seg_apply(src_op);
+                let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?) as i32 as i64;
+                let dst = Reg32::from_bits(mr.reg);
+                let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
+                let prod = a.wrapping_mul(imm);
+                let trunc = prod as i32 as u32;
+                self.regs.set32(dst, trunc);
+                let overflow = prod != prod as i32 as i64;
+                self.regs.flags.cf = overflow;
+                self.regs.flags.of = overflow;
+                self.regs.flags.set_szp_32(trunc);
+                Ok(StepOk::Continued)
+            }
+
             // ----------- Jcc rel8 (0x70..=0x7F) ------
             0x70..=0x7F => {
                 let disp = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
@@ -294,6 +495,31 @@ impl Cpu {
             // ----------- 0x84 / 0x85 — TEST ------
             0x84 => self.test_rm8_r8(mmu),
             0x85 => self.alu_rm32_r32(op, mmu, alu_test_32),
+
+            // 0x86 — XCHG r/m8, r8
+            0x86 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let (lhs, dst) = self.resolve_op8(mr, mmu)?;
+                let rhs_reg = Reg8::from_bits(mr.reg);
+                let rhs = self.regs.get8(rhs_reg);
+                self.write_op8(dst, rhs, mmu)?;
+                self.regs.set8(rhs_reg, lhs);
+                Ok(StepOk::Continued)
+            }
+            // 0x87 — XCHG r/m32, r32
+            0x87 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (rm_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let rm_op = self.seg_apply(rm_op);
+                let rhs_reg = Reg32::from_bits(mr.reg);
+                let lhs = read_operand32(rm_op, &self.regs, mmu)?;
+                let rhs = self.regs.get32(rhs_reg);
+                write_operand32(rm_op, rhs, &mut self.regs, mmu)?;
+                self.regs.set32(rhs_reg, lhs);
+                Ok(StepOk::Continued)
+            }
 
             // ----------- 0x88..=0x8B — MOV r/m, r // r, r/m ------
             0x88 => self.mov_rm8_r8(mmu),
@@ -350,30 +576,85 @@ impl Cpu {
                 self.regs.flags = Flags::unpack(v);
                 Ok(StepOk::Continued)
             }
+            // 0x9E — SAHF: load AH bits 0,2,4,6,7 → SF/ZF/AF/PF/CF
+            0x9E => {
+                let ah = self.regs.get8(Reg8::Ah);
+                self.regs.flags.cf = (ah & 0x01) != 0;
+                self.regs.flags.pf = (ah & 0x04) != 0;
+                self.regs.flags.af = (ah & 0x10) != 0;
+                self.regs.flags.zf = (ah & 0x40) != 0;
+                self.regs.flags.sf = (ah & 0x80) != 0;
+                Ok(StepOk::Continued)
+            }
+            // 0x9F — LAHF: store SF/ZF/AF/PF/CF (and bit-1 reserved=1) into AH
+            0x9F => {
+                let mut ah: u8 = 0b0000_0010; // bit 1 reads as 1
+                if self.regs.flags.cf {
+                    ah |= 0x01;
+                }
+                if self.regs.flags.pf {
+                    ah |= 0x04;
+                }
+                if self.regs.flags.af {
+                    ah |= 0x10;
+                }
+                if self.regs.flags.zf {
+                    ah |= 0x40;
+                }
+                if self.regs.flags.sf {
+                    ah |= 0x80;
+                }
+                self.regs.set8(Reg8::Ah, ah);
+                Ok(StepOk::Continued)
+            }
 
             // 0xA0 — MOV al, moffs8 ; 0xA1 — MOV eax, moffs32 ; A2/A3 inverse
             0xA0 => {
-                let m = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_imm32(mmu)?;
+                let m = self.seg_translate(imm);
                 let v = mmu.load8(m)?;
                 self.regs.set8(Reg8::Al, v);
                 Ok(StepOk::Continued)
             }
             0xA1 => {
-                let m = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_imm32(mmu)?;
+                let m = self.seg_translate(imm);
                 let v = mmu.load32(m)?;
                 self.regs.set32(Reg32::Eax, v);
                 Ok(StepOk::Continued)
             }
             0xA2 => {
-                let m = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_imm32(mmu)?;
+                let m = self.seg_translate(imm);
                 mmu.store8(m, self.regs.get8(Reg8::Al))?;
                 Ok(StepOk::Continued)
             }
             0xA3 => {
-                let m = self.fetch_imm32(mmu)?;
+                let imm = self.fetch_imm32(mmu)?;
+                let m = self.seg_translate(imm);
                 mmu.store32(m, self.regs.get32(Reg32::Eax))?;
                 Ok(StepOk::Continued)
             }
+
+            // 0xA4 — MOVSB ; 0xA5 — MOVSD
+            0xA4 => self.string_movs(mmu, /*sized_dword*/ false),
+            0xA5 => self.string_movs(mmu, /*sized_dword*/ true),
+
+            // 0xA6 — CMPSB ; 0xA7 — CMPSD
+            0xA6 => self.string_cmps(mmu, /*sized_dword*/ false),
+            0xA7 => self.string_cmps(mmu, /*sized_dword*/ true),
+
+            // 0xAA — STOSB ; 0xAB — STOSD
+            0xAA => self.string_stos(mmu, /*sized_dword*/ false),
+            0xAB => self.string_stos(mmu, /*sized_dword*/ true),
+
+            // 0xAC — LODSB ; 0xAD — LODSD
+            0xAC => self.string_lods(mmu, /*sized_dword*/ false),
+            0xAD => self.string_lods(mmu, /*sized_dword*/ true),
+
+            // 0xAE — SCASB ; 0xAF — SCASD
+            0xAE => self.string_scas(mmu, /*sized_dword*/ false),
+            0xAF => self.string_scas(mmu, /*sized_dword*/ true),
 
             // 0xA8 — TEST al, imm8
             0xA8 => {
@@ -409,8 +690,18 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
+            // 0xC0 — Group 2 (shifts) r/m8, imm8
+            0xC0 => self.group2_rm8(mmu, ShiftCount::Imm8),
             // 0xC1 — Group 2 (shifts) r/m32, imm8
-            0xC1 => self.group2_rm32_imm8(mmu),
+            0xC1 => self.group2_rm32(mmu, ShiftCount::Imm8),
+            // 0xD0 — Group 2 (shifts) r/m8, 1
+            0xD0 => self.group2_rm8(mmu, ShiftCount::One),
+            // 0xD1 — Group 2 (shifts) r/m32, 1
+            0xD1 => self.group2_rm32(mmu, ShiftCount::One),
+            // 0xD2 — Group 2 (shifts) r/m8, CL
+            0xD2 => self.group2_rm8(mmu, ShiftCount::Cl),
+            // 0xD3 — Group 2 (shifts) r/m32, CL
+            0xD3 => self.group2_rm32(mmu, ShiftCount::Cl),
 
             // 0xC2 — RETN imm16 ; 0xC3 — RETN
             0xC2 => {
@@ -439,9 +730,13 @@ impl Cpu {
             0xC6 => {
                 let mr = self.fetch_modrm(mmu)?;
                 debug_assert!(mr.reg == 0, "group 11 /0");
-                let imm = self.fetch_imm8(mmu)?;
+                // The displacement (if any) follows the ModR/M
+                // and *precedes* the imm8. Resolve the operand
+                // first so eip advances over the disp, then fetch
+                // the immediate.
                 let (op_val, addr_or_reg) = self.resolve_op8(mr, mmu)?;
                 let _ = op_val;
+                let imm = self.fetch_imm8(mmu)?;
                 self.write_op8(addr_or_reg, imm, mmu)?;
                 Ok(StepOk::Continued)
             }
@@ -452,11 +747,38 @@ impl Cpu {
                 let bytes = self.peek_after_modrm(mmu, 16)?;
                 let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
                 let imm = self.fetch_imm32(mmu)?;
                 write_operand32(op, imm, &mut self.regs, mmu)?;
                 Ok(StepOk::Continued)
             }
 
+            // 0xC8 — ENTER imm16, imm8 (frame setup). We model the
+            // common nesting=0 case fully; nesting>0 is rare and
+            // pushes copied display links — handle it by tracing.
+            0xC8 => {
+                let alloc_size = self.fetch_imm16(mmu)?;
+                let nesting_level = self.fetch_imm8(mmu)? & 0x1F;
+                let frame_temp = self.regs.esp().wrapping_sub(4);
+                self.push32(mmu, self.regs.ebp())?;
+                if nesting_level == 0 {
+                    self.regs.set32(Reg32::Ebp, frame_temp);
+                    self.regs
+                        .set_esp(self.regs.esp().wrapping_sub(u32::from(alloc_size)));
+                } else {
+                    let mut current_ebp = self.regs.ebp();
+                    for _ in 1..nesting_level {
+                        current_ebp = current_ebp.wrapping_sub(4);
+                        let display = mmu.load32(current_ebp)?;
+                        self.push32(mmu, display)?;
+                    }
+                    self.push32(mmu, frame_temp)?;
+                    self.regs.set32(Reg32::Ebp, frame_temp);
+                    self.regs
+                        .set_esp(self.regs.esp().wrapping_sub(u32::from(alloc_size)));
+                }
+                Ok(StepOk::Continued)
+            }
             // 0xC9 — LEAVE: mov esp, ebp; pop ebp
             0xC9 => {
                 self.regs.set_esp(self.regs.ebp());
@@ -512,6 +834,14 @@ impl Cpu {
                 mnemonic: "hlt",
             }),
 
+            // 0xF5 — CMC : invert CF
+            0xF5 => {
+                self.regs.flags.cf = !self.regs.flags.cf;
+                Ok(StepOk::Continued)
+            }
+
+            // 0xF6 — Group 3 (TEST/NOT/NEG/MUL/IMUL/DIV/IDIV) r/m8
+            0xF6 => self.group3_rm8(mmu, entry_eip),
             // 0xF7 — Group 3 (NEG / NOT / MUL / IMUL / DIV / IDIV) r/m32
             0xF7 => self.group3_rm32(mmu, entry_eip),
 
@@ -541,6 +871,40 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
+            // 0xFE — Group 4 (INC / DEC r/m8)
+            0xFE => {
+                let mr = self.fetch_modrm(mmu)?;
+                let (val, dst) = self.resolve_op8(mr, mmu)?;
+                match mr.reg {
+                    0 => {
+                        // INC: preserves CF
+                        let r = val.wrapping_add(1);
+                        let cf = self.regs.flags.cf;
+                        self.regs.flags.af = ((val ^ 1 ^ r) & 0x10) != 0;
+                        self.regs.flags.of = (((val ^ r) & (1u8 ^ r)) & 0x80) != 0;
+                        self.regs.flags.set_szp_8(r);
+                        self.regs.flags.cf = cf;
+                        self.write_op8(dst, r, mmu)?;
+                    }
+                    1 => {
+                        // DEC: preserves CF
+                        let r = val.wrapping_sub(1);
+                        let cf = self.regs.flags.cf;
+                        self.regs.flags.af = ((val ^ 1 ^ r) & 0x10) != 0;
+                        self.regs.flags.of = (((val ^ 1) & (val ^ r)) & 0x80) != 0;
+                        self.regs.flags.set_szp_8(r);
+                        self.regs.flags.cf = cf;
+                        self.write_op8(dst, r, mmu)?;
+                    }
+                    other => {
+                        return Err(Trap::UndefinedOpcode {
+                            eip: entry_eip,
+                            opcode: 0xFE00 | u32::from(other),
+                        });
+                    }
+                }
+                Ok(StepOk::Continued)
+            }
             // 0xFF — Group 5 (INC / DEC / CALL / JMP / PUSH r/m32)
             0xFF => self.group5_rm32(mmu, entry_eip),
 
@@ -569,6 +933,20 @@ impl Cpu {
         let op2 = mmu.fetch_x8(self.regs.eip)?;
         self.regs.eip = self.regs.eip.wrapping_add(1);
         match op2 {
+            // 0x0F 0x40..0x4F — CMOVcc r32, r/m32
+            0x40..=0x4F => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let src_op = self.seg_apply(src_op);
+                let dst = Reg32::from_bits(mr.reg);
+                let src = read_operand32(src_op, &self.regs, mmu)?;
+                if condition_holds(op2 & 0x0F, &self.regs.flags) {
+                    self.regs.set32(dst, src);
+                }
+                Ok(StepOk::Continued)
+            }
             // 0x0F 0x80..0x8F — Jcc rel32
             0x80..=0x8F => {
                 let disp = self.fetch_imm32(mmu)? as i32;
@@ -590,12 +968,87 @@ impl Cpu {
                 self.cpuid();
                 Ok(StepOk::Continued)
             }
+            // 0x0F 0xA3 — BT r/m32, r32
+            0xA3 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let v = read_operand32(op, &self.regs, mmu)?;
+                let bit = self.regs.get32(Reg32::from_bits(mr.reg)) & 31;
+                self.regs.flags.cf = ((v >> bit) & 1) != 0;
+                Ok(StepOk::Continued)
+            }
+            // 0x0F 0xA4 — SHLD r/m32, r32, imm8
+            0xA4 => self.shld_imm(mmu),
+            // 0x0F 0xA5 — SHLD r/m32, r32, CL
+            0xA5 => self.shld_cl(mmu),
+            // 0x0F 0xAC — SHRD r/m32, r32, imm8
+            0xAC => self.shrd_imm(mmu),
+            // 0x0F 0xAD — SHRD r/m32, r32, CL
+            0xAD => self.shrd_cl(mmu),
+            // 0x0F 0xAB — BTS r/m32, r32 (set bit, copy old value to CF)
+            0xAB => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let v = read_operand32(op, &self.regs, mmu)?;
+                let bit = self.regs.get32(Reg32::from_bits(mr.reg)) & 31;
+                self.regs.flags.cf = ((v >> bit) & 1) != 0;
+                let new = v | (1u32 << bit);
+                write_operand32(op, new, &mut self.regs, mmu)?;
+                Ok(StepOk::Continued)
+            }
+            // 0x0F 0xB1 — CMPXCHG r/m32, r32
+            0xB1 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let dest = read_operand32(op, &self.regs, mmu)?;
+                let acc = self.regs.get32(Reg32::Eax);
+                let src = self.regs.get32(Reg32::from_bits(mr.reg));
+                let (_, _) = alu_sub_32(acc, dest, &mut self.regs.flags); // sets flags
+                if acc == dest {
+                    write_operand32(op, src, &mut self.regs, mmu)?;
+                } else {
+                    self.regs.set32(Reg32::Eax, dest);
+                }
+                Ok(StepOk::Continued)
+            }
+            // 0x0F 0xC1 — XADD r/m32, r32
+            0xC1 => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let dest = read_operand32(op, &self.regs, mmu)?;
+                let src_reg = Reg32::from_bits(mr.reg);
+                let src = self.regs.get32(src_reg);
+                let (sum, _) = alu_add_32(dest, src, &mut self.regs.flags);
+                self.regs.set32(src_reg, dest);
+                write_operand32(op, sum, &mut self.regs, mmu)?;
+                Ok(StepOk::Continued)
+            }
+            // 0x0F 0xC8..=0xCF — BSWAP r32
+            0xC8..=0xCF => {
+                let r = Reg32::from_bits(op2 - 0xC8);
+                let v = self.regs.get32(r);
+                self.regs.set32(r, v.swap_bytes());
+                Ok(StepOk::Continued)
+            }
             // 0x0F 0xAF — IMUL r32, r/m32
             0xAF => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
                 let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
                 let dst = Reg32::from_bits(mr.reg);
                 let a = self.regs.get32(dst) as i32 as i64;
                 let b = read_operand32(op, &self.regs, mmu)? as i32 as i64;
@@ -624,12 +1077,38 @@ impl Cpu {
                 self.regs.set32(dst, u32::from(v));
                 Ok(StepOk::Continued)
             }
+            // 0x0F 0xBA — Group 8 (BT/BTS/BTR/BTC r/m32, imm8)
+            0xBA => {
+                let mr = self.fetch_modrm(mmu)?;
+                let bytes = self.peek_after_modrm(mmu, 16)?;
+                let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+                self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
+                let v = read_operand32(op, &self.regs, mmu)?;
+                let bit = u32::from(self.fetch_imm8(mmu)? & 0x1F);
+                self.regs.flags.cf = ((v >> bit) & 1) != 0;
+                let new = match mr.reg {
+                    4 => return Ok(StepOk::Continued), // BT — flags only
+                    5 => v | (1u32 << bit),            // BTS
+                    6 => v & !(1u32 << bit),           // BTR
+                    7 => v ^ (1u32 << bit),            // BTC
+                    other => {
+                        return Err(Trap::UndefinedOpcode {
+                            eip: self.regs.eip,
+                            opcode: 0x0F_BA00 | u32::from(other),
+                        });
+                    }
+                };
+                write_operand32(op, new, &mut self.regs, mmu)?;
+                Ok(StepOk::Continued)
+            }
             // 0x0F 0xBC — BSF r32, r/m32 ; 0xBD — BSR
             0xBC | 0xBD => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
                 let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+                let op = self.seg_apply(op);
                 let dst = Reg32::from_bits(mr.reg);
                 let v = read_operand32(op, &self.regs, mmu)?;
                 if v == 0 {
@@ -752,7 +1231,7 @@ impl Cpu {
             let bytes = self.peek_after_modrm(mmu, 16)?;
             let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
             self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
-            match op {
+            match self.seg_apply(op) {
                 Operand::Reg32(_) => unreachable!("mod != 11 cannot be reg form"),
                 Operand::Mem32(addr) => Ok((mmu.load8(addr)?, Op8Dst::Mem(addr))),
             }
@@ -767,7 +1246,7 @@ impl Cpu {
             let bytes = self.peek_after_modrm(mmu, 16)?;
             let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
             self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
-            match op {
+            match self.seg_apply(op) {
                 Operand::Reg32(_) => unreachable!(),
                 Operand::Mem32(addr) => Ok((mmu.load16(addr)?, Op16Dst::Mem(addr))),
             }
@@ -791,6 +1270,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let lhs_op = self.seg_apply(lhs_op);
         let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
         let rhs = self.regs.get32(Reg32::from_bits(mr.reg));
         let (result, write_back) = f(lhs, rhs, &mut self.regs.flags);
@@ -805,6 +1285,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (rhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let rhs_op = self.seg_apply(rhs_op);
         let dst = Reg32::from_bits(mr.reg);
         let lhs = self.regs.get32(dst);
         let rhs = read_operand32(rhs_op, &self.regs, mmu)?;
@@ -843,6 +1324,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let lhs_op = self.seg_apply(lhs_op);
         let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
         let imm = self.fetch_imm32(mmu)?;
         let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
@@ -858,6 +1340,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let lhs_op = self.seg_apply(lhs_op);
         let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
         let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
         let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
@@ -891,6 +1374,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         let src = self.regs.get32(Reg32::from_bits(mr.reg));
         write_operand32(op, src, &mut self.regs, mmu)?;
         Ok(StepOk::Continued)
@@ -908,6 +1392,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         let src = read_operand32(op, &self.regs, mmu)?;
         self.regs.set32(Reg32::from_bits(mr.reg), src);
         Ok(StepOk::Continued)
@@ -924,6 +1409,8 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        // LEA computes the effective address WITHOUT applying any
+        // segment-base — Intel SDM Vol. 2A LEA.
         let addr = match op {
             Operand::Mem32(a) => a,
             Operand::Reg32(_) => unreachable!(),
@@ -944,17 +1431,23 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         write_operand32(op, v, &mut self.regs, mmu)?;
         Ok(StepOk::Continued)
     }
 
-    fn group2_rm32_imm8(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+    fn group2_rm32(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
-        let count = (self.fetch_imm8(mmu)? & 0x1F) as u32;
+        let count = match source {
+            ShiftCount::One => 1u32,
+            ShiftCount::Cl => u32::from(self.regs.get8(Reg8::Cl)) & 0x1F,
+            ShiftCount::Imm8 => u32::from(self.fetch_imm8(mmu)? & 0x1F),
+        };
         let result = match mr.reg {
             // 0=ROL 1=ROR 2=RCL 3=RCR 4=SHL 5=SHR 6=SAL 7=SAR
             4 | 6 => {
@@ -1028,6 +1521,7 @@ impl Cpu {
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
         match mr.reg {
             0 | 1 => {
@@ -1104,11 +1598,444 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
+    // ----- ALU dispatch helpers (8-bit) ---------------------------
+
+    fn alu_rm8_r8(&mut self, mmu: &mut Mmu, f: AluFn8) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let (lhs, dst) = self.resolve_op8(mr, mmu)?;
+        let rhs = self.regs.get8(Reg8::from_bits(mr.reg));
+        let (result, write_back) = f(lhs, rhs, &mut self.regs.flags);
+        if write_back {
+            self.write_op8(dst, result, mmu)?;
+        }
+        Ok(StepOk::Continued)
+    }
+
+    fn alu_r8_rm8(&mut self, mmu: &mut Mmu, f: AluFn8) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let (rhs, _dst) = self.resolve_op8(mr, mmu)?;
+        let dst_reg = Reg8::from_bits(mr.reg);
+        let lhs = self.regs.get8(dst_reg);
+        let (result, write_back) = f(lhs, rhs, &mut self.regs.flags);
+        if write_back {
+            self.regs.set8(dst_reg, result);
+        }
+        Ok(StepOk::Continued)
+    }
+
+    fn alu_al_imm8(&mut self, mmu: &Mmu, f: AluFn8) -> Result<StepOk, Trap> {
+        let imm = self.fetch_imm8(mmu)?;
+        let lhs = self.regs.get8(Reg8::Al);
+        let (result, write_back) = f(lhs, imm, &mut self.regs.flags);
+        if write_back {
+            self.regs.set8(Reg8::Al, result);
+        }
+        Ok(StepOk::Continued)
+    }
+
+    // ----- Group 2 (shifts) r/m8 ----------------------------------
+
+    fn group2_rm8(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let (val, dst) = self.resolve_op8(mr, mmu)?;
+        let count = match source {
+            ShiftCount::One => 1u32,
+            ShiftCount::Cl => u32::from(self.regs.get8(Reg8::Cl)) & 0x1F,
+            ShiftCount::Imm8 => u32::from(self.fetch_imm8(mmu)? & 0x1F),
+        };
+        let val32 = u32::from(val);
+        let result: u8 = match mr.reg {
+            // 0=ROL 1=ROR 2=RCL 3=RCR 4=SHL 5=SHR 6=SAL 7=SAR
+            4 | 6 => {
+                let r = if count >= 8 { 0u32 } else { val32 << count };
+                if count != 0 {
+                    self.regs.flags.cf = if count <= 8 {
+                        ((val32 >> (8 - count)) & 1) != 0
+                    } else {
+                        false
+                    };
+                    self.regs.flags.set_szp_8(r as u8);
+                }
+                r as u8
+            }
+            5 => {
+                let r = if count >= 8 { 0u32 } else { val32 >> count };
+                if count != 0 {
+                    self.regs.flags.cf = ((val32 >> (count - 1)) & 1) != 0;
+                    self.regs.flags.set_szp_8(r as u8);
+                }
+                r as u8
+            }
+            7 => {
+                let signed = val as i8 as i32;
+                let r = if count >= 8 {
+                    if signed < 0 {
+                        0xFFu8
+                    } else {
+                        0u8
+                    }
+                } else {
+                    (signed >> count) as u8
+                };
+                if count != 0 {
+                    self.regs.flags.cf = ((val32 >> (count - 1)) & 1) != 0;
+                    self.regs.flags.set_szp_8(r);
+                }
+                r
+            }
+            0 => {
+                // ROL r/m8
+                let c = count % 8;
+                let r = if c == 0 { val } else { val.rotate_left(c) };
+                if count != 0 {
+                    self.regs.flags.cf = (r & 1) != 0;
+                }
+                r
+            }
+            1 => {
+                // ROR r/m8
+                let c = count % 8;
+                let r = if c == 0 { val } else { val.rotate_right(c) };
+                if count != 0 {
+                    self.regs.flags.cf = (r & 0x80) != 0;
+                }
+                r
+            }
+            other => {
+                return Err(Trap::UndefinedOpcode {
+                    eip: self.regs.eip,
+                    opcode: 0xC000 | u32::from(other),
+                });
+            }
+        };
+        self.write_op8(dst, result, mmu)?;
+        Ok(StepOk::Continued)
+    }
+
+    // ----- Group 3 r/m8 -------------------------------------------
+
+    fn group3_rm8(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let (val, dst) = self.resolve_op8(mr, mmu)?;
+        match mr.reg {
+            0 | 1 => {
+                // TEST r/m8, imm8
+                let imm = self.fetch_imm8(mmu)?;
+                let r = val & imm;
+                self.regs.flags.cf = false;
+                self.regs.flags.of = false;
+                self.regs.flags.set_szp_8(r);
+            }
+            2 => {
+                // NOT
+                self.write_op8(dst, !val, mmu)?;
+            }
+            3 => {
+                // NEG
+                let r = 0u8.wrapping_sub(val);
+                self.regs.flags.cf = val != 0;
+                self.regs.flags.of = val == 0x80;
+                self.regs.flags.set_szp_8(r);
+                self.write_op8(dst, r, mmu)?;
+            }
+            4 => {
+                // MUL al, r/m8 → ax
+                let prod = u16::from(self.regs.get8(Reg8::Al)) * u16::from(val);
+                self.regs.set16(Reg16::Ax, prod);
+                let hi_nonzero = (prod & 0xFF00) != 0;
+                self.regs.flags.cf = hi_nonzero;
+                self.regs.flags.of = hi_nonzero;
+            }
+            5 => {
+                // IMUL al, r/m8 → ax (signed)
+                let prod = (self.regs.get8(Reg8::Al) as i8 as i16) * (val as i8 as i16);
+                self.regs.set16(Reg16::Ax, prod as u16);
+                let truncated = prod != prod as i8 as i16;
+                self.regs.flags.cf = truncated;
+                self.regs.flags.of = truncated;
+            }
+            6 => {
+                // DIV ax / r/m8 → al = quotient, ah = remainder
+                if val == 0 {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                let dividend = self.regs.get16(Reg16::Ax);
+                let q = dividend / u16::from(val);
+                let r = dividend % u16::from(val);
+                if q > 0xFF {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                self.regs.set8(Reg8::Al, q as u8);
+                self.regs.set8(Reg8::Ah, r as u8);
+            }
+            7 => {
+                // IDIV ax / r/m8 (signed)
+                if val == 0 {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                let dividend = self.regs.get16(Reg16::Ax) as i16;
+                let divisor = val as i8 as i16;
+                let q = dividend / divisor;
+                let r = dividend % divisor;
+                if !(i8::MIN as i16..=i8::MAX as i16).contains(&q) {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                self.regs.set8(Reg8::Al, q as u8);
+                self.regs.set8(Reg8::Ah, r as u8);
+            }
+            _ => unreachable!(),
+        }
+        Ok(StepOk::Continued)
+    }
+
+    // ----- SHLD / SHRD --------------------------------------------
+
+    fn shld_imm(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let imm = u32::from(self.fetch_imm8(mmu)? & 0x1F);
+        self.shld_apply(op, mr.reg, imm, mmu)
+    }
+
+    fn shld_cl(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let count = u32::from(self.regs.get8(Reg8::Cl)) & 0x1F;
+        self.shld_apply(op, mr.reg, count, mmu)
+    }
+
+    fn shld_apply(
+        &mut self,
+        op: Operand,
+        reg_field: u8,
+        count: u32,
+        mmu: &mut Mmu,
+    ) -> Result<StepOk, Trap> {
+        let dest = read_operand32(op, &self.regs, mmu)?;
+        let src = self.regs.get32(Reg32::from_bits(reg_field));
+        if count == 0 {
+            return Ok(StepOk::Continued);
+        }
+        // Per Intel SDM Vol 2A SHLD entry: bits shifted left in;
+        // src provides the in-shifting bits from the right. Last
+        // bit shifted out goes to CF.
+        let combined: u64 = (u64::from(dest) << 32) | u64::from(src);
+        let shifted = combined << count;
+        let result = (shifted >> 32) as u32;
+        self.regs.flags.cf = ((dest >> (32 - count)) & 1) != 0;
+        self.regs.flags.set_szp_32(result);
+        write_operand32(op, result, &mut self.regs, mmu)?;
+        Ok(StepOk::Continued)
+    }
+
+    fn shrd_imm(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let imm = u32::from(self.fetch_imm8(mmu)? & 0x1F);
+        self.shrd_apply(op, mr.reg, imm, mmu)
+    }
+
+    fn shrd_cl(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let count = u32::from(self.regs.get8(Reg8::Cl)) & 0x1F;
+        self.shrd_apply(op, mr.reg, count, mmu)
+    }
+
+    fn shrd_apply(
+        &mut self,
+        op: Operand,
+        reg_field: u8,
+        count: u32,
+        mmu: &mut Mmu,
+    ) -> Result<StepOk, Trap> {
+        let dest = read_operand32(op, &self.regs, mmu)?;
+        let src = self.regs.get32(Reg32::from_bits(reg_field));
+        if count == 0 {
+            return Ok(StepOk::Continued);
+        }
+        // SHRD: shift `dest` right with bits from `src` shifted in
+        // from the left. Last bit shifted out goes to CF.
+        let combined: u64 = (u64::from(src) << 32) | u64::from(dest);
+        let shifted = combined >> count;
+        let result = shifted as u32;
+        self.regs.flags.cf = ((dest >> (count - 1)) & 1) != 0;
+        self.regs.flags.set_szp_32(result);
+        write_operand32(op, result, &mut self.regs, mmu)?;
+        Ok(StepOk::Continued)
+    }
+
+    // ----- String operations --------------------------------------
+    //
+    // Reference: Intel SDM Vol. 2 — entries for MOVS, CMPS, STOS,
+    // LODS, SCAS. The DF flag determines pre-step direction. REP
+    // / REPE / REPNE prefixes are honoured here; we model the
+    // single-step semantics in helpers and loop only for REP.
+
+    fn string_movs(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
+        let step = self.string_step(sized_dword);
+        let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
+            // Source uses DS (overridable); destination uses ES
+            // (NOT overridable). seg_translate captures the
+            // override on the source side; ES base is 0 in flat
+            // 32-bit mode so the destination is unmodified.
+            let src = this.seg_translate(this.regs.get32(Reg32::Esi));
+            let dst = this.regs.get32(Reg32::Edi);
+            if sized_dword {
+                let v = mmu.load32(src)?;
+                mmu.store32(dst, v)?;
+            } else {
+                let v = mmu.load8(src)?;
+                mmu.store8(dst, v)?;
+            }
+            this.regs.set32(
+                Reg32::Esi,
+                this.regs.get32(Reg32::Esi).wrapping_add(step as u32),
+            );
+            this.regs.set32(
+                Reg32::Edi,
+                this.regs.get32(Reg32::Edi).wrapping_add(step as u32),
+            );
+            Ok(())
+        };
+        self.string_loop(mmu, do_one, /*compare*/ false)
+    }
+
+    fn string_stos(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
+        let step = self.string_step(sized_dword);
+        let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
+            let dst = this.regs.get32(Reg32::Edi);
+            if sized_dword {
+                mmu.store32(dst, this.regs.get32(Reg32::Eax))?;
+            } else {
+                mmu.store8(dst, this.regs.get8(Reg8::Al))?;
+            }
+            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            Ok(())
+        };
+        self.string_loop(mmu, do_one, /*compare*/ false)
+    }
+
+    fn string_lods(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
+        let step = self.string_step(sized_dword);
+        let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
+            let src = this.regs.get32(Reg32::Esi);
+            if sized_dword {
+                let v = mmu.load32(src)?;
+                this.regs.set32(Reg32::Eax, v);
+            } else {
+                let v = mmu.load8(src)?;
+                this.regs.set8(Reg8::Al, v);
+            }
+            this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
+            Ok(())
+        };
+        self.string_loop(mmu, do_one, /*compare*/ false)
+    }
+
+    fn string_cmps(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
+        let step = self.string_step(sized_dword);
+        let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
+            let src = this.regs.get32(Reg32::Esi);
+            let dst = this.regs.get32(Reg32::Edi);
+            if sized_dword {
+                let a = mmu.load32(src)?;
+                let b = mmu.load32(dst)?;
+                let _ = alu_sub_32(a, b, &mut this.regs.flags);
+            } else {
+                let a = mmu.load8(src)?;
+                let b = mmu.load8(dst)?;
+                let _ = alu_sub_8(a, b, &mut this.regs.flags);
+            }
+            this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
+            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            Ok(())
+        };
+        self.string_loop(mmu, do_one, /*compare*/ true)
+    }
+
+    fn string_scas(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
+        let step = self.string_step(sized_dword);
+        let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
+            let dst = this.regs.get32(Reg32::Edi);
+            if sized_dword {
+                let v = mmu.load32(dst)?;
+                let acc = this.regs.get32(Reg32::Eax);
+                let _ = alu_sub_32(acc, v, &mut this.regs.flags);
+            } else {
+                let v = mmu.load8(dst)?;
+                let acc = this.regs.get8(Reg8::Al);
+                let _ = alu_sub_8(acc, v, &mut this.regs.flags);
+            }
+            this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
+            Ok(())
+        };
+        self.string_loop(mmu, do_one, /*compare*/ true)
+    }
+
+    /// +1 or -1 depending on DF and operand size. (Sign-extended
+    /// later via `as u32` so wrapping_add does the right thing.)
+    fn string_step(&self, sized_dword: bool) -> i32 {
+        let inc: i32 = if sized_dword { 4 } else { 1 };
+        if self.regs.flags.df {
+            -inc
+        } else {
+            inc
+        }
+    }
+
+    /// Common REP/REPE/REPNE wrapper. `compare` selects the
+    /// repeat-while-flag termination semantics for CMPS/SCAS.
+    fn string_loop(
+        &mut self,
+        mmu: &mut Mmu,
+        mut step: impl FnMut(&mut Self, &mut Mmu) -> Result<(), Trap>,
+        compare: bool,
+    ) -> Result<StepOk, Trap> {
+        match self.rep_prefix {
+            None => {
+                step(self, mmu)?;
+                Ok(StepOk::Continued)
+            }
+            Some(rep) => {
+                while self.regs.get32(Reg32::Ecx) != 0 {
+                    step(self, mmu)?;
+                    let new_ecx = self.regs.get32(Reg32::Ecx).wrapping_sub(1);
+                    self.regs.set32(Reg32::Ecx, new_ecx);
+                    if compare {
+                        let zf = self.regs.flags.zf;
+                        let stop = match rep {
+                            RepPrefix::Rep => !zf,  // REPE: stop if !ZF
+                            RepPrefix::Repne => zf, // REPNE: stop if ZF
+                        };
+                        if stop {
+                            break;
+                        }
+                    }
+                }
+                Ok(StepOk::Continued)
+            }
+        }
+    }
+
     fn group5_rm32(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
         let val = read_operand32(op, &self.regs, mmu)?;
         match mr.reg {
             0 => {
@@ -1169,8 +2096,20 @@ enum Op16Dst {
     Mem(u32),
 }
 
+/// Shift-count source for Group-2 (rotate / shift) opcodes.
+#[derive(Copy, Clone, Debug)]
+enum ShiftCount {
+    /// Implicit count of 1 (`D0` / `D1`).
+    One,
+    /// Count from the `CL` register (`D2` / `D3`).
+    Cl,
+    /// 8-bit immediate following the ModR/M (`C0` / `C1`).
+    Imm8,
+}
+
 // Helper signature: (lhs, rhs, flags) -> (result, write_back).
 type AluFn32 = fn(u32, u32, &mut Flags) -> (u32, bool);
+type AluFn8 = fn(u8, u8, &mut Flags) -> (u8, bool);
 
 fn alu_add_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
     let (result, carry) = lhs.overflowing_add(rhs);
@@ -1227,51 +2166,117 @@ fn alu_test_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
     (r, false)
 }
 
+fn alu_adc_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
+    let cf = f.cf as u32;
+    let s1 = lhs.wrapping_add(rhs);
+    let result = s1.wrapping_add(cf);
+    let new_cf = result < lhs || (cf == 1 && rhs == u32::MAX);
+    f.cf = new_cf;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ result) & (rhs ^ result)) & 0x8000_0000) != 0;
+    f.set_szp_32(result);
+    (result, true)
+}
+
+fn alu_sbb_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
+    let cf = f.cf as u32;
+    let s1 = lhs.wrapping_sub(rhs);
+    let result = s1.wrapping_sub(cf);
+    // Borrow: lhs < rhs + cf (extended).
+    let total = u64::from(rhs) + u64::from(cf);
+    f.cf = u64::from(lhs) < total;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000_0000) != 0;
+    f.set_szp_32(result);
+    (result, true)
+}
+
+// ----- 8-bit ALU primitives -----------------------------------
+
+fn alu_add_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let (result, carry) = lhs.overflowing_add(rhs);
+    f.cf = carry;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ result) & (rhs ^ result)) & 0x80) != 0;
+    f.set_szp_8(result);
+    (result, true)
+}
+
+fn alu_sub_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let (result, borrow) = lhs.overflowing_sub(rhs);
+    f.cf = borrow;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x80) != 0;
+    f.set_szp_8(result);
+    (result, true)
+}
+
+fn alu_cmp_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let (_r, _w) = alu_sub_8(lhs, rhs, f);
+    (0, false)
+}
+
+fn alu_and_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let r = lhs & rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_8(r);
+    (r, true)
+}
+
+fn alu_or_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let r = lhs | rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_8(r);
+    (r, true)
+}
+
+fn alu_xor_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let r = lhs ^ rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_8(r);
+    (r, true)
+}
+
+fn alu_adc_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let cf = f.cf as u8;
+    let s1 = lhs.wrapping_add(rhs);
+    let result = s1.wrapping_add(cf);
+    let total = u16::from(rhs) + u16::from(cf);
+    f.cf = u16::from(lhs) + total > 0xFF;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ result) & (rhs ^ result)) & 0x80) != 0;
+    f.set_szp_8(result);
+    (result, true)
+}
+
+fn alu_sbb_8(lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
+    let cf = f.cf as u8;
+    let s1 = lhs.wrapping_sub(rhs);
+    let result = s1.wrapping_sub(cf);
+    let total = u16::from(rhs) + u16::from(cf);
+    f.cf = u16::from(lhs) < total;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x80) != 0;
+    f.set_szp_8(result);
+    (result, true)
+}
+
 /// /reg subop dispatch for 0x80 (r/m8, imm8). Returns (result,
 /// write_back). 0=ADD 1=OR 2=ADC 3=SBB 4=AND 5=SUB 6=XOR 7=CMP.
 fn group1_op_8(reg: u8, lhs: u8, rhs: u8, f: &mut Flags) -> (u8, bool) {
     match reg {
-        0 => {
-            let (r, c) = lhs.overflowing_add(rhs);
-            f.cf = c;
-            f.set_szp_8(r);
-            (r, true)
-        }
-        1 => {
-            let r = lhs | rhs;
-            f.cf = false;
-            f.of = false;
-            f.set_szp_8(r);
-            (r, true)
-        }
-        4 => {
-            let r = lhs & rhs;
-            f.cf = false;
-            f.of = false;
-            f.set_szp_8(r);
-            (r, true)
-        }
-        5 => {
-            let (r, b) = lhs.overflowing_sub(rhs);
-            f.cf = b;
-            f.set_szp_8(r);
-            (r, true)
-        }
-        6 => {
-            let r = lhs ^ rhs;
-            f.cf = false;
-            f.of = false;
-            f.set_szp_8(r);
-            (r, true)
-        }
-        7 => {
-            // CMP — flags only
-            let (r, b) = lhs.overflowing_sub(rhs);
-            f.cf = b;
-            f.set_szp_8(r);
-            (0, false)
-        }
-        _ => (0, false), // ADC/SBB unimplemented for round 1
+        0 => alu_add_8(lhs, rhs, f),
+        1 => alu_or_8(lhs, rhs, f),
+        2 => alu_adc_8(lhs, rhs, f),
+        3 => alu_sbb_8(lhs, rhs, f),
+        4 => alu_and_8(lhs, rhs, f),
+        5 => alu_sub_8(lhs, rhs, f),
+        6 => alu_xor_8(lhs, rhs, f),
+        7 => alu_cmp_8(lhs, rhs, f),
+        _ => unreachable!(),
     }
 }
 
@@ -1279,27 +2284,12 @@ fn group1_op_32(reg: u8, lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
     match reg {
         0 => alu_add_32(lhs, rhs, f),
         1 => alu_or_32(lhs, rhs, f),
+        2 => alu_adc_32(lhs, rhs, f),
+        3 => alu_sbb_32(lhs, rhs, f),
         4 => alu_and_32(lhs, rhs, f),
         5 => alu_sub_32(lhs, rhs, f),
         6 => alu_xor_32(lhs, rhs, f),
         7 => alu_cmp_32(lhs, rhs, f),
-        // ADC (2) / SBB (3) — partial implementations: use CF
-        2 => {
-            let cf = f.cf as u32;
-            let (s1, c1) = lhs.overflowing_add(rhs);
-            let (s2, c2) = s1.overflowing_add(cf);
-            f.cf = c1 || c2;
-            f.set_szp_32(s2);
-            (s2, true)
-        }
-        3 => {
-            let cf = f.cf as u32;
-            let (s1, b1) = lhs.overflowing_sub(rhs);
-            let (s2, b2) = s1.overflowing_sub(cf);
-            f.cf = b1 || b2;
-            f.set_szp_32(s2);
-            (s2, true)
-        }
         _ => unreachable!(),
     }
 }
@@ -1580,5 +2570,153 @@ mod tests {
             Err(Trap::InstructionLimitExceeded { .. }) => (),
             other => panic!("expected instr-limit trap, got {other:?}"),
         }
+    }
+
+    // ----- round 5 opcode regression tests --------------------------
+
+    #[test]
+    fn add_al_imm8_wraps_and_sets_carry() {
+        let (mut cpu, mut mmu) = make();
+        // mov al, 0xFE   B0 FE
+        // add al, 5      04 05  ; 0xFE + 5 = 0x103 → AL=0x03 CF=1
+        // ret            C3
+        write_code(&mut mmu, 0x1000, &[0xB0, 0xFE, 0x04, 0x05, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get8(Reg8::Al), 0x03);
+        assert!(cpu.regs.flags.cf, "AL+imm8 carry not set");
+    }
+
+    #[test]
+    fn cmp_al_imm8_sets_zf_when_equal() {
+        let (mut cpu, mut mmu) = make();
+        // mov al, 0x42 ; cmp al, 0x42 ; ret
+        write_code(&mut mmu, 0x1000, &[0xB0, 0x42, 0x3C, 0x42, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert!(cpu.regs.flags.zf);
+        assert!(!cpu.regs.flags.cf);
+    }
+
+    #[test]
+    fn imul_r32_imm8_signed() {
+        let (mut cpu, mut mmu) = make();
+        // mov ebx, 0xFFFFFFFF (-1) ; imul eax, ebx, 7 ; ret  → eax = -7 = 0xFFFFFFF9
+        // BB FF FF FF FF       6B C3 07     C3
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0x6B, 0xC3, 0x07, 0xC3],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xFFFF_FFF9);
+    }
+
+    #[test]
+    fn rep_movs_d_copies_dword_per_step_until_ecx_zero() {
+        let (mut cpu, mut mmu) = make();
+        // Lay out two 8-byte buffers in the data page.
+        mmu.write_initializer(0x4100, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .unwrap();
+        // mov esi, 0x4100   BE 00 41 00 00
+        // mov edi, 0x4200   BF 00 42 00 00
+        // mov ecx, 2        B9 02 00 00 00
+        // rep movsd         F3 A5
+        // ret               C3
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0xBE, 0x00, 0x41, 0x00, 0x00, 0xBF, 0x00, 0x42, 0x00, 0x00, 0xB9, 0x02, 0x00, 0x00,
+                0x00, 0xF3, 0xA5, 0xC3,
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        for i in 0..8 {
+            assert_eq!(mmu.load8(0x4200 + i).unwrap(), (i + 1) as u8);
+        }
+        assert_eq!(cpu.regs.get32(Reg32::Ecx), 0);
+    }
+
+    #[test]
+    fn fs_segment_translates_address() {
+        let (mut cpu, mut mmu) = make();
+        // Map a "TEB" page at 0x5000 and seed FS:[0]=0xCAFE.
+        mmu.map(0x5000, 0x1000, Perm::R | Perm::W);
+        mmu.write_initializer(0x5000, &0xCAFEu32.to_le_bytes())
+            .unwrap();
+        cpu.set_fs_base(0x5000);
+        // mov eax, fs:[0]  64 A1 00 00 00 00
+        // ret              C3
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[0x64, 0xA1, 0x00, 0x00, 0x00, 0x00, 0xC3],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xCAFE);
+    }
+
+    #[test]
+    fn cmovz_copies_when_zf_set() {
+        let (mut cpu, mut mmu) = make();
+        // xor eax, eax    33 C0           ; eax=0, ZF=1
+        // mov ebx, 0x77   BB 77 00 00 00
+        // cmovz eax, ebx  0F 44 C3        ; ZF=1 → eax=ebx=0x77
+        // ret             C3
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x33, 0xC0, 0xBB, 0x77, 0x00, 0x00, 0x00, 0x0F, 0x44, 0xC3, 0xC3,
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0x77);
+    }
+
+    #[test]
+    fn bswap_swaps_byte_order() {
+        let (mut cpu, mut mmu) = make();
+        // mov eax, 0x11223344  ; bswap eax  ; ret  → 0x44332211
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x0F, 0xC8, 0xC3],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0x4433_2211);
+    }
+
+    #[test]
+    fn group2_rm8_shl_sets_flags() {
+        let (mut cpu, mut mmu) = make();
+        // mov al, 0x40  B0 40
+        // shl al, 2     C0 E0 02   → al = 0x100 truncated = 0x00, CF = bit 6 (1)
+        // ret           C3
+        write_code(&mut mmu, 0x1000, &[0xB0, 0x40, 0xC0, 0xE0, 0x02, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get8(Reg8::Al), 0x00);
+        assert!(cpu.regs.flags.cf);
+    }
+
+    #[test]
+    fn pushad_popad_round_trip() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xAAA);
+        cpu.regs.set32(Reg32::Ecx, 0xCCC);
+        cpu.regs.set32(Reg32::Edx, 0xDDD);
+        cpu.regs.set32(Reg32::Ebx, 0xBBB);
+        cpu.regs.set32(Reg32::Ebp, 0x1BB);
+        cpu.regs.set32(Reg32::Esi, 0x1EE);
+        cpu.regs.set32(Reg32::Edi, 0x1DD);
+        // pushad ; popad ; ret  →  60 61 C3
+        write_code(&mut mmu, 0x1000, &[0x60, 0x61, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xAAA);
+        assert_eq!(cpu.regs.get32(Reg32::Ecx), 0xCCC);
+        assert_eq!(cpu.regs.get32(Reg32::Edx), 0xDDD);
+        assert_eq!(cpu.regs.get32(Reg32::Ebx), 0xBBB);
+        assert_eq!(cpu.regs.get32(Reg32::Ebp), 0x1BB);
+        assert_eq!(cpu.regs.get32(Reg32::Esi), 0x1EE);
+        assert_eq!(cpu.regs.get32(Reg32::Edi), 0x1DD);
     }
 }

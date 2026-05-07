@@ -34,6 +34,18 @@ const STACK_BOTTOM: u32 = 0x9000_0000;
 const STACK_SIZE: u32 = 0x0010_0000; // 1 MiB
 const STACK_TOP: u32 = STACK_BOTTOM + STACK_SIZE;
 
+/// Thread Environment Block — Windows places its TEB at
+/// `0x7FFD_E000` historically. We map a 4 KiB page here and
+/// stage the SEH chain head (`FS:[0]`) to `0xFFFF_FFFF` ("end of
+/// chain"). Real Windows fills many more fields; for the codec
+/// CRT init we only need a writable page so the codec's SEH
+/// `__try` setup can save the prior chain head, write its own,
+/// and restore on exit.
+const TEB_BASE: u32 = 0x7FFD_E000;
+const TEB_SIZE: u32 = 0x0000_1000; // 4 KiB
+/// `EXCEPTION_REGISTRATION_RECORD*` initialiser at FS:[0].
+const SEH_END_OF_CHAIN: u32 = 0xFFFF_FFFF;
+
 /// One sandbox instance per loaded codec DLL.
 pub struct Sandbox {
     pub mmu: Mmu,
@@ -70,9 +82,20 @@ impl Sandbox {
         );
         // Stack (R+W)
         mmu.map(STACK_BOTTOM, STACK_SIZE, Perm::R | Perm::W);
+        // TEB / FS-segment data (R+W). Initialise FS:[0] = -1
+        // (no SEH handler installed) and FS:[0x18] = TEB self
+        // pointer per the Windows TEB ABI used by Win32 CRTs.
+        mmu.map(TEB_BASE, TEB_SIZE, Perm::R | Perm::W);
+        mmu.write_initializer(TEB_BASE, &SEH_END_OF_CHAIN.to_le_bytes())
+            .expect("seed TEB FS:[0]");
+        mmu.write_initializer(TEB_BASE + 0x18, &TEB_BASE.to_le_bytes())
+            .expect("seed TEB FS:[0x18] (self pointer)");
+        // FS:[0x30] would be the PEB pointer — we leave it 0
+        // until a codec actually dereferences it.
 
         let mut cpu = Cpu::new();
         cpu.regs.set_esp(STACK_TOP - 0x100); // leave a guard at the top
+        cpu.set_fs_base(TEB_BASE);
 
         let mut registry = Registry::new();
         registry.register_all();

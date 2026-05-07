@@ -280,27 +280,58 @@ fn icdecompress_struct_size_matches_marshalling() {
     assert_eq!(BIH_SIZE, 40);
 }
 
-/// Round-4 real-codec walkthrough. Loads Intel's Indeo 3
+/// Round-5 real-codec walkthrough. Loads Intel's Indeo 3
 /// redistributable, calls `DllMain(DLL_PROCESS_ATTACH, NULL)`,
 /// then runs `ICOpen('VIDC','IV31',ICMODE_DECOMPRESS) → ICGetInfo
 /// → ICClose`. The codec name read out of `szName` in `ICINFO`
 /// is asserted ASCII-printable + non-empty.
 ///
-/// **End of round 4 (this round)**: `Sandbox::load` succeeds —
-/// the round-1+2 stub registry plus the 49 round-4 stubs cover
-/// every Win32 import the DLL declares. `DllMain` then traps on
-/// the first ISA opcode our integer interpreter does not yet
-/// model: `ADD AL, imm8` (opcode `0x04`) at
-/// `eip = 0x1000_612A`. That's the round-5 todo list.
+/// Round-4 reached the first undecoded ISA opcode trap (`ADD
+/// AL,imm8` at `eip=0x1000_612A`); round 5 closes that gap and
+/// every other gap up to the codec's `DRV_OPEN → ICM_GETINFO →
+/// DRV_CLOSE` walk. Specifically round 5 added:
 ///
-/// `ICMODE_DECOMPRESS = 1` (vfw.h). The fcc_handler `IV31` is
-/// Indeo 3.2's canonical 4cc. The trap-asserting form below is
-/// the **active round-4 form**: it lets CI flip to "trap landed
-/// at exactly the round-5 entry point" rather than masking the
-/// trap with a panic.
+/// * 8-bit primary ALU opcodes (`0x00..=0x05`, `0x08..=0x0D`,
+///   `0x10..=0x15`, …, `0x38..=0x3D`) plus their `r/m8 imm8`
+///   group-1 (`0x80`) and `r/m8` group-3 (`0xF6`) forms.
+/// * Group-2 shifts on `r/m8` (`0xC0` / `0xD0` / `0xD2`) plus
+///   `r/m32` immediate / `cl` / `1` variants (`0xD1` / `0xD3`).
+/// * `IMUL r32, r/m32, imm32`/`imm8` (`0x69` / `0x6B`).
+/// * `XCHG r/m, r` (`0x86` / `0x87`).
+/// * `MOVS` / `STOS` / `LODS` / `CMPS` / `SCAS` (incl. `REP`
+///   prefix loops over `ECX`).
+/// * `SAHF` (`0x9E`) / `LAHF` (`0x9F`) / `CMC` (`0xF5`).
+/// * `PUSHAD` (`0x60`) / `POPAD` (`0x61`) / `ENTER` (`0xC8`).
+/// * `INC/DEC r/m8` group-4 (`0xFE`).
+/// * `0F 40..4F CMOVcc r32, r/m32`.
+/// * `0F A3 BT` / `0F AB BTS` / `0F BA group-8` (BT/BTS/BTR/BTC
+///   with imm8) / `0F A4..A5 SHLD` / `0F AC..AD SHRD` /
+///   `0F B1 CMPXCHG` / `0F C1 XADD` / `0F C8..CF BSWAP`.
+/// * Segment-override prefixes (`0x26 / 0x2E / 0x36 / 0x3E /
+///   0x64 / 0x65`) now route through a per-instruction
+///   [`Cpu::set_fs_base`] / `set_gs_base`. The runtime maps a
+///   4 KiB TEB at `0x7FFD_E000`, primes `FS:[0]` (SEH chain
+///   end-of-list) + `FS:[0x18]` (TEB self-pointer), and points
+///   FS at it. This is what gets the codec's `_try` setup past
+///   `mov eax, fs:[0]`.
+///
+/// In round 4 the `vfw32::ic_open` host wrapper passed `NULL`
+/// for the `ICOPEN*` parameter, which prompted Indeo 3 to return
+/// the magic value `0xFFFF_0000` — not a real per-instance
+/// pointer. Round 5 stages a real 36-byte `ICOPEN`
+/// (`dwSize / fccType / fccHandler / dwVersion / dwFlags / …`)
+/// so the codec's `DRV_OPEN` allocates real state. Likewise the
+/// `ICM_*` numeric values were wrong (round-4 used `ICM_USER + N`
+/// for `N ∈ {0, 0x29, 0x2A, …}`, but the canonical SDK header
+/// has `ICM_GETINFO = ICM_RESERVED + 2 = 0x5002`,
+/// `ICM_DECOMPRESS_QUERY = ICM_USER + 11 = 0x400B`, etc.).
+///
+/// `ICMODE_DECOMPRESS = 2` (vfw.h). Note round-4 used 1 here,
+/// which is actually `ICMODE_COMPRESS`.
 #[test]
 fn indeo3_driverproc_open_getinfo_close_smoke() {
-    const ICMODE_DECOMPRESS: u32 = 1;
+    /// vfw.h: `ICMODE_DECOMPRESS = 2`.
+    const ICMODE_DECOMPRESS: u32 = 2;
     /// `ICINFO` total size (`dwSize..szDriver[128]`):
     /// 6 dwords + 16 WCHARs + 128 WCHARs + 128 WCHARs
     /// = 24 + 32 + 256 + 256 = 568 bytes.
@@ -311,88 +342,62 @@ fn indeo3_driverproc_open_getinfo_close_smoke() {
 
     let mut sb = Sandbox::new();
     let img = sb.load("IR32_32.DLL", &bytes).expect(
-        "round 4 must load IR32_32.DLL cleanly — every Win32 import \
+        "round 4+ must load IR32_32.DLL cleanly — every Win32 import \
          is now stubbed. If this fails, the asserted import surface \
          in tests/m1_load_dll_main.rs has drifted.",
     );
 
-    // 1. DllMain. Round-4 expectation: traps at the first ISA
-    // opcode the integer interpreter does not yet decode —
-    // `ADD AL, imm8` (opcode 0x04) inside the codec's CRT init.
-    // That trap is the round-5 todo list. We assert on the
-    // exact variant + EIP so any drift is loud.
-    let dll_main_result = sb.call_dll_main(&img, oxideav_vfw::DLL_PROCESS_ATTACH);
-    match dll_main_result {
-        Err(oxideav_vfw::Error::Trap(oxideav_vfw::emulator::Trap::UndefinedOpcode {
-            eip,
-            opcode,
-        })) => {
-            eprintln!(
-                "round 4 outcome: IR32_32.DLL DllMain reached opcode {opcode:#06x} at \
-                 eip={eip:#010x} — round-5 todo: implement ADD AL,imm8 (opcode 0x04) \
-                 + whatever else the i386 base ISA decoder is missing in the codec's \
-                 CRT init path."
-            );
-            // Round-4 boundary: opcode is exactly 0x04 (ADD AL, imm8)
-            // at EIP 0x1000_612A. If a future ISA-decoder change
-            // teaches the interpreter that opcode, this assertion
-            // will fail with a different (eip, opcode) pair —
-            // exactly the round-5 hand-off signal.
-            assert_eq!(
-                opcode, 0x04,
-                "round 4 expected the first undefined-opcode trap to be 0x04 (ADD AL,imm8); \
-                 got {opcode:#06x} at eip={eip:#010x}"
-            );
-            // Document that this is the round-5 entry point for
-            // future readers — the EIP is stable across runs.
-        }
-        Err(other) => {
-            // Anything else means we either passed the CRT init
-            // (great — proceed to ICOpen below) or hit a
-            // different failure mode that's the new round-5 todo.
-            panic!(
-                "IR32_32.DLL DllMain returned an unexpected error \
-                 (round 4 expected the 0x04 opcode trap; round 5 \
-                 likely advanced past it):\n  {other}"
-            );
-        }
-        Ok(_) => {
-            // Round 5+ has landed `ADD AL,imm8` and DllMain is
-            // running further. Drop into the full IC* pipeline
-            // so this test can keep being the next round's
-            // bootstrap signal.
-            indeo3_walk_ic_pipeline(&mut sb, &img, ICMODE_DECOMPRESS, ICINFO_SIZE);
-        }
-    }
-}
+    // 1. DllMain — round 5 walks all the way to RET_SENTINEL.
+    let dll_main_ret = sb
+        .call_dll_main(&img, oxideav_vfw::DLL_PROCESS_ATTACH)
+        .expect(
+            "round 5: IR32_32.DLL DllMain must return cleanly. If this \
+             traps, the i386 ISA / Win32 stub set has regressed somewhere \
+             on the codec's CRT init path.",
+        );
+    assert_ne!(
+        dll_main_ret, 0,
+        "DllMain returned 0 — TRUE expected for DLL_PROCESS_ATTACH"
+    );
 
-/// Round 5+ post-DllMain walkthrough. Walks `install_codec →
-/// ICOpen → ICGetInfo → szName decode → ICClose` end-to-end.
-fn indeo3_walk_ic_pipeline(
-    sb: &mut Sandbox,
-    img: &oxideav_vfw::pe::Image,
-    icmode_decompress: u32,
-    icinfo_size: u32,
-) {
-    // install_codec → ICOpen('VIDC', 'IV31', ICMODE_DECOMPRESS).
-    sb.install_codec(img).expect("DriverProc not exported");
+    // 2. install_codec → ICOpen('VIDC', 'IV31', ICMODE_DECOMPRESS).
+    sb.install_codec(&img).expect("DriverProc not exported");
     let fcc_video = u32::from_le_bytes(*b"VIDC");
     let fcc_iv31 = u32::from_le_bytes(*b"IV31");
     let hic = sb
-        .ic_open(fcc_video, fcc_iv31, icmode_decompress)
+        .ic_open(fcc_video, fcc_iv31, ICMODE_DECOMPRESS)
         .unwrap_or_else(|e| panic!("IR32_32.DLL ICOpen('VIDC','IV31',DECOMPRESS) trap:\n  {e}"));
     assert_ne!(
         hic, 0,
         "ICOpen returned NULL HIC — DriverProc rejected DRV_OPEN"
     );
 
-    // ICGetInfo — codec writes its identity card.
+    // 3. ICGetInfo — codec fills `dwSize / fccType / fccHandler /
+    //    dwFlags / dwVersion / dwVersionICM`. Indeo 3 doesn't
+    //    populate `szName` (vfw32 normally fills it from the
+    //    registry); `vfw32::ic_get_info` falls back to a
+    //    fcc-derived ASCII rendering when the codec leaves it
+    //    NUL.
     let info = sb
-        .ic_get_info(hic, icinfo_size)
+        .ic_get_info(hic, ICINFO_SIZE)
         .unwrap_or_else(|e| panic!("IR32_32.DLL ICGetInfo trap:\n  {e}"));
     assert!(
         !info.is_empty(),
         "ICGetInfo returned 0 bytes — codec did not write its identity card"
+    );
+    assert!(info.len() >= 24, "ICGetInfo returned a truncated header");
+    let dw_size = u32::from_le_bytes(info[0..4].try_into().unwrap());
+    assert_eq!(
+        dw_size, ICINFO_SIZE,
+        "ICINFO.dwSize mismatch — codec wrote {dw_size}"
+    );
+    // Indeo 3 lowercases fccType into szName-friendly bytes
+    // before writing it back, so accept either case.
+    let fcc_type = u32::from_le_bytes(info[4..8].try_into().unwrap());
+    let fcc_video_lc = u32::from_le_bytes(*b"vidc");
+    assert!(
+        fcc_type == fcc_video || fcc_type == fcc_video_lc,
+        "ICINFO.fccType is neither 'VIDC' nor 'vidc' — got {fcc_type:#010x}"
     );
 
     // szName is at offset 24 (after 6 dwords). It's a UTF-16LE
@@ -400,7 +405,8 @@ fn indeo3_walk_ic_pipeline(
     let name = decode_utf16le_until_nul(&info, 24, 16);
     assert!(
         !name.is_empty(),
-        "ICGetInfo szName empty — Indeo 3 should report a codec name"
+        "ICGetInfo szName empty — vfw32::ic_get_info should fall back \
+         to fcc handler when the codec leaves szName NUL"
     );
     assert!(
         name.chars().all(|c| (0x20..=0x7E).contains(&(c as u32))),
@@ -408,10 +414,11 @@ fn indeo3_walk_ic_pipeline(
     );
     eprintln!("Indeo 3 codec name: {name:?}");
 
-    // ICClose.
-    if let Err(e) = sb.ic_close(hic) {
-        panic!("IR32_32.DLL ICClose trap:\n  {e}");
-    }
+    // 4. ICClose.
+    let close_lr = sb
+        .ic_close(hic)
+        .unwrap_or_else(|e| panic!("IR32_32.DLL ICClose trap:\n  {e}"));
+    let _ = close_lr; // codecs return 0 / 1 / DRVCNF_OK, no canonical "success"
 }
 
 /// Decode a fixed-length UTF-16LE field (`field_chars` 16-bit

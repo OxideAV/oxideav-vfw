@@ -40,31 +40,38 @@ pub const DRV_OPEN: u32 = 0x0003;
 /// `mmsystem.h`: Driver-proc message — the driver is being closed.
 pub const DRV_CLOSE: u32 = 0x0004;
 
-/// vfw.h: `ICM_USER` is the start of the IC message space.
+/// vfw.h: `ICM_USER = DRV_USER + 0x0000 = 0x4000`. Start of the
+/// IC message space.
 pub const ICM_USER: u32 = 0x4000;
 
-// `ICM_*` message ids (vfw.h):
-//   ICM_GETINFO            = ICM_USER + 0   (compress: 0x4000)
-//   ICM_DECOMPRESS_QUERY   = ICM_USER + 0x29 (0x4029)
-//   ICM_DECOMPRESS_BEGIN   = ICM_USER + 0x2A (0x402A)
-//   ICM_DECOMPRESS_END     = ICM_USER + 0x2B (0x402B)
-//   ICM_DECOMPRESS         = ICM_USER + 0x2C (0x402C)
-//   ICM_DECOMPRESS_GET_FORMAT      = ICM_USER + 0x21 (0x4021)
-//   ICM_DECOMPRESS_GET_PALETTE     = ICM_USER + 0x22 (0x4022)
-// (See vfw.h's ICM_* numeric block.)
+/// vfw.h: `ICM_RESERVED_LOW = DRV_USER + 0x1000 = 0x5000`. Used
+/// as the base for `ICM_GETINFO` etc.
+pub const ICM_RESERVED: u32 = 0x5000;
+
+// Authoritative `ICM_*` numeric values (vfw.h, Windows 10 SDK):
+//   ICM_GETINFO            = ICM_RESERVED + 2   (0x5002)
+//   ICM_DECOMPRESS_QUERY   = ICM_USER + 11      (0x400B)
+//   ICM_DECOMPRESS_BEGIN   = ICM_USER + 16      (0x4010)
+//   ICM_DECOMPRESS_END     = ICM_USER + 14      (0x400E)
+//   ICM_DECOMPRESS         = ICM_USER + 13      (0x400D)
+//   ICM_DECOMPRESS_GET_FORMAT      = ICM_USER + 8  (0x4008)
+//   ICM_DECOMPRESS_GET_PALETTE     = ICM_USER + 26 (0x401A)
+// Round-4's table was wrong (used `ICM_USER + 0/0x29/0x2A/0x2B/0x2C`)
+// — fixed in round 5 because Indeo 3's DriverProc dispatches on
+// the canonical values, returning ICERR_UNSUPPORTED otherwise.
 
 /// `vfw.h`: `ICM_GETINFO` (request the codec's identity card).
-pub const ICM_GETINFO: u32 = ICM_USER;
+pub const ICM_GETINFO: u32 = ICM_RESERVED + 2;
 /// `vfw.h`: `ICM_DECOMPRESS_GET_FORMAT`.
-pub const ICM_DECOMPRESS_GET_FORMAT: u32 = ICM_USER + 0x21;
+pub const ICM_DECOMPRESS_GET_FORMAT: u32 = ICM_USER + 8;
 /// `vfw.h`: `ICM_DECOMPRESS_QUERY` — can we decompress this format?
-pub const ICM_DECOMPRESS_QUERY: u32 = ICM_USER + 0x29;
-/// `vfw.h`: `ICM_DECOMPRESS_BEGIN`.
-pub const ICM_DECOMPRESS_BEGIN: u32 = ICM_USER + 0x2A;
-/// `vfw.h`: `ICM_DECOMPRESS_END`.
-pub const ICM_DECOMPRESS_END: u32 = ICM_USER + 0x2B;
+pub const ICM_DECOMPRESS_QUERY: u32 = ICM_USER + 11;
 /// `vfw.h`: `ICM_DECOMPRESS`.
-pub const ICM_DECOMPRESS: u32 = ICM_USER + 0x2C;
+pub const ICM_DECOMPRESS: u32 = ICM_USER + 13;
+/// `vfw.h`: `ICM_DECOMPRESS_END`.
+pub const ICM_DECOMPRESS_END: u32 = ICM_USER + 14;
+/// `vfw.h`: `ICM_DECOMPRESS_BEGIN`.
+pub const ICM_DECOMPRESS_BEGIN: u32 = ICM_USER + 16;
 
 // vfw.h: ICDECOMPRESS dwFlags
 /// "This is a key/intra frame" — set on the first frame and on
@@ -245,18 +252,49 @@ pub fn ic_open(
         }
         .into());
     }
-    // Real vfw32 calls DriverProc(dwDriverId=0, hdrvr=0,
-    // DRV_OPEN, 0, &ICOPEN). We pass NULL for the ICOPEN
-    // structure — Cinepak / Indeo handle a NULL pParam fine
-    // (the ICOPEN is purely informational; mode + types are
-    // stored on the host side).
+    // Real vfw32 calls
+    //   DriverProc(dwDriverId=0, hdrvr=0, DRV_OPEN, 0, &ICOPEN).
+    // The ICOPEN structure (vfw.h) is what triggers the codec to
+    // allocate per-instance state and return a real pointer-as-
+    // dwDriverId. Round-4 passed NULL for `lParam2`; Indeo 3 then
+    // returns the magic sentinel 0xFFFF0000, which is NOT a real
+    // pointer — every subsequent message that dereferences
+    // `dwDriverId` faults. Round-5 stages a real ICOPEN.
+    //
+    // ICOPEN layout (vfw.h, 36 bytes, 9 dwords):
+    //   +0  DWORD   dwSize       = 36
+    //   +4  DWORD   fccType      = caller's `fcc_type`  ('VIDC')
+    //   +8  DWORD   fccHandler   = caller's `fcc_handler` ('IV31')
+    //   +12 DWORD   dwVersion    = 0x00010000 (vfw 1.0)
+    //   +16 DWORD   dwFlags      = caller's `mode`
+    //   +20 LRESULT dwError      = 0 (out — codec sets on err)
+    //   +24 LPVOID  pV1Reserved  = 0
+    //   +28 LPVOID  pV2Reserved  = 0
+    //   +32 DWORD   dnDevNode    = 0
+    const ICOPEN_SIZE: u32 = 36;
+    let icopen = state.arena_alloc(ICOPEN_SIZE)?;
+    let bytes: [u8; 36] = {
+        let mut b = [0u8; 36];
+        b[0..4].copy_from_slice(&ICOPEN_SIZE.to_le_bytes());
+        b[4..8].copy_from_slice(&fcc_type.to_le_bytes());
+        b[8..12].copy_from_slice(&fcc_handler.to_le_bytes());
+        b[12..16].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        b[16..20].copy_from_slice(&mode.to_le_bytes());
+        // dwError, pV1, pV2, dnDevNode all left as 0
+        b
+    };
+    mmu.write_initializer(icopen, &bytes)
+        .map_err(|t| Win32Error::InvalidArgument {
+            stub: "ICOpen",
+            reason: format!("{t}"),
+        })?;
     let driver_id = call_guest(
         cpu,
         mmu,
         registry,
         state,
         driver_proc,
-        &[0, 0, DRV_OPEN, 0, 0],
+        &[0, 0, DRV_OPEN, 0, icopen],
     )?;
     if driver_id == 0 {
         return Ok(0);
@@ -305,9 +343,20 @@ pub fn ic_close(
     )
 }
 
-/// Synthesise a 112-byte ICINFO record by calling
-/// `DriverProc(_, _, ICM_GETINFO, &icinfo_scratch, sizeof)`.
-/// Returns the raw bytes the codec wrote.
+/// Synthesise an `ICINFO` record by calling
+/// `DriverProc(_, _, ICM_GETINFO, &scratch, cb)` and reading
+/// back what the codec wrote.
+///
+/// Real `vfw32!ICGetInfo` populates `fccType`, `fccHandler`, and
+/// the three string fields (`szName`, `szDescription`, `szDriver`)
+/// from registry data **before** posting `ICM_GETINFO`, so that
+/// codecs that don't fill the string fields still report a name.
+/// We have no registry; if the codec leaves `szName` empty we
+/// synthesise a four-character ASCII rendering of the fcc handler
+/// so callers (the integration test, the eventual codec wrapper)
+/// see a non-empty descriptor. The fcc-derived fallback is purely
+/// the host-side "I have no registry" cushion, **not** a claim
+/// about what the codec returned.
 pub fn ic_get_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -351,6 +400,18 @@ pub fn ic_get_info(
                 stub: "ICGetInfo",
                 reason: format!("{t}"),
             })?;
+    }
+    // szName starts at offset 24 (dwSize..dwVersionICM = 6 dwords)
+    // and is 16 WCHARs (32 bytes). If the codec left it all-NUL,
+    // fall back to the fcc handler — `vfw32!ICGetInfo` would
+    // normally fill this from a registry "DESCRIPTION" entry.
+    if out.len() >= 24 + 32 && out[24..24 + 32].iter().all(|b| *b == 0) {
+        let fcc = entry.fcc_handler.to_le_bytes();
+        for (i, &c) in fcc.iter().enumerate() {
+            if 24 + i * 2 + 1 < out.len() {
+                out[24 + i * 2] = c;
+            }
+        }
     }
     Ok(out)
 }
