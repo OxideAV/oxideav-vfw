@@ -188,6 +188,15 @@ pub struct HostState {
     pub trace_stubs: bool,
     /// Per-call trace lines populated when [`trace_stubs`] is on.
     pub stub_trace: Vec<String>,
+    /// Set of `DriverProc` VAs that have already received the
+    /// one-time `DRV_LOAD` + `DRV_ENABLE` initialisation pair.
+    /// Round 11 — without this, `IR50_32.DLL`'s `DRV_LOAD` handler
+    /// (which allocates the codec's huffman / inverse-DCT tables
+    /// at `[0x1009c770]`) never runs, and `ICDecompress` later
+    /// reads `[0x1009c770] == NULL` and bails with
+    /// `ICERR_BADIMAGE`. We track per-VA so multi-codec sandboxes
+    /// (round 12+) don't double-load the same driver.
+    pub loaded_drivers: std::collections::BTreeSet<u32>,
 }
 
 impl HostState {
@@ -223,6 +232,7 @@ impl HostState {
             gdi_hdcs: None,
             trace_stubs: false,
             stub_trace: Vec::new(),
+            loaded_drivers: std::collections::BTreeSet::new(),
         }
     }
 

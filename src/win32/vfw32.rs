@@ -35,10 +35,29 @@ use crate::emulator::{Cpu, Mmu};
 
 // --- Constants — vfw.h transcriptions --------------------------------
 
+/// `mmsystem.h`: Driver-proc message — driver code is being
+/// loaded into memory. Sent ONCE, by the system, before any
+/// per-instance `DRV_OPEN`. Real `vfw32!ICOpen` issues this before
+/// the first `DRV_OPEN`. Round 11 — without this, `IR50_32.DLL`'s
+/// global table-init chain (semaphore-guarded one-time setup that
+/// allocates ~400 KB at `[0x1009c770]`) is never run, and the
+/// later `ICDecompress` validation that reads `[0x1009c770]` finds
+/// NULL and bails with `ICERR_BADIMAGE`.
+pub const DRV_LOAD: u32 = 0x0001;
+/// `mmsystem.h`: Driver-proc message — enable the driver.
+/// Sent after `DRV_LOAD` and before per-instance `DRV_OPEN`.
+pub const DRV_ENABLE: u32 = 0x0002;
 /// `mmsystem.h`: Driver-proc message — the driver was just opened.
 pub const DRV_OPEN: u32 = 0x0003;
 /// `mmsystem.h`: Driver-proc message — the driver is being closed.
 pub const DRV_CLOSE: u32 = 0x0004;
+/// `mmsystem.h`: Driver-proc message — disable the driver.
+/// Sent before `DRV_FREE`.
+pub const DRV_DISABLE: u32 = 0x0005;
+/// `mmsystem.h`: Driver-proc message — driver code is being
+/// unloaded. Sent ONCE, after the last `DRV_CLOSE` /
+/// `DRV_DISABLE`.
+pub const DRV_FREE: u32 = 0x0006;
 
 /// vfw.h: `ICM_USER = DRV_USER + 0x0000 = 0x4000`. Start of the
 /// IC message space.
@@ -260,6 +279,35 @@ pub fn ic_open(
             reason: "no codec image staged (host-side)".into(),
         }
         .into());
+    }
+    // Round 11 — before the first DRV_OPEN, real vfw32 dispatches
+    // the one-time DRV_LOAD + DRV_ENABLE pair to the driver. The
+    // codec's DRV_LOAD handler is where global / one-time table
+    // initialisation runs. IR50_32.DLL allocates the codec's
+    // huffman / inverse-DCT tables at `[0x1009c770]` from DRV_LOAD;
+    // without it, ICDecompress reads `[0x1009c770] == NULL` and
+    // bails with ICERR_BADIMAGE. Round 10 (and earlier) skipped
+    // this step because IR32_32.DLL's DRV_LOAD is a near-no-op.
+    // Track per-VA so a multi-codec sandbox (round-12+) doesn't
+    // double-init the same driver.
+    if !state.loaded_drivers.contains(&driver_proc) {
+        let _ = call_guest(
+            cpu,
+            mmu,
+            registry,
+            state,
+            driver_proc,
+            &[0, 0, DRV_LOAD, 0, 0],
+        )?;
+        let _ = call_guest(
+            cpu,
+            mmu,
+            registry,
+            state,
+            driver_proc,
+            &[0, 0, DRV_ENABLE, 0, 0],
+        )?;
+        state.loaded_drivers.insert(driver_proc);
     }
     // Real vfw32 calls
     //   DriverProc(dwDriverId=0, hdrvr=0, DRV_OPEN, 0, &ICOPEN).
