@@ -29,12 +29,7 @@ pub fn register(registry: &mut Registry) {
         stub_co_free_unused_libraries as StubFn,
         0,
     );
-    registry.register(
-        "ole32.dll",
-        "CoInitialize",
-        stub_co_initialize as StubFn,
-        1,
-    );
+    registry.register("ole32.dll", "CoInitialize", stub_co_initialize as StubFn, 1);
     registry.register(
         "ole32.dll",
         "CoTaskMemAlloc",

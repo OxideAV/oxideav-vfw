@@ -200,10 +200,8 @@ fn parse_avih(hdrl: &[u8]) -> Result<(u32, u32), String> {
             }
             let w_off = 8 * 4; // dwWidth at byte 32
             let h_off = 9 * 4; // dwHeight at byte 36
-            let ww =
-                u32::from_le_bytes(c.payload[w_off..w_off + 4].try_into().unwrap());
-            let hh =
-                u32::from_le_bytes(c.payload[h_off..h_off + 4].try_into().unwrap());
+            let ww = u32::from_le_bytes(c.payload[w_off..w_off + 4].try_into().unwrap());
+            let hh = u32::from_le_bytes(c.payload[h_off..h_off + 4].try_into().unwrap());
             return Ok((ww, hh));
         }
     }
@@ -265,8 +263,7 @@ fn find_first_vids_strl(hdrl: &[u8]) -> Result<(u32, i32, i32), String> {
                 }
                 bih_w = i32::from_le_bytes(sc.payload[4..8].try_into().unwrap());
                 bih_h = i32::from_le_bytes(sc.payload[8..12].try_into().unwrap());
-                bih_compression =
-                    u32::from_le_bytes(sc.payload[16..20].try_into().unwrap());
+                bih_compression = u32::from_le_bytes(sc.payload[16..20].try_into().unwrap());
             }
             if found_strh && found_strf && is_video {
                 return Ok((bih_compression, bih_w, bih_h));

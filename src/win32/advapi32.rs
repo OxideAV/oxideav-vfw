@@ -21,7 +21,12 @@ const ERROR_SUCCESS: u32 = 0;
 
 /// Register every advapi32 stub.
 pub fn register(registry: &mut Registry) {
-    registry.register("advapi32.dll", "RegCloseKey", stub_reg_close_key as StubFn, 1);
+    registry.register(
+        "advapi32.dll",
+        "RegCloseKey",
+        stub_reg_close_key as StubFn,
+        1,
+    );
     registry.register(
         "advapi32.dll",
         "RegCreateKeyA",

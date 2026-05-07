@@ -245,7 +245,12 @@ pub fn register(registry: &mut Registry) {
     // canonical "no-op success" / "no error" value per MSDN.
 
     // https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle
-    registry.register("kernel32.dll", "CloseHandle", stub_close_handle as StubFn, 1);
+    registry.register(
+        "kernel32.dll",
+        "CloseHandle",
+        stub_close_handle as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createfilemappinga
     registry.register(
         "kernel32.dll",
@@ -324,7 +329,12 @@ pub fn register(registry: &mut Registry) {
         1,
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary
-    registry.register("kernel32.dll", "FreeLibrary", stub_free_library as StubFn, 1);
+    registry.register(
+        "kernel32.dll",
+        "FreeLibrary",
+        stub_free_library as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freeresource
     registry.register(
         "kernel32.dll",
@@ -428,7 +438,12 @@ pub fn register(registry: &mut Registry) {
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-isbadreadptr
     registry.register("kernel32.dll", "IsBadReadPtr", stub_is_bad_ptr as StubFn, 2);
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-isbadwriteptr
-    registry.register("kernel32.dll", "IsBadWritePtr", stub_is_bad_ptr as StubFn, 2);
+    registry.register(
+        "kernel32.dll",
+        "IsBadWritePtr",
+        stub_is_bad_ptr as StubFn,
+        2,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-lcmapstringa
     registry.register(
         "kernel32.dll",
@@ -459,7 +474,12 @@ pub fn register(registry: &mut Registry) {
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-locallock
     registry.register("kernel32.dll", "LocalLock", stub_local_lock as StubFn, 1);
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localunlock
-    registry.register("kernel32.dll", "LocalUnlock", stub_local_unlock as StubFn, 1);
+    registry.register(
+        "kernel32.dll",
+        "LocalUnlock",
+        stub_local_unlock as StubFn,
+        1,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-lockresource
     registry.register(
         "kernel32.dll",
@@ -549,8 +569,18 @@ pub fn register(registry: &mut Registry) {
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-tlsalloc
     registry.register("kernel32.dll", "TlsAlloc", stub_tls_alloc as StubFn, 0);
     registry.register("kernel32.dll", "TlsFree", stub_tls_free as StubFn, 1);
-    registry.register("kernel32.dll", "TlsGetValue", stub_tls_get_value as StubFn, 1);
-    registry.register("kernel32.dll", "TlsSetValue", stub_tls_set_value as StubFn, 2);
+    registry.register(
+        "kernel32.dll",
+        "TlsGetValue",
+        stub_tls_get_value as StubFn,
+        1,
+    );
+    registry.register(
+        "kernel32.dll",
+        "TlsSetValue",
+        stub_tls_set_value as StubFn,
+        2,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-unmapviewoffile
     registry.register(
         "kernel32.dll",
@@ -1637,8 +1667,7 @@ fn stub_initialize_critical_section(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let p = arg_dword(cpu, mmu, 0)
-        .map_err(|t| trap_to_win32("InitializeCriticalSection", t))?;
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InitializeCriticalSection", t))?;
     if p != 0 {
         // 24-byte CRITICAL_SECTION on x86. Touching pages outside
         // the structure would WriteProtectFault — the codec
@@ -1839,7 +1868,7 @@ fn stub_get_version_ex_a(
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwBuildNumber
     mmu.store32(p + 16, 1)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId
-    // szCSDVersion: ""
+                                                          // szCSDVersion: ""
     mmu.store8(p + 20, 0)
         .map_err(|t| trap_to_win32("GetVersionExA", t))?;
     Ok(1)

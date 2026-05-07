@@ -37,12 +37,7 @@ pub fn register(registry: &mut Registry) {
     // Round 8 (IR50_32.DLL): the Indeo 5 codec uses
     // `timeGetTime` as a higher-resolution wall-clock source than
     // `GetTickCount`. Both return DWORD milliseconds.
-    registry.register(
-        "winmm.dll",
-        "timeGetTime",
-        stub_time_get_time as StubFn,
-        0,
-    );
+    registry.register("winmm.dll", "timeGetTime", stub_time_get_time as StubFn, 0);
 }
 
 /// `LRESULT DefDriverProc(DWORD_PTR dwDriverIdentifier, HDRVR

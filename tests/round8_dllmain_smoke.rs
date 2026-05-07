@@ -14,10 +14,7 @@ fn dllmain_smoke() {
         .load("IR50_32.DLL", &dll_bytes)
         .expect("load IR50_32.DLL");
     eprintln!("Image base = {:#x}", img.image_base);
-    eprintln!(
-        "DriverProc export VA = {:?}",
-        img.export("DriverProc")
-    );
+    eprintln!("DriverProc export VA = {:?}", img.export("DriverProc"));
     let pre = sb.cpu.instr_count;
     let r = sb
         .call_dll_main(&img, oxideav_vfw::DLL_PROCESS_ATTACH)
@@ -30,6 +27,13 @@ fn dllmain_smoke() {
 
     sb.install_codec(&img).expect("DriverProc not exported");
     sb.host.trace_stubs = true;
+    // Round 9 debugging instrumentation kept in-test: a 64-deep
+    // ring of last-executed instruction starts. If a future
+    // `IR50_32.DLL` change causes `ICOpen` to regress, the trap
+    // panic-block prints the ring and a `load32(esi+4)` snapshot
+    // — that combination uncovered the round-8 0x66-prefix bug
+    // (`66 c7 ... iw` decoded with the wrong immediate width).
+    sb.cpu.enable_trace_ring(64);
     let dp_va = img.export("DriverProc").unwrap();
     eprintln!("DriverProc VA = {dp_va:#010x}");
     let mut dp_bytes = Vec::new();
@@ -95,12 +99,33 @@ fn dllmain_smoke() {
                 eprintln!("    [{i}]: {line}");
             }
             eprintln!("  modules: {:?}", sb.host.modules);
-            eprintln!(
-                "  stub trace ({} stub calls):",
-                sb.host.stub_trace.len()
-            );
+            eprintln!("  stub trace ({} stub calls):", sb.host.stub_trace.len());
             for (i, line) in sb.host.stub_trace.iter().enumerate() {
                 eprintln!("    [{i}]: {line}");
+            }
+            eprintln!(
+                "  instruction trace ring (last {} eips):",
+                sb.cpu.trace_ring.len()
+            );
+            for (i, eip) in sb.cpu.trace_ring.iter().enumerate() {
+                let mut bs = [0u8; 8];
+                for j in 0..8u32 {
+                    bs[j as usize] = sb.mmu.load8(eip + j).unwrap_or(0);
+                }
+                eprintln!("    [{i}]: {eip:#010x} bytes={bs:02x?}");
+            }
+            // Read [esi+4] explicitly
+            let esi4 = sb.mmu.load32(esi + 4).unwrap_or(0xDEADBEEF);
+            eprintln!("  load32(esi+4=0x{:x}) = {:#010x}", esi + 4, esi4);
+            // What's at the trap address minus 12, in case
+            // the value 0xe7000060 came from a string/literal:
+            // dump some pages of interest
+            for base in [0x60000000u32, 0xe7000000u32, 0x01600000u32] {
+                let mut bs = [0u8; 16];
+                for j in 0..16u32 {
+                    bs[j as usize] = sb.mmu.load8(base + j).unwrap_or(0xff);
+                }
+                eprintln!("  page check {base:#x}: {bs:02x?}");
             }
             panic!("ICOpen failed");
         }

@@ -10,7 +10,10 @@ use oxideav_vfw::win32::Registry;
 fn ir50_32_dll_imports_inventory() {
     let bytes = common::fetch_or_load("IR50_32.DLL").expect("fetch IR50_32.DLL");
     let imports = common::list_pe_imports(&bytes).expect("imports");
-    eprintln!("IR50_32.DLL declares {} (DLL, name) imports:", imports.len());
+    eprintln!(
+        "IR50_32.DLL declares {} (DLL, name) imports:",
+        imports.len()
+    );
     for (dll, name) in &imports {
         eprintln!("  {dll}!{name}");
     }
