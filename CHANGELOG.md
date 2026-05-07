@@ -6,6 +6,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 8 + 9: **`IR50_32.DLL` (Indeo 5) load + ICOpen wired
+  end-to-end.** The previous round-8 pass landed ~1300 LOC of
+  scaffolding (RIFF/AVI 1.0 chunk walker — `tests/common/avi_extractor.rs`,
+  authored solely from the public IBM/Microsoft RIFF spec +
+  Microsoft AVI 1.0 documentation; `advapi32.rs` registry stubs
+  including `RegOpenKeyExA` / `RegQueryValueExA` / `RegCloseKey`;
+  `ole32.rs` COM stubs; substantial `kernel32.rs` additions —
+  `LCMapStringA`, `IsValidCodePage`, `CreateMutexA`,
+  `WaitForSingleObject`, `ReleaseMutex`, `Tls{Alloc,Get,Set,Free}Value`
+  — and `user32.rs` / `winmm.rs` follow-ups). Round 9 closes the
+  loop by fixing the operand-size-prefix decoding bug that was
+  manifesting as a phantom memory fault during ICOpen.
+- `Cpu::enable_trace_ring(cap)` — a 64-deep ring buffer of
+  recently-executed instruction-start EIPs for trap forensics.
+  Test panic blocks dump it alongside the existing `bytes [eip-24..eip)`
+  + register snapshot. The combination uncovered the 0x66-prefix
+  bug (the instruction trail revealed eip jumping by wrong
+  offsets, NOT the LMEM_MOVEABLE handle issue the round-8 agent
+  hypothesised).
+- `read_operand16` / `write_operand16` in `emulator/decode.rs`,
+  with the corresponding 16-bit memory + register read/write
+  primitives. Required to honour 0x66 cleanly across the MOV
+  family.
+
+### Fixed
+
+- **0x66 (operand-size override) prefix on MOV opcodes.**
+  The opcodes `0x89` (`MOV r/m, r`), `0x8B` (`MOV r, r/m`), and
+  `0xC7` (`MOV r/m, imm`) were ignoring the prefix flag entirely
+  in the integer decoder. For `0xC7` this was a hard correctness
+  bug: `66 C7 /0 iw` is a 6-byte instruction (with a 16-bit
+  immediate), but our impl read 4 bytes of immediate and then
+  advanced eip by the full 32-bit-immediate length, putting all
+  subsequent instruction decoding off by 2 bytes. Manifested as
+  IR50_32.DLL's ICOpen "memory fault at 0xe700006c" in
+  `tests/round8_dllmain_smoke.rs` — eax was being clobbered by
+  a misaligned `OR EAX, imm32` decoded out of the second half
+  of the next instruction. Per Intel SDM Vol. 2A "MOV":
+  `C7 /0 iw` (16-bit) and `C7 /0 id` (32-bit). Fixed in all
+  three handlers; covered by three new lib unit tests
+  (`mov_rm16_imm16_with_66_prefix_consumes_2byte_imm` +
+  siblings).
+
 ### Planned
 
 - **Trace mode** (`trace` Cargo feature, off by default) —

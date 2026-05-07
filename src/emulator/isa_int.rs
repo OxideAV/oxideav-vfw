@@ -19,7 +19,8 @@
 //! 1 Appendix B (EFLAGS Cross-Reference).
 
 use super::decode::{
-    read_operand32, resolve_modrm32, sign_ext_8_to_32, write_operand32, ModRm, Operand,
+    read_operand16, read_operand32, resolve_modrm32, sign_ext_8_to_32, write_operand16,
+    write_operand32, ModRm, Operand,
 };
 use super::mmu::Mmu;
 use super::regs::{Flags, Reg16, Reg32, Reg8, Regs};
@@ -90,6 +91,14 @@ pub struct Cpu {
     /// semantics. Touching `mm0..mm7` always traps as
     /// [`Trap::UnimplementedMmx`].
     pub mmx: [u64; 8],
+    /// Ring buffer of recently-executed instruction starts (eip
+    /// before opcode fetch). Capacity 64. Used by trace mode
+    /// (round 9) to surface a "last N opcodes" log when a trap
+    /// fires deep inside the codec body. Disabled by default.
+    pub trace_ring: Vec<u32>,
+    /// Cap on `trace_ring` capacity; once full the oldest entry
+    /// rolls off. 0 disables.
+    pub trace_ring_cap: usize,
 }
 
 /// Segment-override prefix selector.
@@ -128,6 +137,21 @@ impl Cpu {
             fs_base: 0,
             gs_base: 0,
             mmx: [0u64; 8],
+            trace_ring: Vec::new(),
+            trace_ring_cap: 0,
+        }
+    }
+
+    /// Enable instruction-level trace ring (capacity = `cap`
+    /// last-executed instruction-start EIPs). Set 0 to disable.
+    /// Round-9 debugging aid for the LMEM_MOVEABLE handle bug —
+    /// lets a failing test print the last-executed N instructions
+    /// when the trap surfaces from deep inside the codec body.
+    pub fn enable_trace_ring(&mut self, cap: usize) {
+        self.trace_ring_cap = cap;
+        self.trace_ring.clear();
+        if cap > 0 {
+            self.trace_ring.reserve(cap);
         }
     }
 
@@ -221,6 +245,14 @@ impl Cpu {
         self.seg_override = None;
 
         let entry_eip = self.regs.eip;
+
+        // Push entry_eip into the trace ring if enabled.
+        if self.trace_ring_cap > 0 {
+            if self.trace_ring.len() == self.trace_ring_cap {
+                self.trace_ring.remove(0);
+            }
+            self.trace_ring.push(entry_eip);
+        }
 
         // Consume legacy prefixes (max ~4; we cap at 8 to avoid
         // adversarial loops).
@@ -755,7 +787,9 @@ impl Cpu {
                 self.write_op8(addr_or_reg, imm, mmu)?;
                 Ok(StepOk::Continued)
             }
-            // 0xC7 — MOV r/m32, imm32
+            // 0xC7 — MOV r/m32, imm32 (no prefix) // MOV r/m16,
+            // imm16 (under 0x66). Intel SDM Vol. 2A "MOV":
+            // `C7 /0 iw` (16-bit) and `C7 /0 id` (32-bit).
             0xC7 => {
                 let mr = self.fetch_modrm(mmu)?;
                 debug_assert!(mr.reg == 0, "group 11 /0");
@@ -763,8 +797,13 @@ impl Cpu {
                 let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let op = self.seg_apply(op);
-                let imm = self.fetch_imm32(mmu)?;
-                write_operand32(op, imm, &mut self.regs, mmu)?;
+                if self.op_size_16 {
+                    let imm = self.fetch_imm16(mmu)?;
+                    write_operand16(op, imm, &mut self.regs, mmu)?;
+                } else {
+                    let imm = self.fetch_imm32(mmu)?;
+                    write_operand32(op, imm, &mut self.regs, mmu)?;
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -1441,8 +1480,16 @@ impl Cpu {
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
-        let src = self.regs.get32(Reg32::from_bits(mr.reg));
-        write_operand32(op, src, &mut self.regs, mmu)?;
+        if self.op_size_16 {
+            // 0x66 prefix: MOV r/m16, r16. The reg field still
+            // selects from the same r0..r7 quadrant — we reinterpret
+            // it as the low-16 of the corresponding GP reg.
+            let src = self.regs.get32(Reg32::from_bits(mr.reg)) as u16;
+            write_operand16(op, src, &mut self.regs, mmu)?;
+        } else {
+            let src = self.regs.get32(Reg32::from_bits(mr.reg));
+            write_operand32(op, src, &mut self.regs, mmu)?;
+        }
         Ok(StepOk::Continued)
     }
 
@@ -1459,8 +1506,20 @@ impl Cpu {
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let op = self.seg_apply(op);
-        let src = read_operand32(op, &self.regs, mmu)?;
-        self.regs.set32(Reg32::from_bits(mr.reg), src);
+        if self.op_size_16 {
+            // 0x66 prefix: MOV r16, r/m16. Preserves the upper 16
+            // bits of the destination register per Intel SDM
+            // Vol. 1 §3.4.1.1 (general-purpose register access in
+            // 32-bit mode; 16-bit register operations leave bits
+            // 31:16 unchanged).
+            let src = read_operand16(op, &self.regs, mmu)?;
+            let dst = Reg32::from_bits(mr.reg);
+            let prev = self.regs.get32(dst);
+            self.regs.set32(dst, (prev & 0xFFFF_0000) | u32::from(src));
+        } else {
+            let src = read_operand32(op, &self.regs, mmu)?;
+            self.regs.set32(Reg32::from_bits(mr.reg), src);
+        }
         Ok(StepOk::Continued)
     }
 
@@ -2697,6 +2756,93 @@ mod tests {
             Err(Trap::UndefinedOpcode { opcode: 0xD6, .. }) => (),
             other => panic!("expected undefined-opcode trap for 0xD6, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mov_rm16_imm16_with_66_prefix_consumes_2byte_imm() {
+        // Round-9 regression: `66 c7 ...` was decoded as if the
+        // immediate were 32 bits, advancing eip by 2 bytes too
+        // many and corrupting all subsequent instruction
+        // decoding. Lifted directly from `IR50_32.DLL` ICOpen:
+        //
+        //   66 c7 46 62 02 00     ; mov word [esi+0x62], 2
+        //   c7 46 64 0d 00 00 00  ; mov [esi+0x64], 0xd
+        //
+        // Asserts:
+        //   * exactly 2 bytes of memory at [esi+0x62] are written
+        //     (high half of dword stays zero from initial map)
+        //   * eip lands on the next instruction's first byte
+        //   * the dword write at [esi+0x64] = 0xd is then visible
+        //     intact at the right address.
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Esi, 0x4000);
+        // Pre-stamp 0xFF over [0x4060..0x4080] so we can see
+        // exactly which bytes the 16-bit MOV touches.
+        for i in 0..0x20u32 {
+            mmu.store8(0x4060 + i, 0xFF).unwrap();
+        }
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x66, 0xC7, 0x46, 0x62, 0x02, 0x00, // mov word [esi+0x62], 2
+                0xC7, 0x46, 0x64, 0x0D, 0x00, 0x00, 0x00, // mov [esi+0x64], 0xd
+                0xC3, // ret
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        // [esi+0x62..0x64] = 02 00; [esi+0x64..0x68] = 0d 00 00 00
+        assert_eq!(mmu.load8(0x4062).unwrap(), 0x02);
+        assert_eq!(mmu.load8(0x4063).unwrap(), 0x00);
+        assert_eq!(mmu.load32(0x4064).unwrap(), 0x0000_000D);
+        // The 16-bit MOV must NOT have spilled into [esi+0x64].
+        // Pre-fill was 0xFF; if the bug were present it'd write
+        // 0x46470002 (4 bytes) and clobber [esi+0x64..0x66].
+    }
+
+    #[test]
+    fn mov_rm16_r16_with_66_prefix_writes_only_low_half() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Esi, 0x4000);
+        cpu.regs.set32(Reg32::Eax, 0xDEAD_BEEF);
+        for i in 0..8u32 {
+            mmu.store8(0x401C + i, 0xFF).unwrap();
+        }
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x66, 0x89, 0x46, 0x1C, // mov word [esi+0x1c], ax
+                0xC3,
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        // ax = 0xBEEF. Should write `EF BE` at [0x401C..0x401E].
+        // [0x401E..0x4020] should remain 0xFF.
+        assert_eq!(mmu.load8(0x401C).unwrap(), 0xEF);
+        assert_eq!(mmu.load8(0x401D).unwrap(), 0xBE);
+        assert_eq!(mmu.load8(0x401E).unwrap(), 0xFF);
+        assert_eq!(mmu.load8(0x401F).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn mov_r16_rm16_with_66_prefix_preserves_high_half() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Esi, 0x4000);
+        cpu.regs.set32(Reg32::Eax, 0xCAFE_BABE);
+        // Stage [esi+4..esi+6] = 0x1234 (LE).
+        mmu.store16(0x4004, 0x1234).unwrap();
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x66, 0x8B, 0x46, 0x04, // mov ax, word [esi+4]
+                0xC3,
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        // eax bits 31:16 stay 0xCAFE; bits 15:0 become 0x1234.
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xCAFE_1234);
     }
 
     #[test]

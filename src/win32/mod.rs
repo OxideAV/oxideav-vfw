@@ -24,8 +24,10 @@ use std::collections::BTreeMap;
 
 use crate::emulator::{Cpu, Mmu};
 
+pub mod advapi32;
 pub mod gdi32;
 pub mod kernel32;
+pub mod ole32;
 pub mod user32;
 pub mod vfw32;
 pub mod winmm;
@@ -180,6 +182,12 @@ pub struct HostState {
     /// `gdi32!CreateCompatibleDC` / `user32!GetDC`. `None` until
     /// the first DC is allocated, then a populated set.
     pub gdi_hdcs: Option<std::collections::BTreeSet<u32>>,
+    /// When `true`, [`dispatch_stub`] appends one line per Win32
+    /// call to [`stub_trace`]. Off by default; round-8 tests flip
+    /// it on while triaging which stub returns a bad value.
+    pub trace_stubs: bool,
+    /// Per-call trace lines populated when [`trace_stubs`] is on.
+    pub stub_trace: Vec<String>,
 }
 
 impl HostState {
@@ -213,6 +221,8 @@ impl HostState {
             command_line_ptr: 0,
             environment_strings_ptr: 0,
             gdi_hdcs: None,
+            trace_stubs: false,
+            stub_trace: Vec::new(),
         }
     }
 
@@ -379,13 +389,30 @@ impl Registry {
         self.by_name.len() - before
     }
 
-    /// Register every Round-1+4 stub family in one call: kernel32,
-    /// gdi32, user32, winmm. Returns the total number registered.
+    /// Register every advapi32 stub. Returns the number registered.
+    pub fn register_advapi32(&mut self) -> usize {
+        let before = self.by_name.len();
+        advapi32::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every ole32 stub. Returns the number registered.
+    pub fn register_ole32(&mut self) -> usize {
+        let before = self.by_name.len();
+        ole32::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every Round-1+4+8 stub family in one call:
+    /// kernel32, gdi32, user32, winmm, advapi32, ole32. Returns
+    /// the total number registered.
     pub fn register_all(&mut self) -> usize {
         self.register_kernel32()
             + self.register_gdi32()
             + self.register_user32()
             + self.register_winmm()
+            + self.register_advapi32()
+            + self.register_ole32()
     }
 }
 
@@ -453,6 +480,11 @@ pub fn dispatch_stub(
         .clone();
     // Run the host-side stub.
     let ret = (entry.func)(cpu, mmu, state, registry)?;
+    if state.trace_stubs {
+        state
+            .stub_trace
+            .push(format!("{}!{} → {:#010x}", entry.dll, entry.name, ret));
+    }
     // stdcall: pop return address, advance esp by arg_dwords*4,
     // set eax to the return value.
     let ret_addr = cpu.pop32(mmu)?;

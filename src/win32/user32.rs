@@ -85,6 +85,197 @@ pub fn register(registry: &mut Registry) {
     // arguments; the cdecl caller cleans up. The stub itself
     // walks the variadic list off the stack.
     registry.register("user32.dll", "wsprintfA", stub_wsprintf_a as StubFn, 0);
+
+    // ---- Round-8 additions (IR50_32.DLL configure-dialog
+    // surface). All fail-soft — we never enter the dialog UI
+    // path during decode.
+    registry.register("user32.dll", "CheckDlgButton", stub_zero3 as StubFn, 3);
+    registry.register("user32.dll", "CheckRadioButton", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "CreateDialogParamA", stub_zero5 as StubFn, 5);
+    registry.register("user32.dll", "DefWindowProcA", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "DestroyWindow", stub_zero1 as StubFn, 1);
+    registry.register("user32.dll", "EnableWindow", stub_zero2 as StubFn, 2);
+    registry.register(
+        "user32.dll",
+        "GetClientRect",
+        stub_get_client_rect as StubFn,
+        2,
+    );
+    registry.register("user32.dll", "GetDesktopWindow", stub_zero0 as StubFn, 0);
+    registry.register("user32.dll", "GetDlgCtrlID", stub_zero1 as StubFn, 1);
+    registry.register("user32.dll", "GetDlgItem", stub_zero2 as StubFn, 2);
+    registry.register("user32.dll", "GetFocus", stub_zero0 as StubFn, 0);
+    registry.register("user32.dll", "InvalidateRect", stub_zero3 as StubFn, 3);
+    registry.register("user32.dll", "IsDlgButtonChecked", stub_zero2 as StubFn, 2);
+    registry.register("user32.dll", "IsRectEmpty", stub_is_rect_empty as StubFn, 1);
+    registry.register("user32.dll", "LoadStringW", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "MapWindowPoints", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "MoveWindow", stub_zero6 as StubFn, 6);
+    registry.register("user32.dll", "OffsetRect", stub_offset_rect as StubFn, 3);
+    registry.register("user32.dll", "SendMessageA", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "SetDlgItemInt", stub_zero4 as StubFn, 4);
+    registry.register("user32.dll", "SetFocus", stub_zero1 as StubFn, 1);
+    registry.register("user32.dll", "SetWindowLongA", stub_zero3 as StubFn, 3);
+    registry.register("user32.dll", "SetWindowPos", stub_zero7 as StubFn, 7);
+    registry.register("user32.dll", "SetWindowTextA", stub_zero2 as StubFn, 2);
+    registry.register("user32.dll", "ShowWindow", stub_zero2 as StubFn, 2);
+    registry.register("user32.dll", "WinHelpA", stub_zero4 as StubFn, 4);
+    // wvsprintfA: like wsprintfA but takes a `va_list*` instead
+    // of being variadic. cdecl. We bottom-out at zero.
+    registry.register("user32.dll", "wvsprintfA", stub_zero0 as StubFn, 0);
+}
+
+// ---- Generic fail-soft stubs reused across many user32 entries -----
+//
+// MSDN documents most of these as "returns zero on
+// failure / TRUE on success". For a pure decode path that never
+// renders or pops up a dialog, returning zero is the right
+// "no work happened" signal.
+
+fn stub_zero0(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero1(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero2(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero3(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero4(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero5(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero6(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+fn stub_zero7(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL GetClientRect(HWND, LPRECT)`. Zero-fill the RECT (a
+/// 16-byte struct: left/top/right/bottom).
+fn stub_get_client_rect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetClientRect", t))?;
+    let prect = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetClientRect", t))?;
+    if prect != 0 {
+        for i in 0..16u32 {
+            let _ = mmu.store8(prect + i, 0);
+        }
+    }
+    Ok(1)
+}
+
+/// `BOOL IsRectEmpty(LPRECT lprc)`. A rect is empty iff its
+/// width or height is non-positive (right <= left or bottom <=
+/// top per MSDN).
+fn stub_is_rect_empty(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))?;
+    if p == 0 {
+        return Ok(1);
+    }
+    let l = mmu
+        .load32(p)
+        .map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))? as i32;
+    let t = mmu
+        .load32(p + 4)
+        .map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))? as i32;
+    let r = mmu
+        .load32(p + 8)
+        .map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))? as i32;
+    let b = mmu
+        .load32(p + 12)
+        .map_err(|t| crate::win32::trap_to_win32_local("IsRectEmpty", t))? as i32;
+    Ok(if r <= l || b <= t { 1 } else { 0 })
+}
+
+/// `BOOL OffsetRect(LPRECT lprc, int dx, int dy)`. Add dx/dy to
+/// the four edges.
+fn stub_offset_rect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))?;
+    let dx = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))? as i32;
+    let dy = arg_dword(cpu, mmu, 2)
+        .map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))? as i32;
+    if p == 0 {
+        return Ok(0);
+    }
+    let mut bump = |off: u32, delta: i32| -> Result<(), Win32Error> {
+        let v = mmu
+            .load32(p + off)
+            .map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))?
+            as i32;
+        mmu.store32(p + off, v.wrapping_add(delta) as u32)
+            .map_err(|t| crate::win32::trap_to_win32_local("OffsetRect", t))
+    };
+    bump(0, dx)?;
+    bump(4, dy)?;
+    bump(8, dx)?;
+    bump(12, dy)?;
+    Ok(1)
 }
 
 // `winuser.h`: PAINTSTRUCT — we zero whatever the codec passed.

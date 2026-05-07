@@ -241,6 +241,35 @@ pub fn write_operand32(
     }
 }
 
+/// Read the operand value as a 16-bit word. Treats `Reg32(r)` as
+/// "low 16 bits of `r`" and `Mem32(addr)` as a 16-bit memory read.
+/// Used by opcodes that took the operand-size override prefix
+/// (`0x66`).
+pub fn read_operand16(op: Operand, regs: &Regs, mmu: &Mmu) -> Result<u16, Trap> {
+    match op {
+        Operand::Reg32(r) => Ok(regs.get32(r) as u16),
+        Operand::Mem32(addr) => mmu.load16(addr),
+    }
+}
+
+/// Write to the operand as a 16-bit word. Preserves the upper 16
+/// bits of a `Reg32` register; writes 2 bytes to memory.
+pub fn write_operand16(
+    op: Operand,
+    value: u16,
+    regs: &mut Regs,
+    mmu: &mut Mmu,
+) -> Result<(), Trap> {
+    match op {
+        Operand::Reg32(r) => {
+            let prev = regs.get32(r);
+            regs.set32(r, (prev & 0xFFFF_0000) | u32::from(value));
+            Ok(())
+        }
+        Operand::Mem32(addr) => mmu.store16(addr, value),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
