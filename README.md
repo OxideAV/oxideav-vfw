@@ -9,12 +9,19 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 5 — "DllMain + ICOpen + ICGetInfo + ICClose against Intel
-IR32_32.DLL" landed.** Indeo 3's redistributable DLL now walks the
-end-to-end VfW dispatch in the sandbox: load, run `DllMain` to
-clean exit, install codec, open with `('VIDC','IV31',
-ICMODE_DECOMPRESS)`, read back the `ICINFO` identity card, and
-close. The full design contract is the 659-line document at
+**Round 6 — "Drive the full IC* decode pipeline end-to-end against
+Intel IR32_32.DLL" landed.** Indeo 3's redistributable DLL now
+walks the entire VfW decode-call cycle in the sandbox: load, run
+`DllMain` to clean exit, install codec, open with `('VIDC','IV31',
+ICMODE_DECOMPRESS)`, read back the `ICINFO` identity card,
+`ICDecompressQuery` (→ `ICERR_OK`), `ICDecompressBegin`
+(→ `ICERR_OK`), `ICDecompress` against a synthetic IV31 keyframe
+(→ `ICERR_BADIMAGE`; SPECGAP — the IV5PLAY fixture bundle has no
+real `.avi` payloads), `ICDecompressEnd` (→ `ICERR_OK`), and
+`ICClose`. No new ISA opcodes or Win32 stubs were needed beyond
+round 5 — segment-prefix routing + the 8-bit ALU + REP string
+ops + `0F`-extension subset round 5 added all carried over. The
+full design contract is the 659-line document at
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

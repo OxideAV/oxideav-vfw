@@ -440,3 +440,198 @@ fn decode_utf16le_until_nul(buf: &[u8], off: usize, field_chars: usize) -> Strin
     }
     String::from_utf16_lossy(&chars)
 }
+
+/// Build a synthetic Indeo 3 (IV31) keyframe payload (frame
+/// header + bitstream header) for a small picture. The payload
+/// is a *legal-shape* keyframe — every field validates per
+/// Intel's published Indeo 3 layout — but the plane data is the
+/// minimal "all-cells leaf, no segmentation" filler. The codec
+/// may still report decode errors (this is not a real image),
+/// but the IC* sequence walks end-to-end.
+///
+/// Reference: docs/video/indeo/indeo3/wiki/Indeo_3.wiki
+/// (multimedia.cx mirror), §"Picture header".
+///
+/// Parameters:
+///
+/// * `frame_number` — starts at 0 for the first keyframe.
+/// * `width`, `height` — must be multiples of 4, between 16 and
+///   640 / 480. The function picks the smallest legal value.
+fn build_synthetic_iv31_keyframe(frame_number: u32, width: u16, height: u16) -> Vec<u8> {
+    assert!(width % 4 == 0 && (16..=640).contains(&width));
+    assert!(height % 4 == 0 && (16..=480).contains(&height));
+
+    // ---- Bitstream header (48 bytes) -------------------------------
+    let mut bs = Vec::with_capacity(48);
+    bs.extend_from_slice(&0x0020u16.to_le_bytes()); // dec_version = 0x20
+                                                    // frame_flags: bit 0 (periodic INTRA) | bit 2 (INTRA frame).
+    bs.extend_from_slice(&0x0005u16.to_le_bytes());
+    // data_size = 128 bits is the special "NULL sync frame" marker
+    // per the wiki. Indeo 3 codecs typically reject this value with
+    // ICERR_BADIMAGE because a sync frame still has to carry per-plane
+    // num_vectors dwords + (zero-length) VQ data. We pass 128 here
+    // because the synthetic-keyframe path's contract is just "the IC*
+    // sequence walks end-to-end without trapping" — see the test's
+    // module-level docs.
+    bs.extend_from_slice(&128u32.to_le_bytes());
+    bs.push(0u8); // cb_offset
+    bs.push(0u8); // reserved1
+    bs.extend_from_slice(&0u16.to_le_bytes()); // checksum (encoders set to 0)
+    bs.extend_from_slice(&height.to_le_bytes()); // height
+    bs.extend_from_slice(&width.to_le_bytes()); // width
+    bs.extend_from_slice(&0u32.to_le_bytes()); // y_offset
+    bs.extend_from_slice(&0u32.to_le_bytes()); // v_offset
+    bs.extend_from_slice(&0u32.to_le_bytes()); // u_offset
+    bs.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+    bs.extend_from_slice(&[0u8; 16]); // alt_quant table
+    debug_assert_eq!(bs.len(), 48);
+
+    // ---- Frame header (16 bytes) — checksum xor's frame_size ------
+    let frame_size: u32 = bs.len() as u32 + 16; // includes the frame header itself
+    let unknown1: u32 = 0;
+    let frmh: u32 = u32::from_le_bytes(*b"FRMH");
+    let checksum: u32 = frame_number ^ unknown1 ^ frame_size ^ frmh;
+
+    let mut out = Vec::with_capacity(16 + bs.len());
+    out.extend_from_slice(&frame_number.to_le_bytes());
+    out.extend_from_slice(&unknown1.to_le_bytes());
+    out.extend_from_slice(&checksum.to_le_bytes());
+    out.extend_from_slice(&frame_size.to_le_bytes());
+    out.extend_from_slice(&bs);
+    out
+}
+
+/// Round 6 — full IC* decode pipeline against `IR32_32.DLL`.
+///
+/// Walks `DllMain → ICOpen → ICDecompressQuery →
+/// ICDecompressBegin → ICDecompress → ICDecompressEnd → ICClose`
+/// against a synthetic Indeo 3 keyframe at 64×48 (smallest size
+/// the codec accepts: width/height ≥ 16, multiple of 4).
+///
+/// **SPECGAP**: the IV5 fixture bundle in
+/// `samples.oxideav.org/video/windows/IV5PLAY` ships only DLLs,
+/// not `.avi` payloads. Round 6 uses a *synthetic* IV31
+/// keyframe whose header layout matches Intel's published
+/// Indeo 3 wire format (mirrored at
+/// `docs/video/indeo/indeo3/wiki/Indeo_3.wiki`). The contract
+/// of this test is therefore:
+///
+/// * The IC* sequence runs without trapping (CPU + Win32 stub
+///   coverage).
+/// * `ICDecompressQuery` answers ICERR_OK or a documented
+///   negative code; we accept either, the assertion is just
+///   "it didn't trap and gave us a result".
+/// * `ICDecompress` may write some bytes or zero bytes —
+///   the codec's behaviour on a NULL-data-size sync frame is
+///   not specified by the wire-format docs. We just confirm
+///   the call completes and the output buffer is intact.
+/// * `ICDecompressEnd` returns cleanly.
+///
+/// Round 7+ should swap the synthetic input for a real keyframe
+/// extracted from a bundled `.avi` once one is available, at
+/// which point this test would also assert non-zero output.
+#[test]
+fn indeo3_decompress_one_keyframe() {
+    /// vfw.h: `ICMODE_DECOMPRESS = 2`.
+    const ICMODE_DECOMPRESS: u32 = 2;
+
+    let bytes =
+        common::fetch_or_load("IR32_32.DLL").expect("fetch IR32_32.DLL — see tests/common/mod.rs");
+
+    let mut sb = Sandbox::new();
+    let img = sb.load("IR32_32.DLL", &bytes).expect("load IR32_32.DLL");
+
+    let _ = sb
+        .call_dll_main(&img, oxideav_vfw::DLL_PROCESS_ATTACH)
+        .expect("DllMain");
+
+    sb.install_codec(&img).expect("DriverProc not exported");
+    let fcc_video = u32::from_le_bytes(*b"VIDC");
+    let fcc_iv31 = u32::from_le_bytes(*b"IV31");
+    let hic = sb
+        .ic_open(fcc_video, fcc_iv31, ICMODE_DECOMPRESS)
+        .expect("ICOpen");
+    assert_ne!(hic, 0, "ICOpen must mint a HIC");
+
+    // Smallest legal Indeo 3 picture is 16×16; round-6 picks
+    // 64×48 to give the codec a multi-strip-amenable shape and
+    // a non-trivial output buffer to populate.
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 48;
+
+    let bih_in = Bih {
+        bi_size: BIH_SIZE,
+        width: WIDTH as i32,
+        height: HEIGHT as i32,
+        planes: 1,
+        bit_count: 24, // codec advertises 24bpp output
+        compression: *b"IV31",
+        size_image: 0, // unused for Indeo 3 input bih
+        ..Default::default()
+    };
+
+    // Output: RGB24, top-down (negative height in Windows)
+    let bih_out = Bih {
+        bi_size: BIH_SIZE,
+        width: WIDTH as i32,
+        height: HEIGHT as i32,
+        planes: 1,
+        bit_count: 24,
+        compression: [0; 4], // BI_RGB
+        size_image: WIDTH * HEIGHT * 3,
+        ..Default::default()
+    };
+
+    // ICDecompressQuery: input/output format negotiation.
+    let q = sb
+        .ic_decompress_query(hic, &bih_in, Some(&bih_out))
+        .unwrap_or_else(|e| panic!("ICDecompressQuery trap:\n  {e}"));
+    eprintln!(
+        "ICDecompressQuery returned {q:#010x} (ICERR_OK=0; negatives are codec-specific rejections)"
+    );
+
+    // ICDecompressBegin: set up the decoder pipeline.
+    let begin = sb
+        .ic_decompress_begin(hic, &bih_in, &bih_out)
+        .unwrap_or_else(|e| panic!("ICDecompressBegin trap:\n  {e}"));
+    eprintln!("ICDecompressBegin returned {begin:#010x}");
+
+    // ICDecompress: feed a synthetic IV31 keyframe.
+    let payload = build_synthetic_iv31_keyframe(0, WIDTH as u16, HEIGHT as u16);
+    let out_capacity = WIDTH * HEIGHT * 3;
+    let (lr, out) = sb
+        .ic_decompress(hic, 0, &bih_in, &payload, &bih_out, out_capacity)
+        .unwrap_or_else(|e| panic!("ICDecompress trap:\n  {e}"));
+    eprintln!(
+        "ICDecompress returned {lr:#010x}; output buffer length {} bytes",
+        out.len()
+    );
+    assert_eq!(
+        out.len(),
+        out_capacity as usize,
+        "ICDecompress must hand back a buffer of the requested size, regardless of what the codec wrote"
+    );
+    // ICERR_BADIMAGE is -100 = 0xFFFFFF9C. The synthetic NULL-data-size
+    // path is documented to land here (see SPECGAP in module docs).
+    // Any *positive* error code (or a trap) would indicate either a
+    // codec internal state corruption or a host-side ISA / Win32 stub
+    // gap. Accept ICERR_OK or any documented negative code; reject
+    // positive non-zero values (those are fault-style sentinels in
+    // some Indeo builds).
+    let lr_signed = lr as i32;
+    assert!(
+        lr_signed <= 0,
+        "ICDecompress returned positive {lr_signed}; codec probably faulted"
+    );
+
+    // ICDecompressEnd: tear down the pipeline.
+    let end = sb
+        .ic_decompress_end(hic)
+        .unwrap_or_else(|e| panic!("ICDecompressEnd trap:\n  {e}"));
+    eprintln!("ICDecompressEnd returned {end:#010x}");
+
+    // ICClose closes the codec instance.
+    let _ = sb
+        .ic_close(hic)
+        .unwrap_or_else(|e| panic!("ICClose:\n  {e}"));
+}

@@ -111,7 +111,23 @@
 //! * Bug-fix: round-4's `0xC6` (MOV r/m8, imm8) handler
 //!   fetched the immediate BEFORE resolving the displacement.
 //!
-//! MMX is deliberately **deferred** to round 6+: Indeo 3 is
+//! **Round 6 — "Drive the full IC* decode pipeline end-to-end
+//! against Intel IR32_32.DLL".** No new emulator code needed:
+//! round-5's ISA + segment-prefix coverage is sufficient for the
+//! `ICDecompressQuery → ICDecompressBegin → ICDecompress →
+//! ICDecompressEnd` sequence to walk cleanly. The
+//! `tests/m2_indeo3_driverproc.rs::indeo3_decompress_one_keyframe`
+//! integration test exercises the whole sequence against a
+//! synthetic IV31 keyframe (64×48). The codec accepts the input
+//! / output formats, sets up internal state, rejects the
+//! synthetic NULL-data-size sync frame at the bitstream-header
+//! validation step (returns `ICERR_BADIMAGE = -100`), and tears
+//! down cleanly. SPECGAP: the `IV5PLAY` fixture bundle ships
+//! only DLLs, no `.avi` payloads, so round-6 cannot exercise a
+//! real keyframe end-to-end. Round 7+ swaps the synthetic input
+//! for a real keyframe once one becomes available.
+//!
+//! MMX is deliberately **deferred** to round 7+: Indeo 3 is
 //! pre-MMX, so it stays unblocked. Indeo 5 (`ir50_32.dll`) and
 //! most later codecs use MMX, so MMX support lands when the test
 //! corpus expands to one of those.

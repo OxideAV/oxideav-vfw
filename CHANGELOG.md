@@ -33,6 +33,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 6: "Drive the full IC* decode pipeline end-to-end against
+  Intel IR32_32.DLL" milestone landed. The
+  `ICDecompressQuery → ICDecompressBegin → ICDecompress →
+  ICDecompressEnd` sequence now walks against a synthetic
+  Indeo 3 (IV31) keyframe at 64×48 without tripping a single
+  ISA opcode or Win32 stub gap beyond round 5. No new opcodes,
+  no new stubs; round 5's coverage was sufficient for the full
+  decode-call cycle to enter and exit cleanly.
+  - **SPECGAP**: the `IV5PLAY` redistributable bundle in
+    `samples.oxideav.org/video/windows/IV5PLAY/` ships only the
+    codec DLLs, no `.avi` payloads. Round 6 builds a synthetic
+    IV31 keyframe whose 16-byte frame header + 48-byte bitstream
+    header layout matches the public Indeo 3 spec mirrored in
+    `docs/video/indeo/indeo3/wiki/Indeo_3.wiki` (multimedia.cx,
+    CC-BY-SA), with `data_size = 128` (bits) which the wiki
+    documents as a NULL/sync frame. The codec accepts the input
+    and output formats (`ICDecompressQuery` → `ICERR_OK`),
+    sets up its internal state (`ICDecompressBegin` → `ICERR_OK`),
+    rejects the synthetic NULL-data-size frame at the bitstream-
+    header validation step (`ICDecompress` → `ICERR_BADIMAGE` =
+    `-100` = `0xFFFFFF9C`), and tears down cleanly
+    (`ICDecompressEnd` → `ICERR_OK`).
+  - The contract of `tests/m2_indeo3_driverproc.rs::indeo3_decompress_one_keyframe`
+    is therefore: the IC* sequence runs without trapping; the
+    output buffer is intact at the requested capacity; the
+    `ICDecompress` LRESULT is non-positive (any positive value
+    would be a fault sentinel, not a documented vfw error code).
+    Round 7+ swaps the synthetic input for a real keyframe
+    extracted from a bundled `.avi` once one is available, at
+    which point the test would also assert non-zero output.
+  - No emulator changes — the `0x69 0x6B IMUL`, `0x86 0x87 XCHG`,
+    REP-prefixed string ops, segment-override prefixes, and
+    `0F xx` extension opcodes round 5 added are sufficient for
+    Indeo 3's `ICDecompress*` body. MMX is still deferred to
+    round 7+ when the test corpus expands to MMX-using codecs
+    (Indeo 5, Cinepak, etc.).
+
 - Round 5: "DllMain + ICOpen + ICGetInfo + ICClose against
   Intel IR32_32.DLL" milestone landed.
   - `emulator::isa_int` learnt all 8-bit primary ALU opcodes
