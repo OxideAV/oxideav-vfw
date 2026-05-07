@@ -36,12 +36,16 @@ and a "decode one Cinepak frame" end-to-end test.
 
 ## Why this exists
 
-The crate is for **rare/unique codec compatibility**, not day-to-day
-playback. Modern codecs (H.264, HEVC, AV1, VP9, Opus, AAC, …) all
-have pure-Rust decoders elsewhere in the oxideav workspace. Some old
-codecs were never published with a public spec and never had a
-clean-room reverse-engineering writeup defensible enough for the
-project's standard:
+The crate has **two co-equal end-uses**:
+
+### 1. Rare-codec compatibility
+
+Run codecs the project would otherwise permanently shelve.
+Modern codecs (H.264, HEVC, AV1, VP9, Opus, AAC, …) have
+pure-Rust decoders elsewhere in the oxideav workspace, but some
+old codecs were never published with a public spec and never had
+a clean-room reverse-engineering writeup defensible enough for
+the project's standard:
 
 * Indeo 4 / Indeo 5 (Intel)
 * Sorenson Video 1 / 3
@@ -59,6 +63,31 @@ Microsoft Windows Media Player redistributables, in QuickTime
 installers, in old Linux `vfw_codecs` packages). The bridge says
 "we don't decode them ourselves; we delegate to the user's
 licensed codec running in our sandbox".
+
+### 2. Reverse-engineering aid
+
+Once a codec runs in the sandbox, the same emulator becomes a
+clean-room **research instrument**: every guest memory access,
+every Win32 stub call, and (optionally) every guest instruction
+crosses a Rust boundary, so the emulator can faithfully record
+what the codec is doing on a target bitstream. Output is JSONL
+events; downstream tooling (Python/jq) post-processes them into
+the kind of behavioural traces the workspace's
+specifier→extractor→implementer round procedure consumes when
+producing clean-room codec specs from scratch.
+
+This is gated behind the `trace` Cargo feature (off by default
+because it adds branches on emulator hot paths). See the
+**Trace mode** section of `docs/winmf/winmf-emulator.md` for the
+event schema and the programmatic API
+(`Sandbox::watch(addr, size, mode)` /
+`Sandbox::set_trace_sink(...)`). Lands post-round-5 — the
+infrastructure is documented today so that round-5+ work
+designs around it rather than retrofits.
+
+The two end-uses share the same compatibility-track machinery
+(MMU, ISA interpreter, PE loader, Win32 stubs) — the
+research-track is a layered set of probes on top, not a fork.
 
 ## How
 

@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Planned
+
+- **Trace mode** (`trace` Cargo feature, off by default) —
+  reverse-engineering aid documented in
+  `OxideAV/docs/winmf/winmf-emulator.md` (§Trace mode + §Future
+  extensions). Reframes the crate as having two co-equal
+  end-uses: rare-codec compatibility (today) and clean-room
+  reverse-engineering aid (post-round-5). The feature emits
+  JSONL events for Win32 stub calls, memory watchpoints
+  (`Sandbox::watch(addr, size, mode)`), and (with the
+  `trace-exec` sub-feature) per-instruction execution. Sink
+  configurable via `OXIDEAV_VFW_TRACE_FILE` env var or
+  `Sandbox::set_trace_sink()` programmatic API. Intentionally
+  not implemented yet — documented now so that round-5+ ISA
+  growth and stub additions design the probe hooks in rather
+  than retrofit them.
+
 ### Removed
 
 - The `test-fixtures` Cargo feature is gone. The fixture-discovery
