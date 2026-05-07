@@ -16,6 +16,69 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 4: "Close the 49 round-3 import gaps" milestone landed.
+  The 49 stubs round-3 surfaced from Intel's `IR32_32.DLL`
+  (Indeo 3) are all implemented; `Sandbox::load(IR32_32.DLL)`
+  succeeds end-to-end. 32 lib stub-level tests + 1 integration
+  test round 4 added; full crate now ships 85 lib + 5
+  integration tests, all green.
+  - `win32::gdi32` (8 stubs) — `BitBlt` (no-op TRUE),
+    `CreateCompatibleDC` (sentinel HDC `0xDEADC011`), `DeleteDC`
+    (live-set validating), `GetDeviceCaps` (32 BPP / 1 plane /
+    sensible RASTERCAPS / `LOGPIXELS{X,Y}=96`), `GetNearestColor`
+    (identity), `GetObjectA` (0), `GetSystemPaletteEntries` (0),
+    `SelectObject` (identity).
+  - `win32::kernel32` round-4 additions (24 stubs) —
+    `ExitProcess` (sets `host.exit_requested`, run-loop
+    converts to clean RET_SENTINEL), `GetACP` (1252), `GetOEMCP`
+    (437), `GetCPInfo` (`MaxCharSize=1`, default `'?'`),
+    `GetCommandLineA` (canned `"oxideav-vfw\0"`),
+    `GetEnvironmentStrings` (`"\0\0"`), `GetFileType`
+    (`FILE_TYPE_UNKNOWN=0`), `GetLastError` / `SetLastError`
+    (per-Sandbox `last_error: u32` slot), `GetModuleFileNameA`
+    / `GetModuleHandleA` (NULL → primary loaded DLL base),
+    `GetStartupInfoA` (`cb=68`, rest zero), `GetStdHandle`
+    (`INVALID_HANDLE_VALUE`), `GetSystemInfo`
+    (single-Pentium / 4 KiB pages), `GetVersion` (`0x0A04` =
+    Win98), `GlobalAlloc` / `GlobalFree` / `GlobalLock` /
+    `GlobalUnlock` (Local* alias), `MultiByteToWideChar` /
+    `WideCharToMultiByte` (zero-extend / low-byte-or-default
+    conversion, honours `cb=-1`), `RtlUnwind` (no-op SEH stub),
+    `VirtualAlloc` / `VirtualFree` (uses MMU `find_free_range`
+    + `unmap`; reserved region
+    `0xA000_0000..0xC000_0000`), `WriteFile` (FALSE +
+    `ERROR_INVALID_HANDLE`).
+  - `win32::user32` (16 stubs) — fail-soft for the dialog /
+    paint / window surface; `MessageBoxA` logs to stderr +
+    `host.message_box_log`; `wsprintfA` is a real cdecl
+    variadic implementation (`%d` / `%u` / `%x` / `%X` / `%s` /
+    `%c` / `%%`, no width / precision / `%f`).
+  - `win32::winmm` (1 stub) — `DefDriverProc` returning 0 for
+    every `DRV_*` message except `DRV_CONFIGURE` (`DRVCNF_OK=1`).
+  - `MMU::unmap(addr, size)` and `MMU::find_free_range(lo, hi,
+    size)` plumbing for `VirtualAlloc` / `VirtualFree`.
+  - `HostState` gained `last_error`, `primary_module_base`,
+    `message_box_log`, `exit_requested`, const-arena cursor +
+    `arena_const_alloc()` for canned strings, `gdi_hdcs` live
+    set.
+  - `Registry` gained `register_gdi32` / `register_user32` /
+    `register_winmm` / `register_all`. `Sandbox::new` now wires
+    the full set + maps a const-arena region at
+    `[0x7000_0000, 0x7010_0000)` for canned strings.
+  - `tests/m1_load_dll_main.rs::staged_codec_dll_resolves_every_import`
+    asserts the stub registry covers **every** import
+    `IR32_32.DLL` declares (zero-miss assertion). Renamed from
+    `staged_codec_dll_lists_round_four_todo_imports`.
+  - `tests/m2_indeo3_driverproc.rs::indeo3_driverproc_open_getinfo_close_smoke`
+    flipped from "load is rejected" to "load succeeds, DllMain
+    walks until the first un-decoded ISA opcode": round-4
+    outcome is `Trap::UndefinedOpcode { opcode: 0x04, eip:
+    0x1000_612A }` — that's `ADD AL, imm8`, the round-5 todo
+    list. The test asserts on the exact (opcode, eip) pair so
+    any drift is loud + names round 5's first hand-off.
+  - 32 new lib unit tests covering the new stub families
+    (5 gdi32 + 4 user32 + 2 winmm + 21 kernel32 round-4).
+
 - Round 3: "Real-codec smoke test against Intel IR32_32.DLL"
   milestone landed.
   - `tests/common/mod.rs` — fixture-discovery helper:

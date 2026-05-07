@@ -36,17 +36,48 @@
 //!   `OXIDEAV_VFW_FIXTURE_DIR` env var → Wine prefix → Windows
 //!   system32 → on-disk cache → HTTPS fetch from
 //!   `samples.oxideav.org`. CI=true bypasses the cache.
-//! * `tests/m1_load_dll_main.rs::staged_codec_dll_lists_round_four_todo_imports`
-//!   — fetches Intel's published Indeo 3 DLL and asserts the
-//!   exact set of 49 Win32 imports (gdi32 / user32 / winmm + 24
-//!   extra kernel32) the round-1+2 stub registry does not yet
-//!   satisfy. That set is round 4's deliverable.
-//! * `tests/m2_indeo3_driverproc.rs` — synthetic-codec walkthrough
-//!   coverage retained; plus a forward-compatible Indeo 3
+//! * Round-3 m1 test asserted the exact set of 49 Win32 imports
+//!   (gdi32 / user32 / winmm + 24 extra kernel32) the
+//!   round-1+2 stub registry did not satisfy — round 4's
+//!   concrete dispatch budget. Round 4 closed every gap; the
+//!   m1 test now asserts zero unresolved imports.
+//! * `tests/m2_indeo3_driverproc.rs` retained the
+//!   synthetic-codec walkthrough; a forward-compatible Indeo 3
 //!   `DllMain → ICOpen → ICGetInfo → ICClose` walkthrough that
-//!   activates once round 4 closes the import gaps.
+//!   activated once round 4 closed the import gaps.
 //!
-//! MMX is deliberately **deferred** to round 5+: Indeo 3 is
+//! **Round 4 — "Close the 49 round-3 import gaps".** Adds the
+//! 49 stubs round 3 surfaced:
+//!
+//! * [`win32::gdi32`] — 8 fail-soft stubs for `BitBlt` /
+//!   `CreateCompatibleDC` / `DeleteDC` / `GetDeviceCaps` /
+//!   `GetNearestColor` / `GetObjectA` /
+//!   `GetSystemPaletteEntries` / `SelectObject`.
+//! * [`win32::kernel32`] — 24 round-4 stubs covering the CRT
+//!   init surface (`ExitProcess`, `GetACP` / `GetOEMCP` /
+//!   `GetCPInfo`, `GetCommandLineA` / `GetEnvironmentStrings` /
+//!   `GetFileType`, `GetLastError` / `SetLastError`,
+//!   `GetModuleFileNameA` / `GetModuleHandleA`,
+//!   `GetStartupInfoA` / `GetStdHandle` / `GetSystemInfo` /
+//!   `GetVersion`, `GlobalAlloc` / `GlobalFree` / `GlobalLock`
+//!   / `GlobalUnlock`, `MultiByteToWideChar` /
+//!   `WideCharToMultiByte`, `RtlUnwind`, `VirtualAlloc` /
+//!   `VirtualFree`, `WriteFile`).
+//! * [`win32::user32`] — 16 fail-soft stubs covering the
+//!   dialog / paint surface; `MessageBoxA` logs to stderr +
+//!   `host.message_box_log`; `wsprintfA` is a real cdecl
+//!   variadic implementation.
+//! * [`win32::winmm`] — `DefDriverProc` (returns 0 / DRVCNF_OK).
+//! * [`emulator::mmu::Mmu::unmap`] +
+//!   [`emulator::mmu::Mmu::find_free_range`] for the
+//!   `VirtualAlloc` / `VirtualFree` family.
+//!
+//! With round 4 in place, `IR32_32.DLL` loads cleanly and
+//! `DllMain` runs until it hits the first ISA opcode our integer
+//! interpreter does not yet decode: `ADD AL, imm8` (opcode
+//! `0x04`) at `eip = 0x1000_612A`. That's the round-5 todo list.
+//!
+//! MMX is deliberately **deferred** to round 6+: Indeo 3 is
 //! pre-MMX, so it stays unblocked. Indeo 5 (`ir50_32.dll`) and
 //! most later codecs use MMX, so MMX support lands when the test
 //! corpus expands to one of those.

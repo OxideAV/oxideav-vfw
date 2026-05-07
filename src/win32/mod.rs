@@ -24,8 +24,11 @@ use std::collections::BTreeMap;
 
 use crate::emulator::{Cpu, Mmu};
 
+pub mod gdi32;
 pub mod kernel32;
+pub mod user32;
 pub mod vfw32;
+pub mod winmm;
 
 /// First synthetic thunk address. Chosen well above any plausible
 /// `ImageBase + section.VirtualAddress` so it cannot be mistaken
@@ -131,9 +134,17 @@ pub struct HostState {
     pub tick: u32,
     /// Loaded-module registry: name → ImageBase.
     pub modules: BTreeMap<String, u32>,
+    /// Most-recently-loaded codec module's image base — returned
+    /// by `GetModuleHandleA(NULL)`. Set to 0 if no DLL has been
+    /// loaded yet.
+    pub primary_module_base: u32,
     /// Lines that the codec wrote to `OutputDebugString*`. Tests
     /// can introspect to confirm a known string was emitted.
     pub debug_log: Vec<String>,
+    /// Lines that the codec wrote to `MessageBoxA` (also mirrored
+    /// to `eprintln!`). Distinct from `debug_log` so a test can
+    /// distinguish OutputDebugStringA traffic from real popups.
+    pub message_box_log: Vec<String>,
     /// Open codec handles. Synthesised inside the host (no codec
     /// guest memory is consumed); each handle is a small integer
     /// the codec sees as an `HIC`.
@@ -146,12 +157,41 @@ pub struct HostState {
     /// the no-fixture unit tests). Set to 0 when no codec is
     /// loaded — `ICOpen` then refuses to mint a HIC.
     pub default_driver_proc: u32,
+    /// Set by `kernel32!ExitProcess` to break out of the
+    /// emulator loop in lieu of unwinding to `RET_SENTINEL`.
+    /// `Some(code)` means "the codec asked to terminate"; the
+    /// run-loop converts this into a clean return so the calling
+    /// host code can introspect what happened.
+    pub exit_requested: Option<u32>,
+    /// Read-only constant-data arena. Used by stubs like
+    /// `GetCommandLineA` / `GetEnvironmentStrings` that need to
+    /// hand out stable guest pointers to canned strings. The
+    /// slab grows by `arena_const_alloc` and lives at
+    /// `[const_arena_start, const_arena_end)`. Configured by
+    /// [`HostState::new`] like the heap arena.
+    pub const_arena_cursor: u32,
+    pub const_arena_end: u32,
+    /// Cached pointer to the canned `"oxideav-vfw\0"` command
+    /// line. Lazily populated by `GetCommandLineA`.
+    pub command_line_ptr: u32,
+    /// Cached pointer to the canned empty environment block.
+    pub environment_strings_ptr: u32,
+    /// Currently-live `HDC` values handed out by
+    /// `gdi32!CreateCompatibleDC` / `user32!GetDC`. `None` until
+    /// the first DC is allocated, then a populated set.
+    pub gdi_hdcs: Option<std::collections::BTreeSet<u32>>,
 }
 
 impl HostState {
     /// Construct a HostState with the heap arena at `[heap_start,
     /// heap_end)` (caller is responsible for mapping that region
     /// in the MMU as R+W).
+    ///
+    /// The const-arena (used for canned strings handed back from
+    /// `GetCommandLineA` / `GetEnvironmentStrings` / etc.) is
+    /// **not** allocated here — call [`Self::with_const_arena`]
+    /// to set it up if those stubs are exercised. Tests that
+    /// don't use them can leave it at zero.
     pub fn new(heap_start: u32, heap_end: u32) -> Self {
         HostState {
             heap_cursor: heap_start,
@@ -161,11 +201,61 @@ impl HostState {
             tick: 0,
             heap: BTreeMap::new(),
             modules: BTreeMap::new(),
+            primary_module_base: 0,
             debug_log: Vec::new(),
+            message_box_log: Vec::new(),
             hics: BTreeMap::new(),
             next_hic: 1,
             default_driver_proc: 0,
+            exit_requested: None,
+            const_arena_cursor: 0,
+            const_arena_end: 0,
+            command_line_ptr: 0,
+            environment_strings_ptr: 0,
+            gdi_hdcs: None,
         }
+    }
+
+    /// Configure the const-arena (region for canned read-only
+    /// strings handed back to the codec). `[start, end)` is a
+    /// guest-virtual range the caller has already mapped R+W
+    /// (the arena bytes are written via `write_initializer`,
+    /// so any page perms suffice as long as the page is mapped).
+    pub fn with_const_arena(mut self, start: u32, end: u32) -> Self {
+        self.const_arena_cursor = start;
+        self.const_arena_end = end;
+        self
+    }
+
+    /// Bump-allocate `n` bytes in the const arena. Returns the
+    /// guest address of the new slab. The caller is responsible
+    /// for [`Mmu::write_initializer`]'ing the contents.
+    pub fn arena_const_alloc(&mut self, n: u32) -> Result<u32, Win32Error> {
+        let aligned = n
+            .checked_add(15)
+            .map(|v| v & !15u32)
+            .ok_or(Win32Error::InvalidArgument {
+                stub: "arena_const_alloc",
+                reason: "size overflow".into(),
+            })?;
+        let addr = self.const_arena_cursor;
+        let next = addr
+            .checked_add(aligned)
+            .ok_or(Win32Error::InvalidArgument {
+                stub: "arena_const_alloc",
+                reason: "const arena address-space overflow".into(),
+            })?;
+        if next > self.const_arena_end {
+            return Err(Win32Error::InvalidArgument {
+                stub: "arena_const_alloc",
+                reason: format!(
+                    "const arena exhausted (need {n}, have {})",
+                    self.const_arena_end - addr
+                ),
+            });
+        }
+        self.const_arena_cursor = next;
+        Ok(addr)
     }
 
     /// Allocate a fresh slab in the heap arena and return its
@@ -267,6 +357,36 @@ impl Registry {
         kernel32::register(self);
         self.by_name.len() - before
     }
+
+    /// Register every gdi32 stub. Returns the number registered.
+    pub fn register_gdi32(&mut self) -> usize {
+        let before = self.by_name.len();
+        gdi32::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every user32 stub. Returns the number registered.
+    pub fn register_user32(&mut self) -> usize {
+        let before = self.by_name.len();
+        user32::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every winmm stub. Returns the number registered.
+    pub fn register_winmm(&mut self) -> usize {
+        let before = self.by_name.len();
+        winmm::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every Round-1+4 stub family in one call: kernel32,
+    /// gdi32, user32, winmm. Returns the total number registered.
+    pub fn register_all(&mut self) -> usize {
+        self.register_kernel32()
+            + self.register_gdi32()
+            + self.register_user32()
+            + self.register_winmm()
+    }
 }
 
 /// Read the `n`-th stdcall dword argument off the guest stack.
@@ -277,6 +397,35 @@ impl Registry {
 pub fn arg_dword(cpu: &Cpu, mmu: &Mmu, n: u32) -> Result<u32, crate::emulator::Trap> {
     let addr = cpu.regs.esp().wrapping_add(4u32 * (n + 1));
     mmu.load32(addr)
+}
+
+/// Convert an MMU/CPU [`crate::emulator::Trap`] into a [`Win32Error`]
+/// so a stub's argument-fetch failure surfaces as
+/// `Win32Error::InvalidArgument`. Used by the gdi32 / user32 /
+/// winmm modules.
+pub fn trap_to_win32_local(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
+    Win32Error::InvalidArgument {
+        stub,
+        reason: format!("{t}"),
+    }
+}
+
+/// Read a NUL-terminated 8-bit string from guest memory at `addr`,
+/// stopping at NUL or after `max` bytes. Used by user32/winmm
+/// stubs that take an `LPCSTR`.
+pub fn read_cstr_local(mmu: &Mmu, mut addr: u32, max: u32) -> Result<String, Win32Error> {
+    let mut bytes = Vec::new();
+    for _ in 0..max {
+        let b = mmu
+            .load8(addr)
+            .map_err(|t| trap_to_win32_local("read_cstr", t))?;
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        addr = addr.wrapping_add(1);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Dispatch a stub call. The runtime wires this into the executor
@@ -332,6 +481,13 @@ pub fn run_until_sentinel(
 ) -> Result<(), crate::Error> {
     use crate::emulator::isa_int::{StepOk, RET_SENTINEL};
     loop {
+        if state.exit_requested.is_some() {
+            // `kernel32!ExitProcess` was called. Force eip to
+            // the sentinel so the outer caller's stack-frame
+            // cleanup is consistent and exit cleanly.
+            cpu.regs.eip = RET_SENTINEL;
+            return Ok(());
+        }
         if cpu.regs.eip == RET_SENTINEL {
             return Ok(());
         }

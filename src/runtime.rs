@@ -24,6 +24,11 @@ pub const DLL_PROCESS_DETACH: u32 = 0;
 const HEAP_ARENA_START: u32 = 0x6000_0000;
 const HEAP_ARENA_END: u32 = 0x7000_0000;
 
+/// Const-arena region — read-only canned strings handed back from
+/// `GetCommandLineA` / `GetEnvironmentStrings` etc.
+const CONST_ARENA_START: u32 = 0x7000_0000;
+const CONST_ARENA_END: u32 = 0x7010_0000;
+
 /// Default guest stack region — plenty of room above the heap.
 const STACK_BOTTOM: u32 = 0x9000_0000;
 const STACK_SIZE: u32 = 0x0010_0000; // 1 MiB
@@ -55,6 +60,14 @@ impl Sandbox {
             HEAP_ARENA_END - HEAP_ARENA_START,
             Perm::R | Perm::W,
         );
+        // Const-arena for canned strings (R+W mapped; the caller
+        // ABI treats it as R-only — we use write_initializer for
+        // population, then any reads honour the perm bits).
+        mmu.map(
+            CONST_ARENA_START,
+            CONST_ARENA_END - CONST_ARENA_START,
+            Perm::R | Perm::W,
+        );
         // Stack (R+W)
         mmu.map(STACK_BOTTOM, STACK_SIZE, Perm::R | Perm::W);
 
@@ -62,9 +75,10 @@ impl Sandbox {
         cpu.regs.set_esp(STACK_TOP - 0x100); // leave a guard at the top
 
         let mut registry = Registry::new();
-        registry.register_kernel32();
+        registry.register_all();
 
-        let host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END);
+        let host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
+            .with_const_arena(CONST_ARENA_START, CONST_ARENA_END);
         Sandbox {
             mmu,
             cpu,
@@ -79,6 +93,9 @@ impl Sandbox {
     pub fn load(&mut self, name: &str, bytes: &[u8]) -> Result<Image, crate::Error> {
         let mut loader = Loader::new(&mut self.mmu, &mut self.registry, &mut self.host);
         let img = loader.load(name, bytes)?;
+        // Record primary module base so `GetModuleHandleA(NULL)`
+        // returns the right value.
+        self.host.primary_module_base = img.image_base;
         Ok(img)
     }
 

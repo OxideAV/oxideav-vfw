@@ -12,15 +12,22 @@
 //! * `InterlockedIncrement`, `InterlockedDecrement`
 //! * `LoadLibraryA`, `GetProcAddress`
 //!
-//! Round-2 will add: `VirtualAlloc` / `VirtualFree` /
-//! `VirtualProtect`, `EnterCriticalSection` and friends, `Tls*`,
-//! `GetLastError` / `SetLastError`, `QueryPerformanceCounter`.
+//! Round-4 adds the additional 24 `kernel32` stubs an Indeo 3
+//! class DLL imports through its CRT init: `ExitProcess`,
+//! `GetACP` / `GetOEMCP` / `GetCPInfo`, `GetCommandLineA`,
+//! `GetEnvironmentStrings`, `GetFileType`, `GetLastError` /
+//! `SetLastError`, `GetModuleFileNameA` / `GetModuleHandleA`,
+//! `GetStartupInfoA` / `GetStdHandle` / `GetSystemInfo` /
+//! `GetVersion`, `GlobalAlloc` / `GlobalFree` / `GlobalLock` /
+//! `GlobalUnlock`, `MultiByteToWideChar` / `WideCharToMultiByte`,
+//! `RtlUnwind`, `VirtualAlloc` / `VirtualFree`, `WriteFile`.
 //!
 //! Each stub references its MSDN page in a comment for review;
 //! the implementations honour the public contract (return
 //! values, error semantics, side effects on `lastError`).
 
 use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use crate::emulator::mmu::{Perm, PAGE_SIZE};
 use crate::emulator::{Cpu, Mmu};
 
 /// Register every kernel32 stub into `registry`.
@@ -92,6 +99,144 @@ pub fn register(registry: &mut Registry) {
         stub_get_proc_address as StubFn,
         2,
     );
+
+    // ---- Round-4 additions (24 stubs) -----------------------------
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess
+    registry.register(
+        "kernel32.dll",
+        "ExitProcess",
+        stub_exit_process as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getacp
+    registry.register("kernel32.dll", "GetACP", stub_get_acp as StubFn, 0);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getoemcp
+    registry.register("kernel32.dll", "GetOEMCP", stub_get_oem_cp as StubFn, 0);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getcpinfo
+    registry.register("kernel32.dll", "GetCPInfo", stub_get_cp_info as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getcommandlinea
+    registry.register(
+        "kernel32.dll",
+        "GetCommandLineA",
+        stub_get_command_line_a as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentstrings
+    registry.register(
+        "kernel32.dll",
+        "GetEnvironmentStrings",
+        stub_get_environment_strings as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype
+    registry.register(
+        "kernel32.dll",
+        "GetFileType",
+        stub_get_file_type as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getlasterror
+    registry.register(
+        "kernel32.dll",
+        "GetLastError",
+        stub_get_last_error as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setlasterror
+    registry.register(
+        "kernel32.dll",
+        "SetLastError",
+        stub_set_last_error as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulefilenamea
+    registry.register(
+        "kernel32.dll",
+        "GetModuleFileNameA",
+        stub_get_module_file_name_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlea
+    registry.register(
+        "kernel32.dll",
+        "GetModuleHandleA",
+        stub_get_module_handle_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getstartupinfoa
+    registry.register(
+        "kernel32.dll",
+        "GetStartupInfoA",
+        stub_get_startup_info_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getstdhandle
+    registry.register(
+        "kernel32.dll",
+        "GetStdHandle",
+        stub_get_std_handle as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsysteminfo
+    registry.register(
+        "kernel32.dll",
+        "GetSystemInfo",
+        stub_get_system_info as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversion
+    registry.register("kernel32.dll", "GetVersion", stub_get_version as StubFn, 0);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalalloc
+    registry.register(
+        "kernel32.dll",
+        "GlobalAlloc",
+        stub_global_alloc as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalfree
+    registry.register("kernel32.dll", "GlobalFree", stub_global_free as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globallock
+    registry.register("kernel32.dll", "GlobalLock", stub_global_lock as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalunlock
+    registry.register(
+        "kernel32.dll",
+        "GlobalUnlock",
+        stub_global_unlock as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar
+    registry.register(
+        "kernel32.dll",
+        "MultiByteToWideChar",
+        stub_multi_byte_to_wide_char as StubFn,
+        6,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-widechartomultibyte
+    registry.register(
+        "kernel32.dll",
+        "WideCharToMultiByte",
+        stub_wide_char_to_multi_byte as StubFn,
+        8,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlunwind
+    registry.register("kernel32.dll", "RtlUnwind", stub_rtl_unwind as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc
+    registry.register(
+        "kernel32.dll",
+        "VirtualAlloc",
+        stub_virtual_alloc as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualfree
+    registry.register(
+        "kernel32.dll",
+        "VirtualFree",
+        stub_virtual_free as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
+    registry.register("kernel32.dll", "WriteFile", stub_write_file as StubFn, 5);
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -380,6 +525,653 @@ fn stub_get_proc_address(
     // We don't know which DLL was identified, so always return
     // NULL for round-1; callers fall back to import-table
     // resolution.
+    Ok(0)
+}
+
+// ----- Round-4 stubs -------------------------------------------------
+
+/// `void ExitProcess(UINT uExitCode)`. Sets `state.exit_requested`,
+/// which the run-loop converts into a clean RET_SENTINEL exit so
+/// the host caller can introspect the codec's exit code without
+/// having to handle a panic. Codecs *should* never call this from
+/// their loaded path; if one does, the entire emulator session is
+/// over.
+fn stub_exit_process(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("ExitProcess", t))?;
+    state.exit_requested = Some(code);
+    Ok(0)
+}
+
+/// `UINT GetACP(void)`. Returns Windows-1252 (the canonical code
+/// page for the Indeo 3 era).
+fn stub_get_acp(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1252)
+}
+
+/// `UINT GetOEMCP(void)`. Returns 437 (US English code page).
+fn stub_get_oem_cp(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(437)
+}
+
+/// `BOOL GetCPInfo(UINT codepage, LPCPINFO lpCPInfo)`. Fills the
+/// `CPINFO` struct with `MaxCharSize=1`, `DefaultChar={'?',0}`,
+/// `LeadByte=[0;12]`. Returns TRUE.
+fn stub_get_cp_info(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    let p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // CPINFO layout (per winnls.h):
+    //   UINT  MaxCharSize;        // 4
+    //   BYTE  DefaultChar[2];     // 2
+    //   BYTE  LeadByte[12];       // 12
+    // total: 18 bytes, then padded — we explicitly write each
+    // field so layout-padding is irrelevant.
+    mmu.store32(p, 1)
+        .map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    mmu.store8(p + 4, b'?')
+        .map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    mmu.store8(p + 5, 0)
+        .map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    for i in 0..12 {
+        mmu.store8(p + 6 + i, 0)
+            .map_err(|t| trap_to_win32("GetCPInfo", t))?;
+    }
+    Ok(1)
+}
+
+/// `LPSTR GetCommandLineA(void)`. Returns a guest-side pointer
+/// to the canned `"oxideav-vfw\0"` string.
+fn stub_get_command_line_a(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    if state.command_line_ptr == 0 {
+        let s = b"oxideav-vfw\0";
+        let addr = state.arena_const_alloc(s.len() as u32)?;
+        mmu.write_initializer(addr, s)
+            .map_err(|t| trap_to_win32("GetCommandLineA", t))?;
+        state.command_line_ptr = addr;
+    }
+    Ok(state.command_line_ptr)
+}
+
+/// `LPCH GetEnvironmentStrings(void)`. Returns a guest-side
+/// pointer to a static block `"\0\0"` (empty environment,
+/// double-null-terminated).
+fn stub_get_environment_strings(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    if state.environment_strings_ptr == 0 {
+        let s = b"\0\0";
+        let addr = state.arena_const_alloc(s.len() as u32)?;
+        mmu.write_initializer(addr, s)
+            .map_err(|t| trap_to_win32("GetEnvironmentStrings", t))?;
+        state.environment_strings_ptr = addr;
+    }
+    Ok(state.environment_strings_ptr)
+}
+
+/// `DWORD GetFileType(HANDLE hFile)`. Returns
+/// `FILE_TYPE_UNKNOWN = 0` for any handle. Codecs typically only
+/// call this for stdin/stdout, which they don't actually use.
+fn stub_get_file_type(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `DWORD GetLastError(void)` — returns `state.last_error`.
+fn stub_get_last_error(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(state.last_error)
+}
+
+/// `void SetLastError(DWORD dwErrCode)` — writes `state.last_error`.
+fn stub_set_last_error(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetLastError", t))?;
+    state.last_error = code;
+    Ok(0)
+}
+
+/// `DWORD GetModuleFileNameA(HMODULE hModule, LPSTR lpFilename,
+/// DWORD nSize)`. Writes `"oxideav-vfw\0"` into the buffer up to
+/// `nSize`, returns the number of bytes written (excluding NUL).
+fn stub_get_module_file_name_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
+    let dst = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
+    let n_size = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
+    if dst == 0 || n_size == 0 {
+        return Ok(0);
+    }
+    let s = b"oxideav-vfw";
+    let mut written = 0u32;
+    for (i, b) in s.iter().enumerate() {
+        if (i as u32) >= n_size.saturating_sub(1) {
+            break;
+        }
+        mmu.store8(dst + i as u32, *b)
+            .map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
+        written = written.saturating_add(1);
+    }
+    // Always NUL-terminate (within nSize).
+    if n_size > 0 {
+        let nul_off = written.min(n_size - 1);
+        mmu.store8(dst + nul_off, 0)
+            .map_err(|t| trap_to_win32("GetModuleFileNameA", t))?;
+    }
+    Ok(written)
+}
+
+/// `HMODULE GetModuleHandleA(LPCSTR lpModuleName)`. NULL =>
+/// the primary loaded DLL's image base; otherwise look up via
+/// `state.modules`.
+fn stub_get_module_handle_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetModuleHandleA", t))?;
+    if p == 0 {
+        return Ok(state.primary_module_base);
+    }
+    let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
+    Ok(state.modules.get(&name).copied().unwrap_or(0))
+}
+
+/// `void GetStartupInfoA(LPSTARTUPINFO lpStartupInfo)`. Fills
+/// the `STARTUPINFO` struct with `cb=68`, all other fields zero.
+fn stub_get_startup_info_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetStartupInfoA", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // STARTUPINFOA is 68 bytes — zero all of it, then stamp cb.
+    for i in 0..68u32 {
+        mmu.store8(p + i, 0)
+            .map_err(|t| trap_to_win32("GetStartupInfoA", t))?;
+    }
+    mmu.store32(p, 68)
+        .map_err(|t| trap_to_win32("GetStartupInfoA", t))?;
+    Ok(0)
+}
+
+/// `HANDLE GetStdHandle(DWORD nStdHandle)`. Returns
+/// `INVALID_HANDLE_VALUE = 0xFFFFFFFF`. Codecs that branch on
+/// this fall through to a no-stdio path.
+fn stub_get_std_handle(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFF)
+}
+
+/// `void GetSystemInfo(LPSYSTEM_INFO lpSystemInfo)`. Fills the
+/// `SYSTEM_INFO` struct with sensible defaults — single Pentium
+/// processor, 4 KiB pages.
+fn stub_get_system_info(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemInfo", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let trap = |t: crate::emulator::Trap| trap_to_win32("GetSystemInfo", t);
+    // SYSTEM_INFO layout (winbase.h):
+    //   union { DWORD dwOemId;
+    //           struct { WORD wProcessorArchitecture;
+    //                    WORD wReserved; } };           // 4
+    //   DWORD dwPageSize;                               // 4
+    //   LPVOID lpMinimumApplicationAddress;             // 4
+    //   LPVOID lpMaximumApplicationAddress;             // 4
+    //   DWORD_PTR dwActiveProcessorMask;                // 4 (32-bit)
+    //   DWORD dwNumberOfProcessors;                     // 4
+    //   DWORD dwProcessorType;                          // 4
+    //   DWORD dwAllocationGranularity;                  // 4
+    //   WORD wProcessorLevel;                           // 2
+    //   WORD wProcessorRevision;                        // 2
+    // total: 36 bytes.
+    mmu.store32(p, 0).map_err(trap)?; // dwOemId = PROCESSOR_ARCHITECTURE_INTEL = 0
+    mmu.store32(p + 4, PAGE_SIZE as u32).map_err(trap)?;
+    mmu.store32(p + 8, 0x10000).map_err(trap)?;
+    mmu.store32(p + 12, 0x7FFF_FFFF).map_err(trap)?;
+    mmu.store32(p + 16, 1).map_err(trap)?; // ActiveProcessorMask
+    mmu.store32(p + 20, 1).map_err(trap)?; // NumberOfProcessors
+    mmu.store32(p + 24, 586).map_err(trap)?; // dwProcessorType (PROCESSOR_INTEL_PENTIUM)
+    mmu.store32(p + 28, 0x10000).map_err(trap)?; // dwAllocationGranularity
+    mmu.store16(p + 32, 0).map_err(trap)?; // wProcessorLevel
+    mmu.store16(p + 34, 0).map_err(trap)?; // wProcessorRevision
+    Ok(0)
+}
+
+/// `DWORD GetVersion(void)`. Returns Win98-shaped value: low
+/// word = (minor << 8) | major, high word = build (= 0).
+/// `0x00000A04` = major=4, minor=10 → Windows 98.
+fn stub_get_version(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0x0000_0A04)
+}
+
+/// `HGLOBAL GlobalAlloc(UINT uFlags, SIZE_T dwBytes)`. The
+/// `Global*` family is a legacy alias for `Local*` — same heap.
+const GMEM_ZEROINIT: u32 = 0x0040;
+
+fn stub_global_alloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let flags = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalAlloc", t))?;
+    let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GlobalAlloc", t))?;
+    let addr = bump_alloc(state, n)?;
+    let mut buf = vec![0u8; n as usize];
+    if (flags & GMEM_ZEROINIT) != 0 {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+    }
+    mmu.write_initializer(addr, &buf)
+        .map_err(|t| trap_to_win32("GlobalAlloc", t))?;
+    state.heap.insert(addr, buf);
+    Ok(addr)
+}
+
+/// `HGLOBAL GlobalFree(HGLOBAL hMem)`. Removes the slab; returns
+/// NULL on success per MSDN.
+fn stub_global_free(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalFree", t))?;
+    if addr == 0 {
+        return Ok(0);
+    }
+    state
+        .heap
+        .remove(&addr)
+        .ok_or(Win32Error::InvalidHeapBlock {
+            stub: "GlobalFree",
+            addr,
+        })?;
+    Ok(0)
+}
+
+/// `LPVOID GlobalLock(HGLOBAL hMem)`. We don't move handles, so
+/// we return the address itself.
+fn stub_global_lock(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalLock", t))?;
+    Ok(addr)
+}
+
+/// `BOOL GlobalUnlock(HGLOBAL hMem)`. Returns FALSE per MSDN
+/// when "the memory object is no longer locked" — but with our
+/// no-op-lock model we always return FALSE+last_error=NO_ERROR
+/// so the caller's reference count goes to zero cleanly.
+fn stub_global_unlock(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalUnlock", t))?;
+    state.last_error = 0; // NO_ERROR
+    Ok(0)
+}
+
+/// `int MultiByteToWideChar(UINT codepage, DWORD dwFlags,
+/// LPCSTR lpMultiByteStr, int cbMultiByte, LPWSTR
+/// lpWideCharStr, int cchWideChar)`.
+///
+/// Implements code pages CP_ACP (1252), CP_OEMCP (437), and
+/// CP_UTF8 (65001) by zero-extending each input byte to a
+/// UTF-16 code unit. Honours the cchWideChar=0 case (return
+/// required length without writing).
+fn stub_multi_byte_to_wide_char(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    let src = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    let cb = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    let dst = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    let cch = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    if src == 0 {
+        return Ok(0);
+    }
+    // cbMultiByte = -1 means "include the NUL terminator and stop
+    // at it"; i.e. compute strlen+1.
+    let n = if cb == 0xFFFF_FFFF {
+        let mut p = src;
+        let mut k: u32 = 0;
+        loop {
+            let b = mmu
+                .load8(p)
+                .map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+            k = k.saturating_add(1);
+            if b == 0 {
+                break;
+            }
+            p = p.wrapping_add(1);
+            if k > 0x0010_0000 {
+                break; // safety bound (1 MiB)
+            }
+        }
+        k
+    } else {
+        cb
+    };
+
+    if cch == 0 {
+        // Caller wants the required length, no write.
+        return Ok(n);
+    }
+    if dst == 0 {
+        return Ok(0);
+    }
+    let to_write = core::cmp::min(n, cch);
+    for i in 0..to_write {
+        let b = mmu
+            .load8(src + i)
+            .map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+        mmu.store16(dst + i * 2, u16::from(b))
+            .map_err(|t| trap_to_win32("MultiByteToWideChar", t))?;
+    }
+    Ok(to_write)
+}
+
+/// `int WideCharToMultiByte(UINT codepage, DWORD dwFlags,
+/// LPCWSTR lpWideCharStr, int cchWideChar, LPSTR
+/// lpMultiByteStr, int cbMultiByte, LPCSTR lpDefaultChar,
+/// LPBOOL lpUsedDefaultChar)`.
+///
+/// Inverse of `MultiByteToWideChar`: writes the low byte if
+/// the UTF-16 unit fits in 8 bits, else uses lpDefaultChar
+/// (or `'?'` if lpDefaultChar is NULL) and sets
+/// `*lpUsedDefaultChar = TRUE`.
+#[allow(clippy::too_many_arguments)]
+fn stub_wide_char_to_multi_byte(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _cp = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let src = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let cch = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let dst = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let cb = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let p_default = arg_dword(cpu, mmu, 6).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    let p_used = arg_dword(cpu, mmu, 7).map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    if src == 0 {
+        return Ok(0);
+    }
+
+    // cchWideChar = -1 ⇒ stop at NUL (and include it in count).
+    let n = if cch == 0xFFFF_FFFF {
+        let mut p = src;
+        let mut k: u32 = 0;
+        loop {
+            let u = mmu
+                .load16(p)
+                .map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+            k = k.saturating_add(1);
+            if u == 0 {
+                break;
+            }
+            p = p.wrapping_add(2);
+            if k > 0x0010_0000 {
+                break;
+            }
+        }
+        k
+    } else {
+        cch
+    };
+
+    let default_char: u8 = if p_default != 0 {
+        mmu.load8(p_default)
+            .map_err(|t| trap_to_win32("WideCharToMultiByte", t))?
+    } else {
+        b'?'
+    };
+
+    if cb == 0 {
+        return Ok(n);
+    }
+    if dst == 0 {
+        return Ok(0);
+    }
+
+    let to_write = core::cmp::min(n, cb);
+    let mut used_default = false;
+    for i in 0..to_write {
+        let u = mmu
+            .load16(src + i * 2)
+            .map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+        let b = if u <= 0xFF {
+            u as u8
+        } else {
+            used_default = true;
+            default_char
+        };
+        mmu.store8(dst + i, b)
+            .map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    }
+    if p_used != 0 {
+        mmu.store32(p_used, if used_default { 1 } else { 0 })
+            .map_err(|t| trap_to_win32("WideCharToMultiByte", t))?;
+    }
+    Ok(to_write)
+}
+
+/// `void RtlUnwind(PVOID TargetFrame, PVOID TargetIp,
+/// PEXCEPTION_RECORD ExceptionRecord, PVOID ReturnValue)`.
+///
+/// SEH-stub per the design doc's "out of scope until specifically
+/// needed" entry. The codec's `__try` blocks effectively become
+/// no-ops; if a codec actually relies on SEH for control flow
+/// (rather than only for cleanup), the trap will surface on the
+/// first instruction past the try-body it expected to skip.
+fn stub_rtl_unwind(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+const MEM_COMMIT: u32 = 0x0000_1000;
+const MEM_RESERVE: u32 = 0x0000_2000;
+#[allow(dead_code)]
+const MEM_RELEASE: u32 = 0x0000_8000;
+#[allow(dead_code)]
+const MEM_DECOMMIT: u32 = 0x0000_4000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+#[allow(dead_code)]
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+fn page_protect_to_perm(flprot: u32) -> Perm {
+    // Mask out PAGE_GUARD / PAGE_NOCACHE / PAGE_WRITECOMBINE.
+    let base = flprot & 0xFF;
+    match base {
+        PAGE_NOACCESS => Perm::from_bits(0),
+        PAGE_READONLY => Perm::R,
+        PAGE_READWRITE => Perm::R | Perm::W,
+        PAGE_EXECUTE_READ => Perm::R | Perm::X,
+        PAGE_EXECUTE_READWRITE => Perm::R | Perm::W | Perm::X,
+        _ => Perm::R | Perm::W,
+    }
+}
+
+/// Region [0xA000_0000, 0xC000_0000) reserved for VirtualAlloc
+/// when the caller passes lpAddress=NULL. Kept well above the
+/// heap/stack regions configured by `Sandbox::new`.
+const VIRTUAL_ALLOC_LO: u32 = 0xA000_0000;
+const VIRTUAL_ALLOC_HI: u32 = 0xC000_0000;
+
+/// `LPVOID VirtualAlloc(LPVOID lpAddress, SIZE_T dwSize,
+/// DWORD flAllocationType, DWORD flProtect)`.
+///
+/// MEM_RESERVE alone reserves address space without committing
+/// pages; MEM_COMMIT (alone or together) maps the pages with
+/// the `flProtect` permissions. We honour MEM_COMMIT by mapping
+/// real pages; MEM_RESERVE-only is treated the same way (we
+/// don't model the reserve/commit split distinctly).
+fn stub_virtual_alloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let lp_addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
+    let alloc_type = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
+    let prot = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("VirtualAlloc", t))?;
+
+    if size == 0 {
+        return Ok(0);
+    }
+    let perm = page_protect_to_perm(prot);
+    let aligned_size = ((size + (PAGE_SIZE as u32 - 1)) & !(PAGE_SIZE as u32 - 1)).max(size);
+
+    let base = if lp_addr == 0 {
+        match mmu.find_free_range(VIRTUAL_ALLOC_LO, VIRTUAL_ALLOC_HI, aligned_size) {
+            Some(b) => b,
+            None => return Ok(0),
+        }
+    } else {
+        // Round down to a page boundary.
+        lp_addr & !(PAGE_SIZE as u32 - 1)
+    };
+
+    if (alloc_type & (MEM_COMMIT | MEM_RESERVE)) != 0 || alloc_type == 0 {
+        mmu.map(base, aligned_size, perm);
+    }
+    Ok(base)
+}
+
+/// `BOOL VirtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)`.
+fn stub_virtual_free(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let lp_addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("VirtualFree", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("VirtualFree", t))?;
+    let _free_type = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("VirtualFree", t))?;
+    if lp_addr == 0 {
+        return Ok(0);
+    }
+    // For MEM_RELEASE, MSDN requires dwSize == 0 — we ignore that
+    // detail and unmap whatever range the caller supplied. If
+    // size == 0 (release of the whole allocation), do nothing —
+    // we don't track per-allocation extents.
+    if size > 0 {
+        let aligned_size = (size + (PAGE_SIZE as u32 - 1)) & !(PAGE_SIZE as u32 - 1);
+        mmu.unmap(lp_addr & !(PAGE_SIZE as u32 - 1), aligned_size);
+    }
+    Ok(1)
+}
+
+/// `BOOL WriteFile(HANDLE hFile, LPCVOID lpBuffer,
+/// DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+/// LPOVERLAPPED lpOverlapped)`. Stub failure: returns FALSE,
+/// sets last error to ERROR_INVALID_HANDLE.
+const ERROR_INVALID_HANDLE: u32 = 6;
+fn stub_write_file(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let _lp_buf = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let _n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let lp_written = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("WriteFile", t))?;
+    let _lp_ovl = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("WriteFile", t))?;
+    if lp_written != 0 {
+        // Best-effort write zero into bytes-written so the
+        // caller's error path doesn't UB-read garbage.
+        mmu.store32(lp_written, 0)
+            .map_err(|t| trap_to_win32("WriteFile", t))?;
+    }
+    state.last_error = ERROR_INVALID_HANDLE;
     Ok(0)
 }
 

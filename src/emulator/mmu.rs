@@ -157,6 +157,59 @@ impl Mmu {
         }
     }
 
+    /// Unmap a contiguous range of pages — the inverse of
+    /// [`Self::map`]. `addr` and `size` are rounded down/up to
+    /// page boundaries. Pages not currently mapped are silently
+    /// skipped. Used by `kernel32!VirtualFree`.
+    pub fn unmap(&mut self, addr: u32, size: u32) {
+        if size == 0 {
+            return;
+        }
+        let start_page = (addr >> PAGE_SHIFT) as usize;
+        let end_addr = u64::from(addr) + u64::from(size);
+        let end_page = end_addr.div_ceil(PAGE_SIZE as u64).min(NUM_PAGES as u64) as usize;
+        for p in start_page..end_page {
+            self.pages[p] = None;
+        }
+    }
+
+    /// Locate a contiguous range of `size` bytes (page-aligned)
+    /// of unmapped pages within `[lo, hi)`. Used by
+    /// `kernel32!VirtualAlloc` when the caller passes
+    /// `lpAddress = NULL`.
+    pub fn find_free_range(&self, lo: u32, hi: u32, size: u32) -> Option<u32> {
+        if size == 0 {
+            return Some(lo);
+        }
+        let need_pages = u64::from(size).div_ceil(PAGE_SIZE as u64) as usize;
+        let lo_page = (lo >> PAGE_SHIFT) as usize;
+        let hi_page = (hi >> PAGE_SHIFT) as usize;
+        if lo_page + need_pages > hi_page {
+            return None;
+        }
+        let mut p = lo_page;
+        while p + need_pages <= hi_page {
+            // Find the first unmapped page at or after p.
+            while p < hi_page && self.pages[p].is_some() {
+                p += 1;
+            }
+            if p + need_pages > hi_page {
+                return None;
+            }
+            // Check the next need_pages pages are all unmapped.
+            let mut q = p;
+            let end = p + need_pages;
+            while q < end && self.pages[q].is_none() {
+                q += 1;
+            }
+            if q == end {
+                return Some((p as u32) << PAGE_SHIFT);
+            }
+            p = q + 1;
+        }
+        None
+    }
+
     /// Write a byte slice into emulator memory. Pages along the
     /// way must be mapped and writable; permission is checked
     /// per-page. Returns [`Trap::WriteProtectFault`] /

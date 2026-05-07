@@ -1,0 +1,583 @@
+//! `user32.dll` stubs — the UI surface a VfW-class codec DLL
+//! imports.
+//!
+//! Every stub here is fail-soft: the codec only invokes `user32`
+//! in its config-dialog path, which we never invoke. Each stub
+//! returns the documented "user cancelled / nothing happened"
+//! return value so the codec falls through to a no-UI path.
+//!
+//! `wsprintfA` is the one exception — codecs use it for log
+//! strings + format buffers and we need a working implementation.
+//! It supports `%d`, `%u`, `%x`, `%X`, `%s`, `%c`, `%%`. No `%f`
+//! / no width / precision specifiers — round-4 has not seen a
+//! codec that needs them.
+//!
+//! Reference: MSDN `user32` page-by-page; cited inline.
+
+use super::{arg_dword, HostState, Registry, StubFn, Win32Error};
+use crate::emulator::{Cpu, Mmu};
+
+/// Register every user32 stub.
+pub fn register(registry: &mut Registry) {
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-beginpaint
+    registry.register("user32.dll", "BeginPaint", stub_begin_paint as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dialogboxparama
+    registry.register(
+        "user32.dll",
+        "DialogBoxParamA",
+        stub_dialog_box_param_a as StubFn,
+        5,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enddialog
+    registry.register("user32.dll", "EndDialog", stub_end_dialog as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endpaint
+    registry.register("user32.dll", "EndPaint", stub_end_paint as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdc
+    registry.register("user32.dll", "GetDC", stub_get_dc as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdlgitemint
+    registry.register(
+        "user32.dll",
+        "GetDlgItemInt",
+        stub_get_dlg_item_int as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowlonga
+    registry.register(
+        "user32.dll",
+        "GetWindowLongA",
+        stub_get_window_long_a as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect
+    registry.register(
+        "user32.dll",
+        "GetWindowRect",
+        stub_get_window_rect as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadbitmapa
+    registry.register("user32.dll", "LoadBitmapA", stub_load_bitmap_a as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadstringa
+    registry.register("user32.dll", "LoadStringA", stub_load_string_a as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messagebeep
+    registry.register("user32.dll", "MessageBeep", stub_message_beep as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-messageboxa
+    registry.register("user32.dll", "MessageBoxA", stub_message_box_a as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postmessagea
+    registry.register(
+        "user32.dll",
+        "PostMessageA",
+        stub_post_message_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-releasedc
+    registry.register("user32.dll", "ReleaseDC", stub_release_dc as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setdlgitemtexta
+    registry.register(
+        "user32.dll",
+        "SetDlgItemTextA",
+        stub_set_dlg_item_text_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-wsprintfa
+    // wsprintfA is **cdecl**, not stdcall — it's variadic. We
+    // register `arg_dwords = 0` so dispatch_stub doesn't pop the
+    // arguments; the cdecl caller cleans up. The stub itself
+    // walks the variadic list off the stack.
+    registry.register("user32.dll", "wsprintfA", stub_wsprintf_a as StubFn, 0);
+}
+
+// `winuser.h`: PAINTSTRUCT — we zero whatever the codec passed.
+const PAINTSTRUCT_SIZE: u32 = 64;
+
+fn stub_begin_paint(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("BeginPaint", t))?;
+    let p =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("BeginPaint", t))?;
+    if p != 0 {
+        for i in 0..PAINTSTRUCT_SIZE {
+            mmu.store8(p + i, 0)
+                .map_err(|t| crate::win32::trap_to_win32_local("BeginPaint", t))?;
+        }
+    }
+    Ok(super::gdi32::SENTINEL_HDC)
+}
+
+fn stub_end_paint(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+const IDOK: u32 = 1;
+const IDCANCEL: u32 = 2;
+
+/// `INT_PTR DialogBoxParamA(...)`. Return `IDCANCEL` (user
+/// cancelled the dialog without us showing it).
+fn stub_dialog_box_param_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(IDCANCEL)
+}
+
+/// `BOOL EndDialog(HWND hDlg, INT_PTR nResult)`. Returns TRUE.
+fn stub_end_dialog(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `HDC GetDC(HWND hWnd)`. Same sentinel HDC as
+/// `gdi32::CreateCompatibleDC`.
+fn stub_get_dc(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state
+        .gdi_hdcs
+        .get_or_insert_with(std::collections::BTreeSet::new)
+        .insert(super::gdi32::SENTINEL_HDC);
+    Ok(super::gdi32::SENTINEL_HDC)
+}
+
+/// `int ReleaseDC(HWND hWnd, HDC hDC)`. Returns 1 (success).
+fn stub_release_dc(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `UINT GetDlgItemInt(HWND, int, BOOL*, BOOL)`. Returns 0; if
+/// `lpTranslated`, write FALSE.
+fn stub_get_dlg_item_int(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hdlg = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
+    let _id = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
+    let p_translated = arg_dword(cpu, mmu, 2)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
+    let _signed = arg_dword(cpu, mmu, 3)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
+    if p_translated != 0 {
+        mmu.store32(p_translated, 0)
+            .map_err(|t| crate::win32::trap_to_win32_local("GetDlgItemInt", t))?;
+    }
+    Ok(0)
+}
+
+/// `LONG GetWindowLongA(HWND, int)`. Returns 0.
+fn stub_get_window_long_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL GetWindowRect(HWND hWnd, LPRECT lpRect)`. Fills
+/// `RECT { left=0, top=0, right=640, bottom=480 }`. Returns TRUE.
+fn stub_get_window_rect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+    let p = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+    if p != 0 {
+        mmu.store32(p, 0)
+            .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+        mmu.store32(p + 4, 0)
+            .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+        mmu.store32(p + 8, 640)
+            .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+        mmu.store32(p + 12, 480)
+            .map_err(|t| crate::win32::trap_to_win32_local("GetWindowRect", t))?;
+    }
+    Ok(1)
+}
+
+/// `HBITMAP LoadBitmapA(HINSTANCE, LPCSTR)`. Returns NULL — no
+/// resource bitmaps are available.
+fn stub_load_bitmap_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `int LoadStringA(HINSTANCE, UINT, LPSTR, int)`. Returns 0
+/// (no resource string available); leaves the buffer untouched.
+fn stub_load_string_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL MessageBeep(UINT uType)`. No-op TRUE.
+fn stub_message_beep(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `int MessageBoxA(HWND, LPCSTR, LPCSTR, UINT)`. Logs the text
+/// and caption to stderr (so a codec that calls this surfaces
+/// the message visibly), records it on `state.message_box_log`,
+/// then returns `IDOK = 1`.
+fn stub_message_box_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxA", t))?;
+    let p_text =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxA", t))?;
+    let p_caption =
+        arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxA", t))?;
+    let _utype =
+        arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("MessageBoxA", t))?;
+    let text = if p_text != 0 {
+        super::read_cstr_local(mmu, p_text, 4096)?
+    } else {
+        String::new()
+    };
+    let caption = if p_caption != 0 {
+        super::read_cstr_local(mmu, p_caption, 4096)?
+    } else {
+        String::new()
+    };
+    eprintln!("[oxideav-vfw MessageBoxA] {caption}: {text}");
+    state.message_box_log.push(format!("{caption}: {text}"));
+    Ok(IDOK)
+}
+
+/// `BOOL PostMessageA(HWND, UINT, WPARAM, LPARAM)`. Returns
+/// TRUE (the message is "queued").
+fn stub_post_message_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL SetDlgItemTextA(HWND, int, LPCSTR)`. Returns TRUE.
+fn stub_set_dlg_item_text_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `int wsprintfA(LPSTR lpOut, LPCSTR lpFmt, ...)`. **cdecl**
+/// (caller-cleanup). Walks the variadic args off the guest stack
+/// and renders the format string into `lpOut`. Supports `%d` /
+/// `%u` / `%x` / `%X` / `%s` / `%c` / `%%`. No width or precision
+/// specifiers (round-4 has not seen a codec that needs them).
+///
+/// Returns the number of bytes written (excluding the trailing NUL).
+fn stub_wsprintf_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let lp_out =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))?;
+    let lp_fmt =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))?;
+    if lp_out == 0 || lp_fmt == 0 {
+        return Ok(0);
+    }
+    let fmt = super::read_cstr_local(mmu, lp_fmt, 4096)?;
+    let mut out = Vec::<u8>::with_capacity(fmt.len() + 32);
+    let mut iter = fmt.chars().peekable();
+    let mut next_arg: u32 = 2; // arg index of the next variadic dword
+    let pop_dword = |cpu: &Cpu, mmu: &Mmu, n: u32| -> Result<u32, Win32Error> {
+        arg_dword(cpu, mmu, n).map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))
+    };
+    while let Some(c) = iter.next() {
+        if c != '%' {
+            // Multi-byte UTF-8 chars from the format string are
+            // emitted byte-for-byte.
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            out.extend_from_slice(s.as_bytes());
+            continue;
+        }
+        // Skip flags / width / precision / length we do not honour
+        // (consume but ignore digits + '#' + '-' + '0' + ' ' + '+' + '.').
+        let mut spec = '\0';
+        loop {
+            match iter.next() {
+                None => break,
+                Some(ch) => {
+                    if matches!(ch, '#' | '-' | '+' | ' ' | '0' | '.') || ch.is_ascii_digit() {
+                        continue;
+                    }
+                    if ch == 'l' || ch == 'h' || ch == 'I' {
+                        continue;
+                    }
+                    spec = ch;
+                    break;
+                }
+            }
+        }
+        match spec {
+            '%' => out.push(b'%'),
+            'c' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.push(v as u8);
+            }
+            's' => {
+                let p = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                if p == 0 {
+                    out.extend_from_slice(b"(null)");
+                } else {
+                    let s = super::read_cstr_local(mmu, p, 4096)?;
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+            'd' | 'i' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.extend_from_slice((v as i32).to_string().as_bytes());
+            }
+            'u' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.extend_from_slice(v.to_string().as_bytes());
+            }
+            'x' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.extend_from_slice(format!("{v:x}").as_bytes());
+            }
+            'X' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.extend_from_slice(format!("{v:X}").as_bytes());
+            }
+            'p' => {
+                let v = pop_dword(cpu, mmu, next_arg)?;
+                next_arg += 1;
+                out.extend_from_slice(format!("{v:08X}").as_bytes());
+            }
+            '\0' => break, // truncated format
+            _ => {
+                // Unknown specifier — emit it literally so the
+                // truncation is visible in test logs.
+                out.push(b'%');
+                let mut buf = [0u8; 4];
+                let s = spec.encode_utf8(&mut buf);
+                out.extend_from_slice(s.as_bytes());
+            }
+        }
+    }
+    // Write to guest memory (NUL-terminated).
+    for (i, b) in out.iter().enumerate() {
+        mmu.store8(lp_out + i as u32, *b)
+            .map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))?;
+    }
+    mmu.store8(lp_out + out.len() as u32, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("wsprintfA", t))?;
+    Ok(out.len() as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::mmu::Perm;
+    use crate::emulator::regs::Reg32;
+
+    fn make_env() -> (Cpu, Mmu, Registry, HostState) {
+        let mut mmu = Mmu::new();
+        mmu.map(0x4000, 0x4000, Perm::R | Perm::W);
+        mmu.map(0x9000, 0x1000, Perm::R | Perm::W);
+        let mut cpu = Cpu::new();
+        cpu.regs.set_esp(0x9F00);
+        let mut registry = Registry::new();
+        registry.register_all();
+        let state = HostState::new(0x4000, 0x8000);
+        (cpu, mmu, registry, state)
+    }
+
+    fn call(
+        cpu: &mut Cpu,
+        mmu: &mut Mmu,
+        registry: &Registry,
+        state: &mut HostState,
+        dll: &str,
+        name: &str,
+        args: &[u32],
+    ) -> Result<(), crate::Error> {
+        for a in args.iter().rev() {
+            cpu.push32(mmu, *a)?;
+        }
+        cpu.push32(mmu, 0xDEAD_DEAD)?;
+        cpu.regs.eip = registry.resolve(dll, name).expect("registered");
+        crate::win32::dispatch_stub(cpu, mmu, registry, state)
+    }
+
+    #[test]
+    fn dialog_box_param_a_returns_idcancel() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "user32.dll",
+            "DialogBoxParamA",
+            &[0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), IDCANCEL);
+    }
+
+    #[test]
+    fn message_box_a_logs_and_returns_idok() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // "hello\0" at 0x4000, "title\0" at 0x4010.
+        mmu.write(0x4000, b"hello\0").unwrap();
+        mmu.write(0x4010, b"title\0").unwrap();
+        state.heap_cursor = 0x4020;
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "user32.dll",
+            "MessageBoxA",
+            &[0, 0x4000, 0x4010, 0],
+        )
+        .unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), IDOK);
+        assert!(state.message_box_log.last().unwrap().contains("hello"));
+        assert!(state.message_box_log.last().unwrap().contains("title"));
+    }
+
+    #[test]
+    fn get_window_rect_returns_640x480() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let p = 0x4040;
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "user32.dll",
+            "GetWindowRect",
+            &[0, p],
+        )
+        .unwrap();
+        assert_eq!(mmu.load32(p).unwrap(), 0);
+        assert_eq!(mmu.load32(p + 4).unwrap(), 0);
+        assert_eq!(mmu.load32(p + 8).unwrap(), 640);
+        assert_eq!(mmu.load32(p + 12).unwrap(), 480);
+    }
+
+    #[test]
+    fn wsprintf_a_renders_int_and_str() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // "n=%d s=%s\0" at 0x4000, "abc\0" at 0x4020, output at 0x4080.
+        mmu.write(0x4000, b"n=%d s=%s\0").unwrap();
+        mmu.write(0x4020, b"abc\0").unwrap();
+        // wsprintfA is cdecl — args remain on the stack after the
+        // call. Push: lpOut, lpFmt, 42, 0x4020.
+        let args = [0x4080u32, 0x4000, 42, 0x4020];
+        // We use call() but cdecl pushes don't get cleaned by the
+        // dispatcher (we registered arg_dwords=0).
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "user32.dll",
+            "wsprintfA",
+            &args,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        for i in 0..32u32 {
+            let b = mmu.load8(0x4080 + i).unwrap();
+            if b == 0 {
+                break;
+            }
+            buf.push(b);
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "n=42 s=abc");
+    }
+
+    #[test]
+    fn wsprintf_a_handles_hex_and_percent() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        mmu.write(0x4000, b"v=%X %% %x\0").unwrap();
+        let args = [0x4080u32, 0x4000, 0xCAFEu32, 0xDEADu32];
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "user32.dll",
+            "wsprintfA",
+            &args,
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        for i in 0..32u32 {
+            let b = mmu.load8(0x4080 + i).unwrap();
+            if b == 0 {
+                break;
+            }
+            buf.push(b);
+        }
+        let s = String::from_utf8(buf).unwrap();
+        assert_eq!(s, "v=CAFE % dead");
+    }
+}
