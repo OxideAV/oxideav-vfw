@@ -1,142 +1,92 @@
 # oxideav-vfw test fixtures
 
-This directory is **empty in git** by design. The integration
-test in `m1_load_dll_main.rs` has two paths:
+**Codec DLLs are never committed to this repository and never
+staged on disk.** The fixture-gated tests fetch them on demand
+from `samples.oxideav.org` over HTTPS at test time, every run, as
+many times as the test suite needs. There is no local cache, no
+`tests/fixtures/` directory, no `fetch-fixtures.sh` script — the
+fetch is part of each test's body.
+
+This works because:
+
+* Each DLL is the codec vendor's redistributable, legitimately
+  hosted on `samples.oxideav.org` for the project's own
+  development + CI use.
+* The fetch is small (the DLLs are tens to a few hundred KB
+  each); refetching every test run is fine.
+* No on-disk state means no licensing-clarity question about the
+  repo, no `.gitignore`-trap for accidentally-committed binaries,
+  no stale-fixture maintenance burden.
+* CI runs with network access; the `test-fixtures` Cargo feature
+  is what gates the network-dependent tests so air-gapped
+  environments still get the synthesised-PE coverage from the
+  no-fixture path.
+
+## Available test fixtures (Intel IV5 driver bundle)
+
+The full Intel IV5 redistributable is at:
+
+* https://samples.oxideav.org/video/windows/IV5PLAY.EXE
+  *— the original Dell-bundled installer (R19770;
+  https://www.dell.com/support/home/en-us/drivers/driversdetails?driverid=r19770).
+  Self-extracting CAB archive containing every component below.
+  Use `cabextract IV5PLAY.EXE` if you want them in one shot, or
+  fetch each one individually:*
+
+Individual DLLs (replace the trailing filename to access each):
+
+| Filename | Codec | Type | Notes |
+|----------|-------|------|-------|
+| `IR32_32.DLL` | Indeo 3 (RT21 / IV31) | VfW | Pre-MMX, simplest legacy fixture |
+| `IR41_32.AX`  | Indeo 4 (IV41) | DirectShow filter | `.AX` = DirectShow ActiveMovie module |
+| `IR50_32.DLL` | Indeo 5 (IV50) | VfW | Uses MMX heavily |
+| `IAC25_32.AX` | Indeo Audio (IAC25) | DirectShow | Audio codec |
+| `IACENC.DLL`  | Indeo Audio encoder | VfW/ACM | |
+| `NPINDEO.DLL` | Netscape plugin | NSAPI | Browser-side player; not used by oxideav-vfw |
+
+Base URL: `https://samples.oxideav.org/video/windows/IV5PLAY/`.
+Each filename above is a path under that base.
+
+Example test-side fetch:
+
+```rust
+let url = "https://samples.oxideav.org/video/windows/IV5PLAY/IR32_32.DLL";
+let bytes: Vec<u8> = ureq::get(url).call().unwrap().into_reader()
+    .bytes().collect::<std::io::Result<_>>().unwrap();
+let img = oxideav_vfw::pe::load_dll(&bytes)?;
+// …
+```
+
+## Test paths
 
 * The unconditional `synth_dll_main_returns_through_sentinel`
-  test, which builds a minimal PE32 DLL byte-by-byte from the
-  public Microsoft PE/COFF specification and exercises the full
-  round-1 stack (MMU + integer ISA + PE loader + kernel32
-  stubs).
+  test in `m1_load_dll_main.rs` builds a minimal PE32 DLL
+  byte-by-byte from the public Microsoft PE/COFF specification
+  and exercises the full round-1 stack (MMU + integer ISA + PE
+  loader + kernel32 stubs). No network. Always runs.
 
 * The `test-fixtures`-gated `staged_codec_dll_runs_dll_main_cleanly`
-  test, which loads a real legacy codec DLL.
+  test fetches one of the IV5 DLLs from the URL above and runs
+  its `DllMain(DLL_PROCESS_ATTACH)` through the interpreter,
+  expecting a clean return without an unhandled trap. If a trap
+  fires, the trap variant + EIP point at exactly which Win32
+  stub or ISA opcode the next round needs to add.
 
-The legacy codec DLLs themselves are **not committed to this
-repository**. The crate's design contract
-(`OxideAV/docs/winmf/winmf-emulator.md` §"Test corpus") explains
-why: each DLL is the codec vendor's redistributable, the user
-already owns it through the redistributable's licence terms, and
-shipping it bundled here would muddy the licensing story.
+* Round-2's fixture-gated test in `m2_cinepak_decode.rs` was
+  written for Cinepak's `iccvid.dll`, which is **not** in the
+  IV5 bundle. Round 3 will rewrite this to target an Indeo
+  fixture from the bundle (`IR32_32.DLL` is the round-3
+  candidate; `IR50_32.DLL` for round-4 once MMX lands).
 
-## Where to legitimately source a Cinepak DLL
+## Provenance
 
-Cinepak's `iccvid.dll` (Radius / Provenance Systems / SuperMatch
-Cinepak Toolkit, 1991) is in particular freely redistributable as
-shipped in:
+The IV5 driver bundle is freely redistributable under the
+original Intel/Dell terms as packaged in R19770. No relicensing,
+no rebundling — the URLs above are the canonical legitimate
+source for the project's testing.
 
-* Old Microsoft Windows redistributables (Windows Media Player
-  6.4 was the last bundled-Cinepak version; the DLL is in the
-  `Codecs` directory of the install).
-* The K-Lite Mega Codec Pack (`klcp_mega_*.exe`,
-  https://codecguide.com), which redistributes vendor codec
-  packages with the original licences intact.
-* The free `mscodec.zip` from various legacy multimedia
-  archives.
-
-After staging, place the file at:
-
-```
-crates/oxideav-vfw/tests/fixtures/iccvid.dll
-```
-
-And re-run the test with the `test-fixtures` feature enabled:
-
-```
-cargo test -p oxideav-vfw --features test-fixtures \
-    -- staged_codec_dll
-```
-
-The test loads the DLL through the round-1 PE32 loader, calls
-`DllMain(DLL_PROCESS_ATTACH)` through the interpreter, and
-expects the call to return cleanly via the synthetic
-return-address sentinel without an unhandled trap. If a trap
-fires, the trap variant + EIP point at exactly which Win32 stub
-or ISA opcode round 2 needs to add.
-
-## Round 2 — staged Cinepak frame decode
-
-The round-2 integration test (`tests/m2_cinepak_decode.rs`) adds
-a `test-fixtures`-gated path that exercises the full
-`ICOpen` → `ICDecompressBegin` → `ICDecompress` →
-`ICDecompressEnd` → `ICClose` lifecycle on the real
-`iccvid.dll`. The test looks for two extra files alongside
-`iccvid.dll`:
-
-* `tests/fixtures/cinepak-32x32-1frame.cvid` — a single
-  encoded Cinepak frame (no AVI container, just the raw
-  compressed payload as it would appear inside a `00dc` AVI
-  chunk).
-* `tests/fixtures/cinepak-32x32-1frame.expected.rgb`
-  *(optional)* — the byte-exact decoded frame in 24-bit RGB,
-  bottom-up scanline order, 32 × 32 × 3 = 3072 bytes total.
-  When present the test asserts byte-equality.
-
-### Generating the encoded frame from an AVI
-
-`ffmpeg` ships with Cinepak encode support. To stage a 32×32
-single-frame fixture:
-
-```sh
-ffmpeg -f lavfi -i testsrc=size=32x32:duration=0.04:rate=25 \
-       -vcodec cinepak -frames:v 1 \
-       /tmp/test.avi
-# Extract the single 00dc chunk's payload (skip 4 bytes of fcc + 4
-# bytes of size, copy `size` bytes):
-python3 -c "
-import struct
-with open('/tmp/test.avi', 'rb') as f: b = f.read()
-i = b.find(b'00dc'); sz = struct.unpack('<I', b[i+4:i+8])[0]
-open('crates/oxideav-vfw/tests/fixtures/cinepak-32x32-1frame.cvid', 'wb').write(b[i+8:i+8+sz])
-"
-```
-
-### Generating the expected ground truth
-
-Decode the same frame with `ffmpeg`'s native Cinepak decoder
-(separate from our DLL-driven pipeline) to get a byte-exact
-reference:
-
-```sh
-ffmpeg -i /tmp/test.avi -vframes 1 -f rawvideo -pix_fmt bgr24 \
-       crates/oxideav-vfw/tests/fixtures/cinepak-32x32-1frame.expected.rgb
-```
-
-(Note: `BITMAPINFOHEADER` says BI_RGB is BGR-byte-order on disk;
-our `bit_count = 24` output reflects that. If you store the
-ground truth as RGB instead of BGR, the byte-equality assertion
-will of course fail.)
-
-## Other supported fixtures
-
-Round-1 also tries `tests/fixtures/ir50_32.dll` (Indeo 5) if
-`iccvid.dll` is absent. Indeo 5 uses MMX heavily, so DllMain
-will likely complete fine but the round-3 decode-frame test will
-need MMX support landed first.
-
-Future round-3 candidates (any one or more):
-
-* `tsvqdll.dll` — Sorenson Video 3 (QuickTime variant).
-* `mpg4ds32.ax` — MS-MPEG-4 v3 (DivX-:-) era).
-* `voxmsdec.ax` — Voxware MetaSound.
-
-All are legitimately redistributable under the same vendor terms
-as the Cinepak DLL above; their staging path is the same.
-
-## Why fixtures are not bundled
-
-Two reasons:
-
-1. **Licensing clarity.** The codec licences allow
-   redistribution with the explicit attribution + EULA of the
-   original codec pack. Re-bundling them here without those
-   notices would be sloppy. The user already complied when
-   they installed the codec pack on their own machine.
-2. **Repository size.** Even Cinepak's DLL (~30 KiB) is fine
-   alone, but a complete corpus across every round-3 codec is
-   several megabytes of binary blobs in git history we don't
-   need.
-
-The synthesised-PE test path is sufficient for round-1 CI green;
-the staged-fixture path is for the orchestrator's manual
-post-merge verification.
+The synthesised-PE test path remains the no-network fallback so
+CI is not strictly tied to the URL host being up. If
+`samples.oxideav.org` is unreachable, the `test-fixtures`-gated
+tests fail loudly (so the failure is visible) rather than
+silently skipping.
