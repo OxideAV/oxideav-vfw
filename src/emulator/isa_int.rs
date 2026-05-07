@@ -19,8 +19,8 @@
 //! 1 Appendix B (EFLAGS Cross-Reference).
 
 use super::decode::{
-    read_operand16, read_operand32, resolve_modrm32, sign_ext_8_to_32, write_operand16,
-    write_operand32, ModRm, Operand,
+    read_operand16, read_operand32, resolve_modrm32, sign_ext_8_to_16, sign_ext_8_to_32,
+    write_operand16, write_operand32, ModRm, Operand,
 };
 use super::mmu::Mmu;
 use super::regs::{Flags, Reg16, Reg32, Reg8, Regs};
@@ -77,6 +77,17 @@ pub struct Cpu {
     /// flat mode); Microsoft "TEB" documentation for FS use.
     fs_base: u32,
     gs_base: u32,
+    /// x87 FPU control word — stored as a 16-bit shadow so a
+    /// codec's `fnstcw m16 ; (modify) ; fldcw m16` boilerplate
+    /// round-trips an exact value. We do not model the FPU stack,
+    /// status word, or any FP math — round-10 codecs only set the
+    /// CW for rounding-mode preservation, never read it back into
+    /// arithmetic.
+    ///
+    /// Reference: Intel SDM Vol. 1 §8.1.5 (x87 FPU Control Word).
+    /// Reset value 0x037F (RC=00 round-to-nearest, PC=11 64-bit
+    /// extended precision, all exception masks set).
+    pub fpu_cw: u16,
     /// MMX register file `mm0..mm7`, eight 64-bit registers.
     ///
     /// Per Intel SDM Vol. 1 §9.2.1, the architectural MMX
@@ -136,6 +147,7 @@ impl Cpu {
             seg_override: None,
             fs_base: 0,
             gs_base: 0,
+            fpu_cw: 0x037F,
             mmx: [0u64; 8],
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
@@ -231,6 +243,23 @@ impl Cpu {
         let esp = self.regs.esp();
         let v = mmu.load32(esp)?;
         self.regs.set_esp(esp.wrapping_add(4));
+        Ok(v)
+    }
+
+    /// Push a 16-bit value onto the guest stack — used by 0x66-
+    /// prefixed PUSH r16 / PUSH imm16 forms. Decrements ESP by 2.
+    pub fn push16(&mut self, mmu: &mut Mmu, value: u16) -> Result<(), Trap> {
+        let new_esp = self.regs.esp().wrapping_sub(2);
+        self.regs.set_esp(new_esp);
+        mmu.store16(new_esp, value)
+    }
+
+    /// Pop a 16-bit value off the guest stack — used by 0x66-
+    /// prefixed POP r16 forms. Increments ESP by 2.
+    pub fn pop16(&mut self, mmu: &mut Mmu) -> Result<u16, Trap> {
+        let esp = self.regs.esp();
+        let v = mmu.load16(esp)?;
+        self.regs.set_esp(esp.wrapping_add(2));
         Ok(v)
     }
 
@@ -342,7 +371,7 @@ impl Cpu {
             0x02 => self.alu_r8_rm8(mmu, alu_add_8),
             0x03 => self.alu_r32_rm32(op, mmu, alu_add_32),
             0x04 => self.alu_al_imm8(mmu, alu_add_8),
-            0x05 => self.alu_eax_imm32(mmu, alu_add_32),
+            0x05 => self.alu_eax_imm32(op, mmu, alu_add_32),
 
             // 0x08..=0x0D : OR
             0x08 => self.alu_rm8_r8(mmu, alu_or_8),
@@ -350,7 +379,7 @@ impl Cpu {
             0x0A => self.alu_r8_rm8(mmu, alu_or_8),
             0x0B => self.alu_r32_rm32(op, mmu, alu_or_32),
             0x0C => self.alu_al_imm8(mmu, alu_or_8),
-            0x0D => self.alu_eax_imm32(mmu, alu_or_32),
+            0x0D => self.alu_eax_imm32(op, mmu, alu_or_32),
 
             // 0x10..=0x15 : ADC
             0x10 => self.alu_rm8_r8(mmu, alu_adc_8),
@@ -358,7 +387,7 @@ impl Cpu {
             0x12 => self.alu_r8_rm8(mmu, alu_adc_8),
             0x13 => self.alu_r32_rm32(op, mmu, alu_adc_32),
             0x14 => self.alu_al_imm8(mmu, alu_adc_8),
-            0x15 => self.alu_eax_imm32(mmu, alu_adc_32),
+            0x15 => self.alu_eax_imm32(op, mmu, alu_adc_32),
 
             // 0x18..=0x1D : SBB
             0x18 => self.alu_rm8_r8(mmu, alu_sbb_8),
@@ -366,7 +395,7 @@ impl Cpu {
             0x1A => self.alu_r8_rm8(mmu, alu_sbb_8),
             0x1B => self.alu_r32_rm32(op, mmu, alu_sbb_32),
             0x1C => self.alu_al_imm8(mmu, alu_sbb_8),
-            0x1D => self.alu_eax_imm32(mmu, alu_sbb_32),
+            0x1D => self.alu_eax_imm32(op, mmu, alu_sbb_32),
 
             // 0x20..=0x25 : AND
             0x20 => self.alu_rm8_r8(mmu, alu_and_8),
@@ -374,7 +403,7 @@ impl Cpu {
             0x22 => self.alu_r8_rm8(mmu, alu_and_8),
             0x23 => self.alu_r32_rm32(op, mmu, alu_and_32),
             0x24 => self.alu_al_imm8(mmu, alu_and_8),
-            0x25 => self.alu_eax_imm32(mmu, alu_and_32),
+            0x25 => self.alu_eax_imm32(op, mmu, alu_and_32),
 
             // 0x28..=0x2D : SUB
             0x28 => self.alu_rm8_r8(mmu, alu_sub_8),
@@ -382,7 +411,7 @@ impl Cpu {
             0x2A => self.alu_r8_rm8(mmu, alu_sub_8),
             0x2B => self.alu_r32_rm32(op, mmu, alu_sub_32),
             0x2C => self.alu_al_imm8(mmu, alu_sub_8),
-            0x2D => self.alu_eax_imm32(mmu, alu_sub_32),
+            0x2D => self.alu_eax_imm32(op, mmu, alu_sub_32),
 
             // 0x30..=0x35 : XOR
             0x30 => self.alu_rm8_r8(mmu, alu_xor_8),
@@ -390,7 +419,7 @@ impl Cpu {
             0x32 => self.alu_r8_rm8(mmu, alu_xor_8),
             0x33 => self.alu_r32_rm32(op, mmu, alu_xor_32),
             0x34 => self.alu_al_imm8(mmu, alu_xor_8),
-            0x35 => self.alu_eax_imm32(mmu, alu_xor_32),
+            0x35 => self.alu_eax_imm32(op, mmu, alu_xor_32),
 
             // 0x38..=0x3D : CMP
             0x38 => self.alu_rm8_r8(mmu, alu_cmp_8),
@@ -398,26 +427,49 @@ impl Cpu {
             0x3A => self.alu_r8_rm8(mmu, alu_cmp_8),
             0x3B => self.alu_r32_rm32(op, mmu, alu_cmp_32),
             0x3C => self.alu_al_imm8(mmu, alu_cmp_8),
-            0x3D => self.alu_eax_imm32(mmu, alu_cmp_32),
+            0x3D => self.alu_eax_imm32(op, mmu, alu_cmp_32),
 
             // ----------- INC/DEC r32 (single-byte forms 0x40..=0x4F) ------
+            // Under 0x66, these become INC/DEC r16 — the destination
+            // is the low 16 bits of the corresponding GP reg, and
+            // flags are computed at 16-bit width (sign bit at 0x8000).
             0x40..=0x47 => {
-                let r = Reg32::from_bits(op - 0x40);
-                let v = self.regs.get32(r);
-                let (out, carry_unchanged) = (v.wrapping_add(1), self.regs.flags.cf);
-                self.regs.set32(r, out);
-                set_flags_inc_dec_32(&mut self.regs.flags, v, 1, out, /*sub*/ false);
-                self.regs.flags.cf = carry_unchanged; // INC preserves CF
+                if self.op_size_16 {
+                    let r = Reg16::from_bits(op - 0x40);
+                    let v = self.regs.get16(r);
+                    let cf = self.regs.flags.cf;
+                    let out = v.wrapping_add(1);
+                    self.regs.set16(r, out);
+                    set_flags_inc_dec_16(&mut self.regs.flags, v, 1, out, /*sub*/ false);
+                    self.regs.flags.cf = cf; // INC preserves CF
+                } else {
+                    let r = Reg32::from_bits(op - 0x40);
+                    let v = self.regs.get32(r);
+                    let (out, carry_unchanged) = (v.wrapping_add(1), self.regs.flags.cf);
+                    self.regs.set32(r, out);
+                    set_flags_inc_dec_32(&mut self.regs.flags, v, 1, out, /*sub*/ false);
+                    self.regs.flags.cf = carry_unchanged; // INC preserves CF
+                }
                 Ok(StepOk::Continued)
             }
             0x48..=0x4F => {
-                let r = Reg32::from_bits(op - 0x48);
-                let v = self.regs.get32(r);
-                let out = v.wrapping_sub(1);
-                let carry_unchanged = self.regs.flags.cf;
-                self.regs.set32(r, out);
-                set_flags_inc_dec_32(&mut self.regs.flags, v, 1, out, /*sub*/ true);
-                self.regs.flags.cf = carry_unchanged; // DEC preserves CF
+                if self.op_size_16 {
+                    let r = Reg16::from_bits(op - 0x48);
+                    let v = self.regs.get16(r);
+                    let cf = self.regs.flags.cf;
+                    let out = v.wrapping_sub(1);
+                    self.regs.set16(r, out);
+                    set_flags_inc_dec_16(&mut self.regs.flags, v, 1, out, /*sub*/ true);
+                    self.regs.flags.cf = cf; // DEC preserves CF
+                } else {
+                    let r = Reg32::from_bits(op - 0x48);
+                    let v = self.regs.get32(r);
+                    let out = v.wrapping_sub(1);
+                    let carry_unchanged = self.regs.flags.cf;
+                    self.regs.set32(r, out);
+                    set_flags_inc_dec_32(&mut self.regs.flags, v, 1, out, /*sub*/ true);
+                    self.regs.flags.cf = carry_unchanged; // DEC preserves CF
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -460,67 +512,123 @@ impl Cpu {
             }
 
             // ----------- PUSH / POP r32 (0x50..=0x5F) ------
+            // Under 0x66, these become PUSH/POP r16; ESP changes by
+            // 2 instead of 4, and the destination of POP is the low
+            // 16 bits of the corresponding GP register (upper 16
+            // preserved per Intel SDM Vol. 1 §3.4.1.1).
             0x50..=0x57 => {
-                let r = Reg32::from_bits(op - 0x50);
-                let v = self.regs.get32(r);
-                self.push32(mmu, v)?;
+                if self.op_size_16 {
+                    let r = Reg16::from_bits(op - 0x50);
+                    let v = self.regs.get16(r);
+                    self.push16(mmu, v)?;
+                } else {
+                    let r = Reg32::from_bits(op - 0x50);
+                    let v = self.regs.get32(r);
+                    self.push32(mmu, v)?;
+                }
                 Ok(StepOk::Continued)
             }
             0x58..=0x5F => {
-                let r = Reg32::from_bits(op - 0x58);
-                let v = self.pop32(mmu)?;
-                self.regs.set32(r, v);
+                if self.op_size_16 {
+                    let r = Reg16::from_bits(op - 0x58);
+                    let v = self.pop16(mmu)?;
+                    self.regs.set16(r, v);
+                } else {
+                    let r = Reg32::from_bits(op - 0x58);
+                    let v = self.pop32(mmu)?;
+                    self.regs.set32(r, v);
+                }
                 Ok(StepOk::Continued)
             }
 
-            // PUSH imm32 (0x68) / PUSH imm8 (0x6A)
+            // PUSH imm32 (0x68) / PUSH imm8 (0x6A) — under 0x66
+            // PUSH imm16 / PUSH imm8-sign-extended-to-16, ESP -= 2.
             0x68 => {
-                let v = self.fetch_imm32(mmu)?;
-                self.push32(mmu, v)?;
+                if self.op_size_16 {
+                    let v = self.fetch_imm16(mmu)?;
+                    self.push16(mmu, v)?;
+                } else {
+                    let v = self.fetch_imm32(mmu)?;
+                    self.push32(mmu, v)?;
+                }
                 Ok(StepOk::Continued)
             }
             0x6A => {
-                let v = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
-                self.push32(mmu, v)?;
+                if self.op_size_16 {
+                    let v = sign_ext_8_to_16(self.fetch_imm8(mmu)?);
+                    self.push16(mmu, v)?;
+                } else {
+                    let v = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
+                    self.push32(mmu, v)?;
+                }
                 Ok(StepOk::Continued)
             }
 
-            // 0x69 — IMUL r32, r/m32, imm32
+            // 0x69 — IMUL r32, r/m32, imm32 (no prefix) // IMUL
+            // r16, r/m16, imm16 (under 0x66).
             0x69 => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
                 let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let src_op = self.seg_apply(src_op);
-                let imm = self.fetch_imm32(mmu)? as i32 as i64;
-                let dst = Reg32::from_bits(mr.reg);
-                let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
-                let prod = a.wrapping_mul(imm);
-                let trunc = prod as i32 as u32;
-                self.regs.set32(dst, trunc);
-                let overflow = prod != prod as i32 as i64;
-                self.regs.flags.cf = overflow;
-                self.regs.flags.of = overflow;
-                self.regs.flags.set_szp_32(trunc);
+                if self.op_size_16 {
+                    let imm = self.fetch_imm16(mmu)? as i16 as i32;
+                    let dst = Reg16::from_bits(mr.reg);
+                    let a = read_operand16(src_op, &self.regs, mmu)? as i16 as i32;
+                    let prod = a.wrapping_mul(imm);
+                    let trunc = prod as i16 as u16;
+                    self.regs.set16(dst, trunc);
+                    let overflow = prod != prod as i16 as i32;
+                    self.regs.flags.cf = overflow;
+                    self.regs.flags.of = overflow;
+                    self.regs.flags.set_szp_16(trunc);
+                } else {
+                    let imm = self.fetch_imm32(mmu)? as i32 as i64;
+                    let dst = Reg32::from_bits(mr.reg);
+                    let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
+                    let prod = a.wrapping_mul(imm);
+                    let trunc = prod as i32 as u32;
+                    self.regs.set32(dst, trunc);
+                    let overflow = prod != prod as i32 as i64;
+                    self.regs.flags.cf = overflow;
+                    self.regs.flags.of = overflow;
+                    self.regs.flags.set_szp_32(trunc);
+                }
                 Ok(StepOk::Continued)
             }
-            // 0x6B — IMUL r32, r/m32, imm8 (sign-extended)
+            // 0x6B — IMUL r32, r/m32, imm8 (sign-extended) //
+            // IMUL r16, r/m16, imm8 (sign-extended-to-16) under
+            // 0x66.
             0x6B => {
                 let mr = self.fetch_modrm(mmu)?;
                 let bytes = self.peek_after_modrm(mmu, 16)?;
                 let (src_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
                 self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
                 let src_op = self.seg_apply(src_op);
-                let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?) as i32 as i64;
-                let dst = Reg32::from_bits(mr.reg);
-                let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
-                let prod = a.wrapping_mul(imm);
-                let trunc = prod as i32 as u32;
-                self.regs.set32(dst, trunc);
-                let overflow = prod != prod as i32 as i64;
-                self.regs.flags.cf = overflow;
-                self.regs.flags.of = overflow;
-                self.regs.flags.set_szp_32(trunc);
+                if self.op_size_16 {
+                    let imm = sign_ext_8_to_16(self.fetch_imm8(mmu)?) as i16 as i32;
+                    let dst = Reg16::from_bits(mr.reg);
+                    let a = read_operand16(src_op, &self.regs, mmu)? as i16 as i32;
+                    let prod = a.wrapping_mul(imm);
+                    let trunc = prod as i16 as u16;
+                    self.regs.set16(dst, trunc);
+                    let overflow = prod != prod as i16 as i32;
+                    self.regs.flags.cf = overflow;
+                    self.regs.flags.of = overflow;
+                    self.regs.flags.set_szp_16(trunc);
+                } else {
+                    let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?) as i32 as i64;
+                    let dst = Reg32::from_bits(mr.reg);
+                    let a = read_operand32(src_op, &self.regs, mmu)? as i32 as i64;
+                    let prod = a.wrapping_mul(imm);
+                    let trunc = prod as i32 as u32;
+                    self.regs.set32(dst, trunc);
+                    let overflow = prod != prod as i32 as i64;
+                    self.regs.flags.cf = overflow;
+                    self.regs.flags.of = overflow;
+                    self.regs.flags.set_szp_32(trunc);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -611,16 +719,26 @@ impl Cpu {
                 Ok(StepOk::Continued)
             }
 
-            // 0x9C — PUSHFD
+            // 0x9C — PUSHFD (no prefix) // PUSHF (under 0x66)
             0x9C => {
                 let v = self.regs.flags.pack();
-                self.push32(mmu, v)?;
+                if self.op_size_16 {
+                    self.push16(mmu, v as u16)?;
+                } else {
+                    self.push32(mmu, v)?;
+                }
                 Ok(StepOk::Continued)
             }
-            // 0x9D — POPFD
+            // 0x9D — POPFD (no prefix) // POPF (under 0x66)
             0x9D => {
-                let v = self.pop32(mmu)?;
-                self.regs.flags = Flags::unpack(v);
+                if self.op_size_16 {
+                    let lo = self.pop16(mmu)?;
+                    let cur = self.regs.flags.pack();
+                    self.regs.flags = Flags::unpack((cur & 0xFFFF_0000) | u32::from(lo));
+                } else {
+                    let v = self.pop32(mmu)?;
+                    self.regs.flags = Flags::unpack(v);
+                }
                 Ok(StepOk::Continued)
             }
             // 0x9E — SAHF: load AH bits 0,2,4,6,7 → SF/ZF/AF/PF/CF
@@ -666,8 +784,16 @@ impl Cpu {
             0xA1 => {
                 let imm = self.fetch_imm32(mmu)?;
                 let m = self.seg_translate(imm);
-                let v = mmu.load32(m)?;
-                self.regs.set32(Reg32::Eax, v);
+                if self.op_size_16 {
+                    // 0x66 0xA1 moffs32 — MOV AX, [moffs32]. The
+                    // moffs is still 32 bits in 32-bit address mode;
+                    // 0x66 only changes the destination width.
+                    let v = mmu.load16(m)?;
+                    self.regs.set16(Reg16::Ax, v);
+                } else {
+                    let v = mmu.load32(m)?;
+                    self.regs.set32(Reg32::Eax, v);
+                }
                 Ok(StepOk::Continued)
             }
             0xA2 => {
@@ -679,7 +805,11 @@ impl Cpu {
             0xA3 => {
                 let imm = self.fetch_imm32(mmu)?;
                 let m = self.seg_translate(imm);
-                mmu.store32(m, self.regs.get32(Reg32::Eax))?;
+                if self.op_size_16 {
+                    mmu.store16(m, self.regs.get16(Reg16::Ax))?;
+                } else {
+                    mmu.store32(m, self.regs.get32(Reg32::Eax))?;
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -712,13 +842,22 @@ impl Cpu {
                 self.regs.flags.set_szp_8(res);
                 Ok(StepOk::Continued)
             }
-            // 0xA9 — TEST eax, imm32
+            // 0xA9 — TEST eax, imm32 (no prefix) // TEST AX,
+            // imm16 (under 0x66).
             0xA9 => {
-                let imm = self.fetch_imm32(mmu)?;
-                let res = self.regs.get32(Reg32::Eax) & imm;
-                self.regs.flags.cf = false;
-                self.regs.flags.of = false;
-                self.regs.flags.set_szp_32(res);
+                if self.op_size_16 {
+                    let imm = self.fetch_imm16(mmu)?;
+                    let res = self.regs.get16(Reg16::Ax) & imm;
+                    self.regs.flags.cf = false;
+                    self.regs.flags.of = false;
+                    self.regs.flags.set_szp_16(res);
+                } else {
+                    let imm = self.fetch_imm32(mmu)?;
+                    let res = self.regs.get32(Reg32::Eax) & imm;
+                    self.regs.flags.cf = false;
+                    self.regs.flags.of = false;
+                    self.regs.flags.set_szp_32(res);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -729,11 +868,20 @@ impl Cpu {
                 self.regs.set8(r, imm);
                 Ok(StepOk::Continued)
             }
-            // 0xB8..=0xBF — MOV r32, imm32
+            // 0xB8..=0xBF — MOV r32, imm32 (no prefix) // MOV r16,
+            // imm16 (under 0x66). Five vs three bytes; per Intel
+            // SDM Vol. 1 §3.4.1.1 the upper 16 bits are preserved
+            // when writing through the 16-bit alias.
             0xB8..=0xBF => {
-                let r = Reg32::from_bits(op - 0xB8);
-                let imm = self.fetch_imm32(mmu)?;
-                self.regs.set32(r, imm);
+                if self.op_size_16 {
+                    let r = Reg16::from_bits(op - 0xB8);
+                    let imm = self.fetch_imm16(mmu)?;
+                    self.regs.set16(r, imm);
+                } else {
+                    let r = Reg32::from_bits(op - 0xB8);
+                    let imm = self.fetch_imm32(mmu)?;
+                    self.regs.set32(r, imm);
+                }
                 Ok(StepOk::Continued)
             }
 
@@ -749,6 +897,16 @@ impl Cpu {
             0xD2 => self.group2_rm8(mmu, ShiftCount::Cl),
             // 0xD3 — Group 2 (shifts) r/m32, CL
             0xD3 => self.group2_rm32(mmu, ShiftCount::Cl),
+
+            // x87 escapes 0xD8..=0xDF. We do not model the FPU
+            // stack or any arithmetic. Codec DLL prologues commonly
+            // use `D9 /5 fldcw m16` + `D9 /7 fnstcw m16` to save +
+            // restore the rounding-mode CW so a particular block
+            // can compute integer-truncating math without disturbing
+            // the host's CW. We model exactly that one round-trip
+            // by shadowing the CW in [`Cpu::fpu_cw`]; any other
+            // x87 escape traps as `PrivilegedOpcode`.
+            0xD9 => self.fpu_d9(mmu, entry_eip),
 
             // 0xC2 — RETN imm16 ; 0xC3 — RETN
             0xC2 => {
@@ -1370,7 +1528,11 @@ impl Cpu {
 
     // ----- ALU dispatch helpers (32-bit) --------------------------
 
-    fn alu_rm32_r32(&mut self, _op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+    fn alu_rm32_r32(&mut self, op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+        if self.op_size_16 {
+            let f16 = alu_fn16_for_opcode(op);
+            return self.alu_rm16_r16(mmu, f16);
+        }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
@@ -1385,7 +1547,11 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
-    fn alu_r32_rm32(&mut self, _op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+    fn alu_r32_rm32(&mut self, op: u8, mmu: &mut Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+        if self.op_size_16 {
+            let f16 = alu_fn16_for_opcode(op);
+            return self.alu_r16_rm16(mmu, f16);
+        }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (rhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
@@ -1401,7 +1567,52 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
-    fn alu_eax_imm32(&mut self, mmu: &Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+    /// 16-bit analogue of [`Self::alu_rm32_r32`] used when 0x66
+    /// rewrites the operand width.
+    fn alu_rm16_r16(&mut self, mmu: &mut Mmu, f: AluFn16) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let lhs_op = self.seg_apply(lhs_op);
+        let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
+        let rhs = self.regs.get16(Reg16::from_bits(mr.reg));
+        let (result, write_back) = f(lhs, rhs, &mut self.regs.flags);
+        if write_back {
+            write_operand16(lhs_op, result, &mut self.regs, mmu)?;
+        }
+        Ok(StepOk::Continued)
+    }
+
+    /// 16-bit analogue of [`Self::alu_r32_rm32`] used when 0x66
+    /// rewrites the operand width.
+    fn alu_r16_rm16(&mut self, mmu: &mut Mmu, f: AluFn16) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (rhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let rhs_op = self.seg_apply(rhs_op);
+        let dst = Reg16::from_bits(mr.reg);
+        let lhs = self.regs.get16(dst);
+        let rhs = read_operand16(rhs_op, &self.regs, mmu)?;
+        let (result, write_back) = f(lhs, rhs, &mut self.regs.flags);
+        if write_back {
+            self.regs.set16(dst, result);
+        }
+        Ok(StepOk::Continued)
+    }
+
+    fn alu_eax_imm32(&mut self, op: u8, mmu: &Mmu, f: AluFn32) -> Result<StepOk, Trap> {
+        if self.op_size_16 {
+            let f16 = alu_fn16_for_opcode(op);
+            let imm = self.fetch_imm16(mmu)?;
+            let lhs = self.regs.get16(Reg16::Ax);
+            let (result, write_back) = f16(lhs, imm, &mut self.regs.flags);
+            if write_back {
+                self.regs.set16(Reg16::Ax, result);
+            }
+            return Ok(StepOk::Continued);
+        }
         let imm = self.fetch_imm32(mmu)?;
         let lhs = self.regs.get32(Reg32::Eax);
         let (result, write_back) = f(lhs, imm, &mut self.regs.flags);
@@ -1423,34 +1634,56 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
-    // 0x81 — group 1 r/m32, imm32
+    // 0x81 — group 1 r/m32, imm32 (no prefix) // r/m16, imm16
+    // (under 0x66). Intel SDM Vol. 2A "Group 1": `81 /n iw`
+    // (16-bit) and `81 /n id` (32-bit).
     fn group1_rm32_imm32(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
-        let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
-        let imm = self.fetch_imm32(mmu)?;
-        let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
-        if write_back {
-            write_operand32(lhs_op, result, &mut self.regs, mmu)?;
+        if self.op_size_16 {
+            let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
+            let imm = self.fetch_imm16(mmu)?;
+            let (result, write_back) = group1_op_16(mr.reg, lhs, imm, &mut self.regs.flags);
+            if write_back {
+                write_operand16(lhs_op, result, &mut self.regs, mmu)?;
+            }
+        } else {
+            let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
+            let imm = self.fetch_imm32(mmu)?;
+            let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
+            if write_back {
+                write_operand32(lhs_op, result, &mut self.regs, mmu)?;
+            }
         }
         Ok(StepOk::Continued)
     }
 
-    // 0x83 — group 1 r/m32, imm8 (sign-extended)
+    // 0x83 — group 1 r/m32, imm8 (sign-extended) // r/m16, imm8
+    // (sign-extended-to-16) under 0x66. `83` always has an imm8;
+    // 0x66 only changes the destination size, not the immediate.
     fn group1_rm32_imm8(&mut self, mmu: &mut Mmu) -> Result<StepOk, Trap> {
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (lhs_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
         self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
         let lhs_op = self.seg_apply(lhs_op);
-        let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
-        let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
-        let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
-        if write_back {
-            write_operand32(lhs_op, result, &mut self.regs, mmu)?;
+        if self.op_size_16 {
+            let lhs = read_operand16(lhs_op, &self.regs, mmu)?;
+            let imm = sign_ext_8_to_16(self.fetch_imm8(mmu)?);
+            let (result, write_back) = group1_op_16(mr.reg, lhs, imm, &mut self.regs.flags);
+            if write_back {
+                write_operand16(lhs_op, result, &mut self.regs, mmu)?;
+            }
+        } else {
+            let lhs = read_operand32(lhs_op, &self.regs, mmu)?;
+            let imm = sign_ext_8_to_32(self.fetch_imm8(mmu)?);
+            let (result, write_back) = group1_op_32(mr.reg, lhs, imm, &mut self.regs.flags);
+            if write_back {
+                write_operand32(lhs_op, result, &mut self.regs, mmu)?;
+            }
         }
         Ok(StepOk::Continued)
     }
@@ -1562,6 +1795,9 @@ impl Cpu {
     }
 
     fn group2_rm32(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
+        if self.op_size_16 {
+            return self.group2_rm16(mmu, source);
+        }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
@@ -1641,7 +1877,92 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
+    /// 16-bit group-2 (`C1 / D1 / D3` under 0x66): shift / rotate
+    /// r/m16. Per Intel SDM Vol. 2A "C1" entry, the shift count
+    /// for 16-bit operands masks to 5 bits (same as 32-bit), but
+    /// the operand width and flag-bit positions narrow.
+    fn group2_rm16(&mut self, mmu: &mut Mmu, source: ShiftCount) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let val = read_operand16(op, &self.regs, mmu)?;
+        let val32 = u32::from(val);
+        let count = match source {
+            ShiftCount::One => 1u32,
+            ShiftCount::Cl => u32::from(self.regs.get8(Reg8::Cl)) & 0x1F,
+            ShiftCount::Imm8 => u32::from(self.fetch_imm8(mmu)? & 0x1F),
+        };
+        let result: u16 = match mr.reg {
+            4 | 6 => {
+                let r = if count >= 16 { 0u32 } else { val32 << count };
+                if count != 0 {
+                    self.regs.flags.cf = if count <= 16 {
+                        ((val32 >> (16 - count)) & 1) != 0
+                    } else {
+                        false
+                    };
+                    self.regs.flags.set_szp_16(r as u16);
+                }
+                r as u16
+            }
+            5 => {
+                let r = if count >= 16 { 0u32 } else { val32 >> count };
+                if count != 0 {
+                    self.regs.flags.cf = ((val32 >> (count - 1)) & 1) != 0;
+                    self.regs.flags.set_szp_16(r as u16);
+                }
+                r as u16
+            }
+            7 => {
+                let signed = val as i16 as i32;
+                let r = if count >= 16 {
+                    if signed < 0 {
+                        0xFFFFu16
+                    } else {
+                        0u16
+                    }
+                } else {
+                    (signed >> count) as u16
+                };
+                if count != 0 {
+                    self.regs.flags.cf = ((val32 >> (count - 1)) & 1) != 0;
+                    self.regs.flags.set_szp_16(r);
+                }
+                r
+            }
+            0 => {
+                let c = count % 16;
+                let r = if c == 0 { val } else { val.rotate_left(c) };
+                if count != 0 {
+                    self.regs.flags.cf = (r & 1) != 0;
+                }
+                r
+            }
+            1 => {
+                let c = count % 16;
+                let r = if c == 0 { val } else { val.rotate_right(c) };
+                if count != 0 {
+                    self.regs.flags.cf = (r & 0x8000) != 0;
+                }
+                r
+            }
+            other => {
+                return Err(Trap::UndefinedOpcode {
+                    eip: self.regs.eip,
+                    opcode: 0xC100 | u32::from(other),
+                });
+            }
+        };
+        write_operand16(op, result, &mut self.regs, mmu)?;
+        Ok(StepOk::Continued)
+    }
+
     fn group3_rm32(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
+        if self.op_size_16 {
+            return self.group3_rm16(mmu, entry_eip);
+        }
         let mr = self.fetch_modrm(mmu)?;
         let bytes = self.peek_after_modrm(mmu, 16)?;
         let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
@@ -1717,6 +2038,139 @@ impl Cpu {
                 }
                 self.regs.set32(Reg32::Eax, q as u32);
                 self.regs.set32(Reg32::Edx, r as u32);
+            }
+            _ => unreachable!(),
+        }
+        Ok(StepOk::Continued)
+    }
+
+    /// x87 escape `0xD9` — round-10 partial coverage. We honor
+    /// only the two memory forms `D9 /5 FLDCW m16` and `D9 /7
+    /// FNSTCW m16` (the codec-prologue idiom for saving and
+    /// restoring the rounding-mode control word). Every other
+    /// `D9 ...` form traps as `PrivilegedOpcode` so the
+    /// implementer can localise it.
+    ///
+    /// Reference: Intel SDM Vol. 2A "FLDCW" + "FSTCW/FNSTCW".
+    fn fpu_d9(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        if mr.mode == 0b11 {
+            // ST(i)-form FPU ops (FLD ST, FXCH, FCHS, FABS, …) —
+            // not modelled.
+            return Err(Trap::PrivilegedOpcode {
+                eip: entry_eip,
+                mnemonic: "x87 D9 /reg-form (FPU not modelled)",
+            });
+        }
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let addr = match op {
+            Operand::Mem32(a) => a,
+            Operand::Reg32(_) => unreachable!(),
+        };
+        match mr.reg {
+            5 => {
+                // FLDCW m16: load FPU control word from m16
+                self.fpu_cw = mmu.load16(addr)?;
+                Ok(StepOk::Continued)
+            }
+            7 => {
+                // FNSTCW m16: store FPU control word to m16
+                mmu.store16(addr, self.fpu_cw)?;
+                Ok(StepOk::Continued)
+            }
+            other => Err(Trap::PrivilegedOpcode {
+                eip: entry_eip,
+                mnemonic: match other {
+                    0 => "x87 D9 /0 FLD m32 (FPU not modelled)",
+                    2 => "x87 D9 /2 FST m32 (FPU not modelled)",
+                    3 => "x87 D9 /3 FSTP m32 (FPU not modelled)",
+                    4 => "x87 D9 /4 FLDENV m28 (FPU not modelled)",
+                    6 => "x87 D9 /6 FNSTENV m28 (FPU not modelled)",
+                    _ => "x87 D9 /reg unknown",
+                },
+            }),
+        }
+    }
+
+    /// 16-bit group-3 (`F7 /n` under 0x66): TEST/NOT/NEG/MUL/IMUL/
+    /// DIV/IDIV r/m16. The TEST sub-form has imm16 not imm32; MUL
+    /// targets DX:AX rather than EDX:EAX; the divide narrows.
+    fn group3_rm16(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
+        let mr = self.fetch_modrm(mmu)?;
+        let bytes = self.peek_after_modrm(mmu, 16)?;
+        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        let op = self.seg_apply(op);
+        let val = read_operand16(op, &self.regs, mmu)?;
+        match mr.reg {
+            0 | 1 => {
+                let imm = self.fetch_imm16(mmu)?;
+                let r = val & imm;
+                self.regs.flags.cf = false;
+                self.regs.flags.of = false;
+                self.regs.flags.set_szp_16(r);
+            }
+            2 => {
+                write_operand16(op, !val, &mut self.regs, mmu)?;
+            }
+            3 => {
+                let r = 0u16.wrapping_sub(val);
+                self.regs.flags.cf = val != 0;
+                self.regs.flags.of = val == 0x8000;
+                self.regs.flags.set_szp_16(r);
+                write_operand16(op, r, &mut self.regs, mmu)?;
+            }
+            4 => {
+                // MUL ax, r/m16 → dx:ax
+                let prod = u32::from(self.regs.get16(Reg16::Ax)) * u32::from(val);
+                self.regs.set16(Reg16::Ax, prod as u16);
+                self.regs.set16(Reg16::Dx, (prod >> 16) as u16);
+                let hi_nonzero = (prod >> 16) != 0;
+                self.regs.flags.cf = hi_nonzero;
+                self.regs.flags.of = hi_nonzero;
+            }
+            5 => {
+                // IMUL ax, r/m16 → dx:ax (signed)
+                let prod = (self.regs.get16(Reg16::Ax) as i16 as i32) * (val as i16 as i32);
+                self.regs.set16(Reg16::Ax, prod as u16);
+                self.regs.set16(Reg16::Dx, (prod >> 16) as u16);
+                let truncated = prod != prod as i16 as i32;
+                self.regs.flags.cf = truncated;
+                self.regs.flags.of = truncated;
+            }
+            6 => {
+                // DIV dx:ax / r/m16
+                if val == 0 {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                let dividend = (u32::from(self.regs.get16(Reg16::Dx)) << 16)
+                    | u32::from(self.regs.get16(Reg16::Ax));
+                let q = dividend / u32::from(val);
+                let r = dividend % u32::from(val);
+                if q > u16::MAX as u32 {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                self.regs.set16(Reg16::Ax, q as u16);
+                self.regs.set16(Reg16::Dx, r as u16);
+            }
+            7 => {
+                // IDIV dx:ax / r/m16 (signed)
+                if val == 0 {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                let dividend = (i32::from(self.regs.get16(Reg16::Dx) as i16) << 16)
+                    | (self.regs.get16(Reg16::Ax) as i16 as u16 as i32 & 0xFFFF);
+                let divisor = val as i16 as i32;
+                let q = dividend / divisor;
+                let r = dividend % divisor;
+                if !(i16::MIN as i32..=i16::MAX as i32).contains(&q) {
+                    return Err(Trap::DivideByZero { eip: entry_eip });
+                }
+                self.regs.set16(Reg16::Ax, q as u16);
+                self.regs.set16(Reg16::Dx, r as u16);
             }
             _ => unreachable!(),
         }
@@ -2010,7 +2464,8 @@ impl Cpu {
     // single-step semantics in helpers and loop only for REP.
 
     fn string_movs(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
-        let step = self.string_step(sized_dword);
+        let size = self.string_size(sized_dword);
+        let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
             // Source uses DS (overridable); destination uses ES
             // (NOT overridable). seg_translate captures the
@@ -2018,12 +2473,19 @@ impl Cpu {
             // 32-bit mode so the destination is unmodified.
             let src = this.seg_translate(this.regs.get32(Reg32::Esi));
             let dst = this.regs.get32(Reg32::Edi);
-            if sized_dword {
-                let v = mmu.load32(src)?;
-                mmu.store32(dst, v)?;
-            } else {
-                let v = mmu.load8(src)?;
-                mmu.store8(dst, v)?;
+            match size {
+                StringSize::B8 => {
+                    let v = mmu.load8(src)?;
+                    mmu.store8(dst, v)?;
+                }
+                StringSize::W16 => {
+                    let v = mmu.load16(src)?;
+                    mmu.store16(dst, v)?;
+                }
+                StringSize::D32 => {
+                    let v = mmu.load32(src)?;
+                    mmu.store32(dst, v)?;
+                }
             }
             this.regs.set32(
                 Reg32::Esi,
@@ -2039,13 +2501,14 @@ impl Cpu {
     }
 
     fn string_stos(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
-        let step = self.string_step(sized_dword);
+        let size = self.string_size(sized_dword);
+        let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
             let dst = this.regs.get32(Reg32::Edi);
-            if sized_dword {
-                mmu.store32(dst, this.regs.get32(Reg32::Eax))?;
-            } else {
-                mmu.store8(dst, this.regs.get8(Reg8::Al))?;
+            match size {
+                StringSize::B8 => mmu.store8(dst, this.regs.get8(Reg8::Al))?,
+                StringSize::W16 => mmu.store16(dst, this.regs.get16(Reg16::Ax))?,
+                StringSize::D32 => mmu.store32(dst, this.regs.get32(Reg32::Eax))?,
             }
             this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
             Ok(())
@@ -2054,15 +2517,23 @@ impl Cpu {
     }
 
     fn string_lods(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
-        let step = self.string_step(sized_dword);
+        let size = self.string_size(sized_dword);
+        let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
             let src = this.regs.get32(Reg32::Esi);
-            if sized_dword {
-                let v = mmu.load32(src)?;
-                this.regs.set32(Reg32::Eax, v);
-            } else {
-                let v = mmu.load8(src)?;
-                this.regs.set8(Reg8::Al, v);
+            match size {
+                StringSize::B8 => {
+                    let v = mmu.load8(src)?;
+                    this.regs.set8(Reg8::Al, v);
+                }
+                StringSize::W16 => {
+                    let v = mmu.load16(src)?;
+                    this.regs.set16(Reg16::Ax, v);
+                }
+                StringSize::D32 => {
+                    let v = mmu.load32(src)?;
+                    this.regs.set32(Reg32::Eax, v);
+                }
             }
             this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
             Ok(())
@@ -2071,18 +2542,27 @@ impl Cpu {
     }
 
     fn string_cmps(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
-        let step = self.string_step(sized_dword);
+        let size = self.string_size(sized_dword);
+        let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
             let src = this.regs.get32(Reg32::Esi);
             let dst = this.regs.get32(Reg32::Edi);
-            if sized_dword {
-                let a = mmu.load32(src)?;
-                let b = mmu.load32(dst)?;
-                let _ = alu_sub_32(a, b, &mut this.regs.flags);
-            } else {
-                let a = mmu.load8(src)?;
-                let b = mmu.load8(dst)?;
-                let _ = alu_sub_8(a, b, &mut this.regs.flags);
+            match size {
+                StringSize::B8 => {
+                    let a = mmu.load8(src)?;
+                    let b = mmu.load8(dst)?;
+                    let _ = alu_sub_8(a, b, &mut this.regs.flags);
+                }
+                StringSize::W16 => {
+                    let a = mmu.load16(src)?;
+                    let b = mmu.load16(dst)?;
+                    let _ = alu_sub_16(a, b, &mut this.regs.flags);
+                }
+                StringSize::D32 => {
+                    let a = mmu.load32(src)?;
+                    let b = mmu.load32(dst)?;
+                    let _ = alu_sub_32(a, b, &mut this.regs.flags);
+                }
             }
             this.regs.set32(Reg32::Esi, src.wrapping_add(step as u32));
             this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
@@ -2092,17 +2572,26 @@ impl Cpu {
     }
 
     fn string_scas(&mut self, mmu: &mut Mmu, sized_dword: bool) -> Result<StepOk, Trap> {
-        let step = self.string_step(sized_dword);
+        let size = self.string_size(sized_dword);
+        let step = self.string_step_for(size);
         let do_one = |this: &mut Self, mmu: &mut Mmu| -> Result<(), Trap> {
             let dst = this.regs.get32(Reg32::Edi);
-            if sized_dword {
-                let v = mmu.load32(dst)?;
-                let acc = this.regs.get32(Reg32::Eax);
-                let _ = alu_sub_32(acc, v, &mut this.regs.flags);
-            } else {
-                let v = mmu.load8(dst)?;
-                let acc = this.regs.get8(Reg8::Al);
-                let _ = alu_sub_8(acc, v, &mut this.regs.flags);
+            match size {
+                StringSize::B8 => {
+                    let v = mmu.load8(dst)?;
+                    let acc = this.regs.get8(Reg8::Al);
+                    let _ = alu_sub_8(acc, v, &mut this.regs.flags);
+                }
+                StringSize::W16 => {
+                    let v = mmu.load16(dst)?;
+                    let acc = this.regs.get16(Reg16::Ax);
+                    let _ = alu_sub_16(acc, v, &mut this.regs.flags);
+                }
+                StringSize::D32 => {
+                    let v = mmu.load32(dst)?;
+                    let acc = this.regs.get32(Reg32::Eax);
+                    let _ = alu_sub_32(acc, v, &mut this.regs.flags);
+                }
             }
             this.regs.set32(Reg32::Edi, dst.wrapping_add(step as u32));
             Ok(())
@@ -2110,10 +2599,28 @@ impl Cpu {
         self.string_loop(mmu, do_one, /*compare*/ true)
     }
 
-    /// +1 or -1 depending on DF and operand size. (Sign-extended
-    /// later via `as u32` so wrapping_add does the right thing.)
-    fn string_step(&self, sized_dword: bool) -> i32 {
-        let inc: i32 = if sized_dword { 4 } else { 1 };
+    /// Resolve the operand size for a string opcode whose decoded
+    /// table-form is "dword" but which 0x66 narrows to "word".
+    /// 8-bit string ops (`A4/A6/AA/AC/AE`) ignore 0x66.
+    fn string_size(&self, sized_dword: bool) -> StringSize {
+        if !sized_dword {
+            StringSize::B8
+        } else if self.op_size_16 {
+            StringSize::W16
+        } else {
+            StringSize::D32
+        }
+    }
+
+    /// +N or -N depending on DF and operand size. Returned as i32
+    /// so callers can sign-extend it via `as u32` for
+    /// wrapping_add.
+    fn string_step_for(&self, size: StringSize) -> i32 {
+        let inc: i32 = match size {
+            StringSize::B8 => 1,
+            StringSize::W16 => 2,
+            StringSize::D32 => 4,
+        };
         if self.regs.flags.df {
             -inc
         } else {
@@ -2221,6 +2728,16 @@ enum Op16Dst {
     Mem(u32),
 }
 
+/// String-operation operand size. The dword-form opcodes
+/// (`A5/A7/AB/AD/AF`) honor the 0x66 prefix to narrow to word; the
+/// byte-form opcodes (`A4/A6/AA/AC/AE`) always use [`Self::B8`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum StringSize {
+    B8,
+    W16,
+    D32,
+}
+
 /// Shift-count source for Group-2 (rotate / shift) opcodes.
 #[derive(Copy, Clone, Debug)]
 enum ShiftCount {
@@ -2234,6 +2751,7 @@ enum ShiftCount {
 
 // Helper signature: (lhs, rhs, flags) -> (result, write_back).
 type AluFn32 = fn(u32, u32, &mut Flags) -> (u32, bool);
+type AluFn16 = fn(u16, u16, &mut Flags) -> (u16, bool);
 type AluFn8 = fn(u8, u8, &mut Flags) -> (u8, bool);
 
 fn alu_add_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
@@ -2314,6 +2832,139 @@ fn alu_sbb_32(lhs: u32, rhs: u32, f: &mut Flags) -> (u32, bool) {
     f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000_0000) != 0;
     f.set_szp_32(result);
     (result, true)
+}
+
+// ----- 16-bit ALU primitives ----------------------------------
+//
+// Used by opcodes that took the operand-size override prefix
+// (`0x66`). Same flag semantics as the 32-bit primitives, just
+// the sign-bit moves from bit 31 to bit 15.
+
+fn alu_add_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let (result, carry) = lhs.overflowing_add(rhs);
+    f.cf = carry;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ result) & (rhs ^ result)) & 0x8000) != 0;
+    f.set_szp_16(result);
+    (result, true)
+}
+
+fn alu_sub_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let (result, borrow) = lhs.overflowing_sub(rhs);
+    f.cf = borrow;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000) != 0;
+    f.set_szp_16(result);
+    (result, true)
+}
+
+fn alu_cmp_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let (_r, _w) = alu_sub_16(lhs, rhs, f);
+    (0, false)
+}
+
+fn alu_and_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let r = lhs & rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_16(r);
+    (r, true)
+}
+
+fn alu_or_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let r = lhs | rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_16(r);
+    (r, true)
+}
+
+fn alu_xor_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let r = lhs ^ rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_16(r);
+    (r, true)
+}
+
+fn alu_test_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let r = lhs & rhs;
+    f.cf = false;
+    f.of = false;
+    f.set_szp_16(r);
+    (r, false)
+}
+
+fn alu_adc_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let cf = f.cf as u16;
+    let s1 = lhs.wrapping_add(rhs);
+    let result = s1.wrapping_add(cf);
+    let total = u32::from(rhs) + u32::from(cf);
+    f.cf = u32::from(lhs) + total > 0xFFFF;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ result) & (rhs ^ result)) & 0x8000) != 0;
+    f.set_szp_16(result);
+    (result, true)
+}
+
+fn alu_sbb_16(lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    let cf = f.cf as u16;
+    let s1 = lhs.wrapping_sub(rhs);
+    let result = s1.wrapping_sub(cf);
+    let total = u32::from(rhs) + u32::from(cf);
+    f.cf = u32::from(lhs) < total;
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = (((lhs ^ rhs) & (lhs ^ result)) & 0x8000) != 0;
+    f.set_szp_16(result);
+    (result, true)
+}
+
+/// Map a one-byte opcode in the 32-bit ALU range
+/// (`0x00..=0x3D` even/odd pattern, plus `0x85` TEST) to its
+/// 16-bit primitive. Used when the operand-size override prefix
+/// (`0x66`) rewrites the operand width. The opcode encodes both
+/// the operation and the direction (rm←r vs r←rm vs accum←imm);
+/// the operation lives in bits 5:3 except for `0x85` which is a
+/// special-case.
+fn alu_fn16_for_opcode(op: u8) -> AluFn16 {
+    if op == 0x85 {
+        return alu_test_16;
+    }
+    match (op >> 3) & 0b111 {
+        0 => alu_add_16,
+        1 => alu_or_16,
+        2 => alu_adc_16,
+        3 => alu_sbb_16,
+        4 => alu_and_16,
+        5 => alu_sub_16,
+        6 => alu_xor_16,
+        7 => alu_cmp_16,
+        _ => unreachable!(),
+    }
+}
+
+fn group1_op_16(reg: u8, lhs: u16, rhs: u16, f: &mut Flags) -> (u16, bool) {
+    match reg {
+        0 => alu_add_16(lhs, rhs, f),
+        1 => alu_or_16(lhs, rhs, f),
+        2 => alu_adc_16(lhs, rhs, f),
+        3 => alu_sbb_16(lhs, rhs, f),
+        4 => alu_and_16(lhs, rhs, f),
+        5 => alu_sub_16(lhs, rhs, f),
+        6 => alu_xor_16(lhs, rhs, f),
+        7 => alu_cmp_16(lhs, rhs, f),
+        _ => unreachable!(),
+    }
+}
+
+fn set_flags_inc_dec_16(f: &mut Flags, lhs: u16, rhs: u16, result: u16, sub: bool) {
+    f.af = ((lhs ^ rhs ^ result) & 0x10) != 0;
+    f.of = if sub {
+        (((lhs ^ rhs) & (lhs ^ result)) & 0x8000) != 0
+    } else {
+        (((lhs ^ result) & (rhs ^ result)) & 0x8000) != 0
+    };
+    f.set_szp_16(result);
 }
 
 // ----- 8-bit ALU primitives -----------------------------------
@@ -3051,5 +3702,240 @@ mod tests {
         assert_eq!(cpu.regs.get32(Reg32::Ebp), 0x1BB);
         assert_eq!(cpu.regs.get32(Reg32::Esi), 0x1EE);
         assert_eq!(cpu.regs.get32(Reg32::Edi), 0x1DD);
+    }
+
+    /// Round-10 regression: `66 81 7C 24 14 41 53` is `cmp word
+    /// [esp+0x14], 0x5341` — 7 bytes, imm16 not imm32. The
+    /// pre-round-10 decoder always treated 0x81 as imm32 even
+    /// under 0x66 and consumed 9 bytes, mis-parsing the next 2
+    /// bytes downstream. This is the exact opcode that produced
+    /// the round-9 ICDecompressQuery memory fault inside
+    /// IR50_32.DLL.
+    #[test]
+    fn group1_rm16_imm16_with_66_prefix_consumes_2byte_imm() {
+        let (mut cpu, mut mmu) = make();
+        // Place a known 2-byte value at [esp+0x14] = 0x4000 +
+        // 0x14 = 0x4014. We'll cmp it against 0x5341.
+        cpu.regs.set_esp(0x4000);
+        mmu.write_initializer(0x4014, &[0x41u8, 0x53]).unwrap();
+        // 66 81 7C 24 14 41 53  CMP word [esp+0x14], 0x5341
+        // C3                    RET
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[0x66, 0x81, 0x7C, 0x24, 0x14, 0x41, 0x53, 0xC3],
+        );
+        // We pre-pushed the sentinel onto the stack; the cmp's
+        // [esp+0x14] address is unaffected by the sentinel push
+        // because we set esp explicitly above. Re-prime after
+        // overwriting esp:
+        cpu.regs.set_esp(0x4000);
+        // Run by stepping; we cannot use cpu.run because we did
+        // not push the sentinel at this esp. Step exactly 1
+        // instruction, then check eip and zf.
+        cpu.step(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.eip, 0x1007, "0x66 81 ... iw must be 7 bytes");
+        assert!(
+            cpu.regs.flags.zf,
+            "cmp 0x5341 against [esp+0x14]=0x5341 must set ZF"
+        );
+    }
+
+    /// `66 83 C0 01` is `add ax, 1` under 0x66. Verify EAX hi
+    /// bits are preserved.
+    #[test]
+    fn group1_rm16_imm8_with_66_prefix_preserves_high_half() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xAABB_FFFF);
+        // 66 83 C0 01  add ax, 1
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0x83, 0xC0, 0x01, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(
+            cpu.regs.get32(Reg32::Eax),
+            0xAABB_0000,
+            "0x66 0x83 must wrap at 16 bits"
+        );
+        assert!(cpu.regs.flags.cf, "16-bit overflow sets CF");
+    }
+
+    /// `66 BB 34 12` is `mov bx, 0x1234` — 4 bytes.
+    #[test]
+    fn mov_r16_imm16_with_66_prefix_preserves_high_half() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Ebx, 0xDEAD_BEEF);
+        // 66 BB 34 12  mov bx, 0x1234
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0xBB, 0x34, 0x12, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Ebx), 0xDEAD_1234);
+    }
+
+    /// `66 50 ; 58` is `push ax ; pop ax` — esp moves by 2 each.
+    /// We single-step push16 / pop16 directly so the test's
+    /// expectation isn't entangled with the make() stack
+    /// sentinel.
+    #[test]
+    fn push_pop_r16_with_66_prefix_moves_esp_by_2() {
+        let (mut cpu, mut mmu) = make();
+        let esp_before = cpu.regs.esp();
+        // 66 53        push bx (1 step)
+        // 66 5B        pop  bx (1 step)
+        write_code(&mut mmu, 0x1000, &[0x66, 0x53, 0x66, 0x5B]);
+        cpu.regs.set32(Reg32::Ebx, 0xCAFE_BABE);
+        // After PUSH BX, esp -= 2.
+        cpu.step(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.esp(), esp_before - 2);
+        // After POP BX, esp += 2 (back to original).
+        cpu.step(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.esp(), esp_before);
+        // BX low-half preserved (32-bit upper half preserved
+        // unchanged by push16 + pop16).
+        assert_eq!(cpu.regs.get32(Reg32::Ebx), 0xCAFE_BABE);
+    }
+
+    /// `66 40` is `inc ax`. The 32-bit inc would be `40` only.
+    #[test]
+    fn inc_r16_with_66_prefix() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0x1111_FFFF);
+        // 66 40  inc ax  ; C3 ret
+        write_code(&mut mmu, 0x1000, &[0x66, 0x40, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0x1111_0000);
+        assert!(cpu.regs.flags.zf, "inc to zero sets ZF");
+    }
+
+    /// `66 A9 02 00` is `test ax, 0x0002` — 4 bytes; the imm is
+    /// 16-bit not 32-bit.
+    #[test]
+    fn test_ax_imm16_with_66_prefix_consumes_2byte_imm() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0x0000_0002);
+        // 66 A9 02 00  test ax, 2
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0xA9, 0x02, 0x00, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert!(!cpu.regs.flags.zf, "test ax,2 against 2 sets none-of");
+        assert_eq!(cpu.regs.eip, RET_SENTINEL);
+    }
+
+    /// `66 6B C0 02` is `imul ax, ax, 2` under 0x66.
+    #[test]
+    fn imul_r16_imm8_with_66_prefix_preserves_high_half() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xDEAD_0003);
+        // 66 6B C0 02  imul ax, ax, 2  →  ax = 6
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0x6B, 0xC0, 0x02, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_0006);
+    }
+
+    /// `66 35 02 00` is `xor ax, 2` — 4 bytes; the EAX-imm form
+    /// (`0x35`) under 0x66.
+    #[test]
+    fn xor_ax_imm16_with_66_prefix() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xCAFE_FFFF);
+        // 66 35 02 00  xor ax, 2
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0x35, 0x02, 0x00, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xCAFE_FFFD);
+    }
+
+    /// `66 03 C3` is `add ax, bx` under 0x66 (the r↔r/m direction
+    /// of the standard ALU ADD). Verifies the
+    /// `alu_r32_rm32` 16-bit branch.
+    #[test]
+    fn add_r16_rm16_with_66_prefix() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xCAFE_0010);
+        cpu.regs.set32(Reg32::Ebx, 0xDEAD_0020);
+        // 66 03 C3  add ax, bx
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0x03, 0xC3, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xCAFE_0030);
+    }
+
+    /// `66 F7 D0` is `not ax` under 0x66 (group-3 r/m16 /2 NOT).
+    #[test]
+    fn group3_rm16_not_with_66_prefix() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0xDEAD_0F0F);
+        // 66 F7 D0  not ax
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0xF7, 0xD0, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_F0F0);
+    }
+
+    /// `66 F7 C0 03 00` is `test ax, 3` under 0x66. The TEST sub-
+    /// form of group-3 takes imm16, NOT imm32, so it is 5 bytes
+    /// total.
+    #[test]
+    fn group3_rm16_test_imm16_with_66_prefix_consumes_2byte_imm() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Eax, 0x0000_0003);
+        // 66 F7 C0 03 00  test ax, 3
+        // C3
+        write_code(&mut mmu, 0x1000, &[0x66, 0xF7, 0xC0, 0x03, 0x00, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert!(!cpu.regs.flags.zf);
+        assert_eq!(cpu.regs.eip, RET_SENTINEL);
+    }
+
+    /// FPU control word round-trip: `D9 7D F8 ; D9 6D F8` is
+    /// `fnstcw [ebp-8] ; fldcw [ebp-8]`. This is the codec-
+    /// prologue idiom we model via the [`Cpu::fpu_cw`] shadow.
+    #[test]
+    fn fpu_fnstcw_then_fldcw_round_trip_via_shadow() {
+        let (mut cpu, mut mmu) = make();
+        cpu.regs.set32(Reg32::Ebp, 0x5000);
+        cpu.fpu_cw = 0x027F;
+        // C7 45 F8 7F 03 00 00  mov dword [ebp-8], 0x37F
+        // D9 6D F8              fldcw [ebp-8]   (loads 0x37F into shadow)
+        // D9 7D F0              fnstcw [ebp-0x10]
+        // C3
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0xC7, 0x45, 0xF8, 0x7F, 0x03, 0x00, 0x00, 0xD9, 0x6D, 0xF8, 0xD9, 0x7D, 0xF0, 0xC3,
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.fpu_cw, 0x037F, "fldcw must update shadow");
+        assert_eq!(
+            mmu.load16(0x5000 - 0x10).unwrap(),
+            0x037F,
+            "fnstcw must store shadow to memory"
+        );
+    }
+
+    /// Round-10: REP MOVSW under 0x66. Each step copies a word
+    /// (2 bytes), advancing ESI/EDI by 2.
+    #[test]
+    fn rep_movs_w_with_66_prefix_copies_word_per_step() {
+        let (mut cpu, mut mmu) = make();
+        // Source @ 0x4100 = "ABCD" (4 bytes). Dest @ 0x4200.
+        mmu.write_initializer(0x4100, b"ABCD").unwrap();
+        cpu.regs.set32(Reg32::Esi, 0x4100);
+        cpu.regs.set32(Reg32::Edi, 0x4200);
+        cpu.regs.set32(Reg32::Ecx, 2);
+        // F3 66 A5  rep movsw   (2 words = 4 bytes)
+        // C3
+        write_code(&mut mmu, 0x1000, &[0xF3, 0x66, 0xA5, 0xC3]);
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(cpu.regs.get32(Reg32::Ecx), 0);
+        assert_eq!(cpu.regs.get32(Reg32::Esi), 0x4104);
+        assert_eq!(cpu.regs.get32(Reg32::Edi), 0x4204);
+        let mut got = [0u8; 4];
+        for (i, slot) in got.iter_mut().enumerate() {
+            *slot = mmu.load8(0x4200 + i as u32).unwrap();
+        }
+        assert_eq!(&got, b"ABCD");
     }
 }

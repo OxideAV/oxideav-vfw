@@ -8,6 +8,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 10: **0x66-prefix honored across the integer ISA, not
+  just the MOV family.** Round 9 fixed `0x89` / `0x8B` / `0xC7`;
+  round 10 closes the rest of the gap so the IV50 decode body
+  runs cleanly through `ICDecompressQuery → ICDecompressBegin →
+  ICDecompress` against `IR50_32.DLL` without a single CPU trap.
+  The fixes cover, per Intel SDM Vol. 2A: `0x81` / `0x83` group-
+  1 r/m, imm (the literal opcode that produced round-9's
+  ICDecompressQuery memory fault — `66 81 7C 24 14 41 53` is
+  `cmp word [esp+0x14], 0x5341`, 7 bytes, imm16 not imm32);
+  `0x69` / `0x6B` IMUL r, r/m, imm; `0x40..0x4F` INC/DEC r and
+  `0x50..0x5F` PUSH/POP r (the 16-bit forms move ESP by 2);
+  `0x68` / `0x6A` PUSH imm; `0xB8..0xBF` MOV r, imm; `0xA1` /
+  `0xA3` MOV moffs; `0xA9` TEST EAX/AX, imm; `0x9C` / `0x9D`
+  PUSHF / POPF; `0xF7` group-3 r/m (TEST imm width changes too);
+  the entire `0x00..0x3D` even-row r/m32, r32 / r32, r/m32 ALU
+  pair plus the `0x05/0x0D/.../0x3D` accumulator-imm forms;
+  group-2 shifts r/m16 (`0xC1` / `0xD1` / `0xD3`); the dword
+  string operations MOVSW / STOSW / LODSW / CMPSW / SCASW under
+  0x66 (each step advances ESI/EDI by 2 instead of 4).
+- New `push16` / `pop16` helpers in [`Cpu`].
+- Sixteen 16-bit ALU primitives (`alu_add_16`, `alu_sub_16`,
+  …, `alu_test_16`, `group1_op_16`, `set_flags_inc_dec_16`)
+  matching the existing 32-bit / 8-bit set, with sign bit at
+  0x8000.
+- `Cpu::fpu_cw` — a 16-bit shadow of the x87 FPU control word.
+  We do **not** model the FPU stack or any arithmetic, but the
+  codec-prologue idiom `D9 /5 fldcw m16` + `D9 /7 fnstcw m16`
+  (used by `ICDecompressBegin` to save and restore the rounding-
+  mode CW around an integer-truncation block) now round-trips
+  through the shadow. Other `D9 ...` forms still trap as
+  `PrivilegedOpcode` with a specific mnemonic so the round-11
+  implementer can localise them.
+- Thirteen new unit tests covering the 0x66-prefix paths +
+  the FPU CW round-trip + REP MOVSW.
+
+### Round-10 outcome
+
+`tests/round8_iv50_decode.rs::cat_attack_first_keyframe_decodes_through_ir50_32_dll`
+now runs the full IC* sequence end-to-end through the real
+`IR50_32.DLL` against the 4300-byte IV50 keyframe extracted
+from `cat_attack.avi`. `ICDecompressQuery` and
+`ICDecompressBegin` both return 0 (ICERR_OK). `ICDecompress`
+runs the codec body for ~4682 instructions and returns
+`ICERR_BADIMAGE` (-100) cleanly via a normal `RET` — no trap,
+no MMX opcodes encountered, no unimplemented ISA. The codec
+rejects the keyframe at a yet-unidentified pre-MMX validation
+step; round 11's gate is to localise that path. The trap-log
+driven MMX implementation that round 7 scaffolded is therefore
+NOT triggered yet by this fixture.
+
 - Round 8 + 9: **`IR50_32.DLL` (Indeo 5) load + ICOpen wired
   end-to-end.** The previous round-8 pass landed ~1300 LOC of
   scaffolding (RIFF/AVI 1.0 chunk walker — `tests/common/avi_extractor.rs`,
