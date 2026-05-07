@@ -127,10 +127,41 @@
 //! real keyframe end-to-end. Round 7+ swaps the synthetic input
 //! for a real keyframe once one becomes available.
 //!
-//! MMX is deliberately **deferred** to round 7+: Indeo 3 is
-//! pre-MMX, so it stays unblocked. Indeo 5 (`ir50_32.dll`) and
-//! most later codecs use MMX, so MMX support lands when the test
-//! corpus expands to one of those.
+//! **Round 7 — "Real IV31 keyframe decode through `cubes.mov`,
+//! plus MMX scaffolding".** Twin deliverables:
+//!
+//! * **Part A — Real keyframe decode.** Adds a test-side
+//!   QuickTime / ISO BMFF chunk walker
+//!   (`tests/common/mov_extractor.rs`, ~270 LOC, authored from
+//!   ISO/IEC 14496-12 alone) that locates sample 0 in
+//!   `cubes.mov` (160×120 yuv410p, 121 KB) from
+//!   `samples.oxideav.org/ffmpeg/V-codecs/IV32/`. The new
+//!   `tests/round7_cubes_mov.rs::cubes_mov_first_keyframe_decodes_through_ir32_32_dll`
+//!   feeds the real 3079-byte IV31 keyframe through the IC*
+//!   sequence; `ICDecompress` returns `ICERR_OK` and ~30 K of
+//!   the 57.6 KB RGB24 output is non-zero — the first real
+//!   pixel decode through `IR32_32.DLL`. The bug fix that
+//!   unblocks this:
+//!   `ICM_DECOMPRESS_BEGIN` was at `ICM_USER + 16 = 0x4010`
+//!   (round-5 typo) — an unmapped slot in `IR32_32.DLL`'s
+//!   dispatch table. The canonical vfw.h value is
+//!   `ICM_USER + 12 = 0x400C`. Without the BEGIN handler running,
+//!   `ICDecompress` bailed early at a `[state2_ptr] != 0`
+//!   sentinel check. While here,
+//!   `ICM_DECOMPRESS_GET_FORMAT` corrected from
+//!   `0x4008` → `0x400A`.
+//! * **Part B — MMX scaffolding** for round 8.
+//!   [`emulator::Cpu`] grows an `mmx: [u64; 8]` register file
+//!   (`mm0..mm7`, per Intel SDM Vol. 1 §9.2.1). A new
+//!   [`emulator::Trap::UnimplementedMmx`] variant carries the
+//!   2-byte opcode + EIP + an SDM-derived mnemonic hint
+//!   (`"PADDB MMX"`, `"PXOR MMX"`, `"EMMS"`, …). The
+//!   `0x0F 0x60..0x6F`, `0x0F 0x70..0x7F`, and
+//!   `0x0F 0xD0..0xFF` opcode blocks (per SDM Vol. 2
+//!   Appendix A Table A-3) now route through
+//!   `emulator::isa_int::dispatch_mmx` to the structured trap
+//!   instead of the generic `UndefinedOpcode`. Round 8 reads
+//!   the trap log to land MMX semantics opcode-by-opcode.
 //!
 //! Modern codecs (H.264 / HEVC / AV1 / Opus / AAC / …) are decoded
 //! natively elsewhere in the workspace; this crate exists for

@@ -49,29 +49,38 @@ pub const ICM_USER: u32 = 0x4000;
 pub const ICM_RESERVED: u32 = 0x5000;
 
 // Authoritative `ICM_*` numeric values (vfw.h, Windows 10 SDK):
-//   ICM_GETINFO            = ICM_RESERVED + 2   (0x5002)
-//   ICM_DECOMPRESS_QUERY   = ICM_USER + 11      (0x400B)
-//   ICM_DECOMPRESS_BEGIN   = ICM_USER + 16      (0x4010)
-//   ICM_DECOMPRESS_END     = ICM_USER + 14      (0x400E)
-//   ICM_DECOMPRESS         = ICM_USER + 13      (0x400D)
-//   ICM_DECOMPRESS_GET_FORMAT      = ICM_USER + 8  (0x4008)
-//   ICM_DECOMPRESS_GET_PALETTE     = ICM_USER + 26 (0x401A)
+//   ICM_GETINFO                  = ICM_RESERVED + 2   (0x5002)
+//   ICM_DECOMPRESS_GET_FORMAT    = ICM_USER + 10      (0x400A)
+//   ICM_DECOMPRESS_QUERY         = ICM_USER + 11      (0x400B)
+//   ICM_DECOMPRESS_BEGIN         = ICM_USER + 12      (0x400C)
+//   ICM_DECOMPRESS               = ICM_USER + 13      (0x400D)
+//   ICM_DECOMPRESS_END           = ICM_USER + 14      (0x400E)
+//   ICM_DECOMPRESS_SET_PALETTE   = ICM_USER + 29      (0x401D)
+//   ICM_DECOMPRESS_GET_PALETTE   = ICM_USER + 30      (0x401E)
+//
 // Round-4's table was wrong (used `ICM_USER + 0/0x29/0x2A/0x2B/0x2C`)
-// — fixed in round 5 because Indeo 3's DriverProc dispatches on
-// the canonical values, returning ICERR_UNSUPPORTED otherwise.
+// — round-5 corrected QUERY/END/DECOMPRESS but kept BEGIN at the wrong
+// value (ICM_USER + 16 = 0x4010). Round-7 fixes BEGIN to ICM_USER + 12
+// after disassembling IR32_32.DLL's dispatch table at 0x10001760: the
+// real BEGIN handler at 0x10001339 calls 0x10002a30 which sets up the
+// per-instance state2 buffer (`inc [state2_ptr]`), without which
+// ICM_DECOMPRESS bails immediately at the `cmp [state2_ptr], 0`
+// validation in 0x10002b30 (returns ICERR_BADIMAGE = 0xFFFFFF9C).
+//
+// And GET_FORMAT was at +8 (0x4008) — round-7 fixes to +10 (0x400A).
 
 /// `vfw.h`: `ICM_GETINFO` (request the codec's identity card).
 pub const ICM_GETINFO: u32 = ICM_RESERVED + 2;
 /// `vfw.h`: `ICM_DECOMPRESS_GET_FORMAT`.
-pub const ICM_DECOMPRESS_GET_FORMAT: u32 = ICM_USER + 8;
+pub const ICM_DECOMPRESS_GET_FORMAT: u32 = ICM_USER + 10;
 /// `vfw.h`: `ICM_DECOMPRESS_QUERY` — can we decompress this format?
 pub const ICM_DECOMPRESS_QUERY: u32 = ICM_USER + 11;
+/// `vfw.h`: `ICM_DECOMPRESS_BEGIN`.
+pub const ICM_DECOMPRESS_BEGIN: u32 = ICM_USER + 12;
 /// `vfw.h`: `ICM_DECOMPRESS`.
 pub const ICM_DECOMPRESS: u32 = ICM_USER + 13;
 /// `vfw.h`: `ICM_DECOMPRESS_END`.
 pub const ICM_DECOMPRESS_END: u32 = ICM_USER + 14;
-/// `vfw.h`: `ICM_DECOMPRESS_BEGIN`.
-pub const ICM_DECOMPRESS_BEGIN: u32 = ICM_USER + 16;
 
 // vfw.h: ICDECOMPRESS dwFlags
 /// "This is a key/intra frame" — set on the first frame and on

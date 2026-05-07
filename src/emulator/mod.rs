@@ -51,6 +51,21 @@ pub enum Trap {
     /// Instruction limit exceeded — guards against runaway
     /// loops.
     InstructionLimitExceeded { eip: u32, count: u64 },
+    /// MMX opcode in the recognised opcode-map slots
+    /// (`0F 60..6F`, `0F 70..7F`, `0F D0..FF`) that is decoded as
+    /// MMX but not yet semantically implemented.
+    ///
+    /// Round 7 routes the MMX opcode space here; round 8 drains
+    /// it opcode-by-opcode. The trap carries the full 2-byte
+    /// opcode (`0F xx`) packed into `opcode`, the EIP of the
+    /// `0F` byte, and a short SDM-derived `mnemonic_hint`
+    /// (`"PADDB"`, `"MOVQ MMX"`, `"PXOR"`, …) so the trap log
+    /// reads as a concrete to-do list.
+    UnimplementedMmx {
+        eip: u32,
+        opcode: u32,
+        mnemonic_hint: &'static str,
+    },
 }
 
 impl core::fmt::Display for Trap {
@@ -81,6 +96,14 @@ impl core::fmt::Display for Trap {
             Trap::InstructionLimitExceeded { eip, count } => write!(
                 f,
                 "instruction limit exceeded at eip={eip:#010x} after {count} instructions"
+            ),
+            Trap::UnimplementedMmx {
+                eip,
+                opcode,
+                mnemonic_hint,
+            } => write!(
+                f,
+                "unimplemented MMX opcode {opcode:#06x} ({mnemonic_hint}) at eip={eip:#010x}"
             ),
         }
     }

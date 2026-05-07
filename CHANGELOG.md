@@ -33,6 +33,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 7: **Real IV31 keyframe decode through `cubes.mov`**, plus
+  MMX scaffolding for round 8. Twin deliverables:
+  - **Part A — `cubes.mov` decode.** `tests/common/mod.rs` gains
+    `fetch_or_load_ffmpeg_sample(fourcc, name)` for the
+    `samples.oxideav.org/ffmpeg/V-codecs/<FOURCC>/<NAME>` corpus
+    (HTTPS + cache + env-override tiers). New
+    `tests/common/mov_extractor.rs` — a ~270 LOC test-side
+    QuickTime / ISO BMFF chunk walker (authored from
+    ISO/IEC 14496-12, §4 + §8) that parses
+    `moov → trak → mdia → minf → stbl → {stsd, stco, stsz}` to
+    locate sample 0's bytes from `cubes.mov` (160×120 yuv410p,
+    Indeo 3, 40 frames, 121 KB). New `tests/round7_cubes_mov.rs`
+    drives the full IC* sequence against the real keyframe;
+    `ICDecompress` returns `ICERR_OK` and writes ~30 K non-zero
+    RGB24 bytes (~52% of the 57.6 KB output) — the first real
+    pixel decode through `IR32_32.DLL`.
+  - **Bug fix**: `ICM_DECOMPRESS_BEGIN` was wrong since round 5,
+    pointing at `ICM_USER + 16 = 0x4010` (an unmapped slot), so
+    the codec's per-instance state initialiser never ran and
+    `ICDecompress` always bailed at the `[state2_ptr] != 0`
+    check (`mov eax, 0xffffff9c` at `eip=0x10002b5d`). Round 7
+    fixes `ICM_DECOMPRESS_BEGIN = ICM_USER + 12 = 0x400C` — the
+    canonical vfw.h value — disassembled from
+    `IR32_32.DLL`'s dispatch table at `0x10001760`. While here,
+    `ICM_DECOMPRESS_GET_FORMAT` corrected from
+    `0x4008` → `0x400A`.
+  - **Part B — MMX scaffolding for round 8.**
+    - `Cpu::mmx: [u64; 8]` register file (mm0..mm7), per Intel
+      SDM Vol. 1 §9.2.1. Aliases to FPU stack ST(0..7) on real
+      hardware; we model them as a separate array.
+    - New `Trap::UnimplementedMmx { eip, opcode, mnemonic_hint }`
+      variant. Round-8 work-list reads the trap log.
+    - `emulator::isa_int::dispatch_mmx` routes the MMX opcode
+      space (`0F 60..6F`, `0F 70..7F`, `0F D0..FF`, per Intel
+      SDM Vol. 2 Appendix A Table A-3) to the structured trap.
+      ModR/M + (PSHUFW / group-12/13/14) imm8 are consumed so
+      EIP advances past the full instruction.
+    - SDM-derived mnemonic hints (`PXOR MMX`, `PADDB MMX`,
+      `PSLLQ imm8 (group-14)`, `EMMS`, …) — round 8 lands them
+      one at a time.
+    - 14 new tests in `tests/round7_mmx_scaffold.rs`: register
+      file zero-init / writability, every opcode-space block
+      traps as `UnimplementedMmx` with the correct opcode +
+      mnemonic, EIP advances correctly past ModR/M and imm8,
+      `0F C8 BSWAP eax` (a non-MMX `0F` opcode) still works.
 - Round 6: "Drive the full IC* decode pipeline end-to-end against
   Intel IR32_32.DLL" milestone landed. The
   `ICDecompressQuery → ICDecompressBegin → ICDecompress →

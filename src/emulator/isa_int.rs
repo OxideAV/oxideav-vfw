@@ -76,6 +76,20 @@ pub struct Cpu {
     /// flat mode); Microsoft "TEB" documentation for FS use.
     fs_base: u32,
     gs_base: u32,
+    /// MMX register file `mm0..mm7`, eight 64-bit registers.
+    ///
+    /// Per Intel SDM Vol. 1 §9.2.1, the architectural MMX
+    /// registers alias to the lower 64 bits of FPU stack
+    /// `ST(0)..ST(7)`. We model them as a separate `[u64; 8]`
+    /// array because the FPU stack is not modelled in this
+    /// crate; codecs that mix x87 + MMX will need an explicit
+    /// alias in a later round.
+    ///
+    /// Round 7 lands the register file + structured-trap
+    /// dispatch surface but does NOT implement any actual MMX
+    /// semantics. Touching `mm0..mm7` always traps as
+    /// [`Trap::UnimplementedMmx`].
+    pub mmx: [u64; 8],
 }
 
 /// Segment-override prefix selector.
@@ -113,6 +127,7 @@ impl Cpu {
             seg_override: None,
             fs_base: 0,
             gs_base: 0,
+            mmx: [0u64; 8],
         }
     }
 
@@ -1139,11 +1154,62 @@ impl Cpu {
                 self.regs.set32(dst, v as i16 as i32 as u32);
                 Ok(StepOk::Continued)
             }
+            // ---- MMX opcode space (Intel SDM Vol. 2, App. A) ----
+            // Round 7: structured-trap surface; round 8 will land
+            // semantics opcode-by-opcode.
+            //
+            //   0F 60..6F : PUNPCK*, PACK*, PCMP*, MOVD/MOVQ.
+            //   0F 70..7F : PSHUFW, group-12/13/14 shifts (imm8),
+            //               EMMS, MOVD/MOVQ.
+            //   0F D0..FF : PADD*/PSUB*/PMUL*/PMADD/PCMPEQ/PSL*/
+            //               PSR*/PAND/POR/PXOR/PADDS*/PSUBS*.
+            0x60..=0x6F | 0x70..=0x7F | 0xD0..=0xFF => self.dispatch_mmx(op2, entry_eip, mmu),
             other => Err(Trap::UndefinedOpcode {
                 eip: entry_eip,
                 opcode: 0x0F00 | u32::from(other),
             }),
         }
+    }
+
+    /// MMX opcode dispatch (round 7 scaffold).
+    ///
+    /// All implemented MMX opcodes consume their ModR/M (and any
+    /// imm8) so that EIP advances past the entire instruction
+    /// even when we trap. This makes the trap log a faithful
+    /// "next instruction the codec wants" report rather than a
+    /// landmine for the round-8 implementer.
+    ///
+    /// Reference: Intel® 64 and IA-32 Architectures Software
+    /// Developer's Manual, Volume 2, Appendix A (Opcode Maps),
+    /// Tables A-2 (one-byte) + A-3 (two-byte).
+    fn dispatch_mmx(&mut self, op2: u8, entry_eip: u32, mmu: &mut Mmu) -> Result<StepOk, Trap> {
+        // Most MMX instructions take a ModR/M byte. We consume it
+        // (and any displacement / imm8) before trapping so that
+        // EIP moves past the instruction, even when the MMX
+        // semantics are not yet implemented. This lets a tracing
+        // run keep walking past unimplemented MMX bodies.
+        let mnemonic_hint = mmx_mnemonic(op2);
+        let needs_modrm = mmx_consumes_modrm(op2);
+        let imm8_after = mmx_has_imm8(op2);
+
+        if needs_modrm {
+            let mr = self.fetch_modrm(mmu)?;
+            let bytes = self.peek_after_modrm(mmu, 16)?;
+            // We don't actually use the operand — but resolving it
+            // also tells us how many displacement bytes follow.
+            let (_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
+            self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
+        }
+        if imm8_after {
+            // Advance past the trailing imm8 (PSHUFW, group-12/13/14
+            // shift-by-immediate).
+            self.regs.eip = self.regs.eip.wrapping_add(1);
+        }
+        Err(Trap::UnimplementedMmx {
+            eip: entry_eip,
+            opcode: 0x0F00 | u32::from(op2),
+            mnemonic_hint,
+        })
     }
 
     /// CPUID — return a fixed Pentium-class response. Per design
@@ -2326,6 +2392,127 @@ fn condition_holds(cc: u8, f: &Flags) -> bool {
         0xF => !f.zf && (f.sf == f.of), // JG / JNLE
         _ => unreachable!(),
     }
+}
+
+/// SDM-derived mnemonic hint for `0F xx` MMX opcodes.
+///
+/// Reference: Intel® 64 and IA-32 Architectures Software
+/// Developer's Manual, Volume 2 Appendix A Table A-3
+/// ("Two-byte Opcode Map"). Coverage:
+///
+/// * `0F 60..6F` — punpck/pack/pcmp/movd/movq family.
+/// * `0F 70..7F` — pshufw, group-12/13/14 imm shifts, EMMS,
+///   movd/movq.
+/// * `0F D0..FF` — full PADD/PSUB/PMUL/PMADD/PCMP/PSL/PSR/PAND/
+///   POR/PXOR/PADDS/PSUBS family.
+///
+/// Some slots in `0F 70..7F` (notably `0F 71/72/73`) are
+/// "group" opcodes whose `/r` field disambiguates the actual
+/// mnemonic (e.g. `0F 73 /6` is `PSLLQ imm8`, `0F 73 /2` is
+/// `PSRLQ imm8`). We surface the umbrella mnemonic here; the
+/// round-8 implementer reads `mr.reg` to disambiguate.
+pub(crate) fn mmx_mnemonic(op2: u8) -> &'static str {
+    match op2 {
+        // 0F 60..6F — unpack / pack / compare / move-MMX
+        0x60 => "PUNPCKLBW MMX",
+        0x61 => "PUNPCKLWD MMX",
+        0x62 => "PUNPCKLDQ MMX",
+        0x63 => "PACKSSWB MMX",
+        0x64 => "PCMPGTB MMX",
+        0x65 => "PCMPGTW MMX",
+        0x66 => "PCMPGTD MMX",
+        0x67 => "PACKUSWB MMX",
+        0x68 => "PUNPCKHBW MMX",
+        0x69 => "PUNPCKHWD MMX",
+        0x6A => "PUNPCKHDQ MMX",
+        0x6B => "PACKSSDW MMX",
+        0x6C => "PUNPCKLQDQ (SSE2)",
+        0x6D => "PUNPCKHQDQ (SSE2)",
+        0x6E => "MOVD MMX",
+        0x6F => "MOVQ MMX",
+
+        // 0F 70..7F — shuf / group-12/13/14 / EMMS / movd / movq
+        0x70 => "PSHUFW MMX",
+        0x71 => "MMX group-12 (PSLLW/PSRAW/PSRLW imm8)",
+        0x72 => "MMX group-13 (PSLLD/PSRAD/PSRLD imm8)",
+        0x73 => "MMX group-14 (PSLLQ/PSRLQ imm8)",
+        0x74 => "PCMPEQB MMX",
+        0x75 => "PCMPEQW MMX",
+        0x76 => "PCMPEQD MMX",
+        0x77 => "EMMS",
+        0x78..=0x7D => "MMX/SSE reserved",
+        0x7E => "MOVD r/m32, mm",
+        0x7F => "MOVQ mm/m64, mm",
+
+        // 0F D0..DF
+        0xD1 => "PSRLW MMX",
+        0xD2 => "PSRLD MMX",
+        0xD3 => "PSRLQ MMX",
+        0xD4 => "PADDQ MMX",
+        0xD5 => "PMULLW MMX",
+        0xD7 => "PMOVMSKB MMX",
+        0xD8 => "PSUBUSB MMX",
+        0xD9 => "PSUBUSW MMX",
+        0xDA => "PMINUB MMX",
+        0xDB => "PAND MMX",
+        0xDC => "PADDUSB MMX",
+        0xDD => "PADDUSW MMX",
+        0xDE => "PMAXUB MMX",
+        0xDF => "PANDN MMX",
+
+        // 0F E0..EF
+        0xE0 => "PAVGB MMX",
+        0xE1 => "PSRAW MMX",
+        0xE2 => "PSRAD MMX",
+        0xE3 => "PAVGW MMX",
+        0xE4 => "PMULHUW MMX",
+        0xE5 => "PMULHW MMX",
+        0xE7 => "MOVNTQ MMX",
+        0xE8 => "PSUBSB MMX",
+        0xE9 => "PSUBSW MMX",
+        0xEA => "PMINSW MMX",
+        0xEB => "POR MMX",
+        0xEC => "PADDSB MMX",
+        0xED => "PADDSW MMX",
+        0xEE => "PMAXSW MMX",
+        0xEF => "PXOR MMX",
+
+        // 0F F0..FF
+        0xF1 => "PSLLW MMX",
+        0xF2 => "PSLLD MMX",
+        0xF3 => "PSLLQ MMX",
+        0xF4 => "PMULUDQ MMX",
+        0xF5 => "PMADDWD MMX",
+        0xF6 => "PSADBW MMX",
+        0xF7 => "MASKMOVQ MMX",
+        0xF8 => "PSUBB MMX",
+        0xF9 => "PSUBW MMX",
+        0xFA => "PSUBD MMX",
+        0xFB => "PSUBQ MMX",
+        0xFC => "PADDB MMX",
+        0xFD => "PADDW MMX",
+        0xFE => "PADDD MMX",
+
+        _ => "MMX (unmapped slot)",
+    }
+}
+
+/// Whether the named MMX opcode in `0F 60..7F` / `D0..FF` has a
+/// ModR/M byte. (All implemented MMX opcodes do; `0F 77 EMMS`
+/// is the lone exception.)
+fn mmx_consumes_modrm(op2: u8) -> bool {
+    !matches!(op2, 0x77)
+}
+
+/// Whether the named MMX opcode in `0F 60..7F` / `D0..FF` carries
+/// a trailing imm8 byte after the ModR/M.
+///
+/// The two cases in the round-7 surface:
+///
+/// * `0F 70` PSHUFW imm8.
+/// * `0F 71/72/73` group-12/13/14 shift-by-imm8.
+fn mmx_has_imm8(op2: u8) -> bool {
+    matches!(op2, 0x70..=0x73)
 }
 
 #[cfg(test)]

@@ -26,9 +26,18 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
+pub mod mov_extractor;
+
 /// Canonical HTTPS prefix for the Intel IV5 driver bundle.
 /// Each filename listed in `tests/README.md` is appended verbatim.
 const BASE_URL: &str = "https://samples.oxideav.org/video/windows/IV5PLAY";
+
+/// Canonical HTTPS prefix for the FFmpeg samples corpus,
+/// indexed by FourCC. Used by round 7+ to fetch real-codec
+/// `.mov` / `.avi` payloads. The full URL is built as
+/// `<FFMPEG_BASE_URL>/<FOURCC>/<NAME>`.
+const FFMPEG_BASE_URL: &str = "https://samples.oxideav.org/ffmpeg/V-codecs";
 
 /// Resolve `name` (e.g. `"IR32_32.DLL"`) to a byte buffer.
 ///
@@ -98,6 +107,65 @@ pub fn fetch_or_load(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 
     if !ci {
         // Best-effort cache write; never fail the test on cache I/O.
+        let _ = fs::create_dir_all(cache_dir());
+        let _ = fs::write(&cache_path, &bytes);
+    }
+
+    Ok(bytes)
+}
+
+/// Round-7 sibling of [`fetch_or_load`] for the FFmpeg samples
+/// corpus.
+///
+/// The corpus URL pattern is
+/// `https://samples.oxideav.org/ffmpeg/V-codecs/<FOURCC>/<NAME>`.
+/// `fourcc` is the codec FourCC (e.g. `"IV32"`, `"IV50"`),
+/// `name` is the leaf file name (e.g. `"cubes.mov"`).
+///
+/// Resolution order — same tiers as [`fetch_or_load`]:
+///
+/// 1. `OXIDEAV_VFW_FIXTURE_DIR/<NAME>` (case-insensitive).
+/// 2. Local cache: `<CARGO_TARGET_DIR>/test-fixture-cache/<FOURCC>-<NAME>`.
+///    Skipped (read + write) when `CI=true`.
+/// 3. HTTPS fetch from
+///    `<FFMPEG_BASE_URL>/<FOURCC>/<NAME>`.
+///
+/// Wine + Windows-system-path tiers are skipped here — the
+/// FFmpeg corpus carries no Windows-side analogue.
+#[allow(dead_code)]
+pub fn fetch_or_load_ffmpeg_sample(
+    fourcc: &str,
+    name: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    // 1. Explicit user override (same env var as fetch_or_load).
+    if let Some(dir) = env::var_os("OXIDEAV_VFW_FIXTURE_DIR") {
+        let dir = PathBuf::from(dir);
+        if let Some(bytes) = read_case_insensitive(&dir, name)? {
+            return Ok(bytes);
+        }
+        // Fall through if the env-var is set but this file isn't in
+        // the override dir — the FFmpeg corpus is large + the user
+        // only stages the fixtures they care about. Drop to cache /
+        // network like the un-overridden case.
+    }
+
+    let ci = env::var("CI")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    // 2. Local cache. Cache key includes fourcc to avoid clashes
+    //    when two corpora ship a `cubes.mov`.
+    let cache_key = format!("{}-{}", fourcc.to_ascii_uppercase(), name);
+    let cache_path = cache_dir().join(&cache_key);
+    if !ci && cache_path.exists() {
+        return Ok(fs::read(&cache_path)?);
+    }
+
+    // 3. HTTPS fetch.
+    let url = format!("{FFMPEG_BASE_URL}/{fourcc}/{name}");
+    let bytes = http_fetch(&url).map_err(|e| format!("HTTPS fetch of {url} failed: {e}"))?;
+
+    if !ci {
         let _ = fs::create_dir_all(cache_dir());
         let _ = fs::write(&cache_path, &bytes);
     }
@@ -260,9 +328,11 @@ pub fn list_pe_imports(bytes: &[u8]) -> Result<BTreeSet<(String, String)>, Strin
 
 /// HTTPS GET via `ureq`. Returns the raw body bytes.
 fn http_fetch(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    // Cap at 8 MiB — Intel's IV5 DLLs are tens of KB; anything
-    // beyond that is a server-side surprise we want to refuse.
-    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    // Cap at 32 MiB — covers Intel IV5 DLLs (tens of KB) and the
+    // FFmpeg corpus's small-shape `.mov` / `.avi` fixtures (low
+    // single-digit MB). Anything beyond that is a server-side
+    // surprise we want to refuse.
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
     let resp = ureq::get(url).call()?;
     let mut buf = Vec::new();
     resp.into_reader().take(MAX_BYTES).read_to_end(&mut buf)?;
