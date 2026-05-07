@@ -1,0 +1,302 @@
+//! Win32 stub registry + per-DLL host implementations of the
+//! functions the loaded codec DLLs import.
+//!
+//! Each stub is a Rust function pointer with the signature
+//! [`StubFn`]. The PE loader, when populating the IAT, looks up
+//! `(dll_name_lowercased, function_name)` in [`Registry`] and
+//! writes the synthetic [`StubAddr`] (a guest address that lives
+//! in the unmapped "thunk space" near `0xFFFE_0000`) into the
+//! IAT slot.
+//!
+//! At call time, the integer ISA executor sees `eip` jump to a
+//! thunk address. It detects this via [`Registry::is_thunk`]
+//! and dispatches to the stub directly, popping the right number
+//! of bytes off the guest stack for the calling convention.
+//!
+//! All stubs are stdcall (callee-cleanup) for round 1; the
+//! `arg_dwords` field carries the count. Round-2 will add cdecl
+//! (caller-cleanup) once vfw32 needs it.
+//!
+//! Reference for each function: the corresponding MSDN page
+//! (linked in source comments next to each stub).
+
+use std::collections::BTreeMap;
+
+use crate::emulator::{Cpu, Mmu};
+
+pub mod kernel32;
+
+/// First synthetic thunk address. Chosen well above any plausible
+/// `ImageBase + section.VirtualAddress` so it cannot be mistaken
+/// for a real DLL byte. Each registered stub gets the next
+/// 16-byte slot.
+pub const THUNK_BASE: u32 = 0xFFFE_0000;
+const THUNK_STRIDE: u32 = 16;
+
+/// Signature every Win32 stub uses.
+///
+/// Returns the dword to put in `eax` on return. The stub
+/// internally reads its arguments off the guest stack via the
+/// [`Cpu`] / [`Mmu`] handles. The runtime takes care of popping
+/// `arg_dwords * 4` bytes from the guest stack after the stub
+/// returns (stdcall callee-cleanup).
+pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState) -> Result<u32, Win32Error>;
+
+/// Information stored alongside each stub.
+#[derive(Clone)]
+pub struct StubEntry {
+    pub dll: String,
+    pub name: String,
+    pub func: StubFn,
+    /// Number of dword arguments to pop off the stack (stdcall
+    /// callee-cleanup). cdecl callers will be added in round 2
+    /// with a separate flag.
+    pub arg_dwords: u32,
+    /// The synthetic guest address that, when called, invokes
+    /// this stub.
+    pub thunk_addr: u32,
+}
+
+/// Errors a stub can raise. Wrapped in `crate::Error::Win32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Win32Error {
+    /// No stub registered for the requested `(dll, name)` pair.
+    /// PE-load-time error; surfaces from
+    /// [`crate::pe::Loader::resolve_imports`].
+    UnknownImport { dll: String, name: String },
+    /// Stub-side argument validation failed.
+    InvalidArgument { stub: &'static str, reason: String },
+    /// Heap call referenced an unknown allocation.
+    InvalidHeapBlock { stub: &'static str, addr: u32 },
+}
+
+impl core::fmt::Display for Win32Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Win32Error::UnknownImport { dll, name } => {
+                write!(f, "no Round-1 stub for import {dll}!{name}")
+            }
+            Win32Error::InvalidArgument { stub, reason } => {
+                write!(f, "{stub}: {reason}")
+            }
+            Win32Error::InvalidHeapBlock { stub, addr } => {
+                write!(f, "{stub}: unknown heap allocation {addr:#010x}")
+            }
+        }
+    }
+}
+
+/// The host-side state every stub may read or mutate.
+///
+/// This is the "operating system" of the sandbox — the heap, the
+/// LastError TLS, the pseudo-tick counter, the loaded-module
+/// registry, etc. One per emulator instance.
+#[derive(Default)]
+pub struct HostState {
+    /// Heap allocations keyed by guest address.
+    pub heap: BTreeMap<u32, Vec<u8>>,
+    /// Cursor for the next heap allocation. Walks through a
+    /// dedicated guest-virtual region (configured by [`HostState::new`]).
+    pub heap_cursor: u32,
+    pub heap_arena_end: u32,
+    /// Default process heap handle returned by `GetProcessHeap`.
+    pub process_heap_handle: u32,
+    /// Last error code (`SetLastError` / `GetLastError`).
+    pub last_error: u32,
+    /// Pseudo-tick counter incremented on every `GetTickCount`.
+    pub tick: u32,
+    /// Loaded-module registry: name → ImageBase.
+    pub modules: BTreeMap<String, u32>,
+    /// Lines that the codec wrote to `OutputDebugString*`. Tests
+    /// can introspect to confirm a known string was emitted.
+    pub debug_log: Vec<String>,
+}
+
+impl HostState {
+    /// Construct a HostState with the heap arena at `[heap_start,
+    /// heap_end)` (caller is responsible for mapping that region
+    /// in the MMU as R+W).
+    pub fn new(heap_start: u32, heap_end: u32) -> Self {
+        HostState {
+            heap_cursor: heap_start,
+            heap_arena_end: heap_end,
+            process_heap_handle: 0xDEAD_BEEF,
+            last_error: 0,
+            tick: 0,
+            heap: BTreeMap::new(),
+            modules: BTreeMap::new(),
+            debug_log: Vec::new(),
+        }
+    }
+}
+
+/// Stub registry. Created once per emulator instance.
+#[derive(Default)]
+pub struct Registry {
+    by_thunk: BTreeMap<u32, StubEntry>,
+    by_name: BTreeMap<(String, String), u32>,
+    next_slot: u32,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Registry {
+            by_thunk: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+            next_slot: 0,
+        }
+    }
+
+    /// Register a stub. Returns the synthetic thunk address that
+    /// the IAT slot should be populated with.
+    pub fn register(&mut self, dll: &str, name: &str, func: StubFn, arg_dwords: u32) -> u32 {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        if let Some(addr) = self.by_name.get(&key) {
+            return *addr;
+        }
+        let thunk_addr = THUNK_BASE.wrapping_add(self.next_slot.wrapping_mul(THUNK_STRIDE));
+        self.next_slot += 1;
+        self.by_name.insert(key.clone(), thunk_addr);
+        self.by_thunk.insert(
+            thunk_addr,
+            StubEntry {
+                dll: key.0,
+                name: key.1,
+                func,
+                arg_dwords,
+                thunk_addr,
+            },
+        );
+        thunk_addr
+    }
+
+    /// Resolve an import. The PE loader uses this when populating
+    /// IAT slots. `dll_name` is matched case-insensitively.
+    pub fn resolve(&self, dll: &str, name: &str) -> Option<u32> {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        self.by_name.get(&key).copied()
+    }
+
+    /// True iff `addr` is a registered thunk address.
+    pub fn is_thunk(&self, addr: u32) -> bool {
+        self.by_thunk.contains_key(&addr)
+    }
+
+    /// Look up the stub entry by its thunk address. Used by the
+    /// runtime when it sees `eip == thunk_addr`.
+    pub fn entry(&self, addr: u32) -> Option<&StubEntry> {
+        self.by_thunk.get(&addr)
+    }
+
+    /// Convenience: register every kernel32 stub. Returns the
+    /// number of stubs registered.
+    pub fn register_kernel32(&mut self) -> usize {
+        let before = self.by_name.len();
+        kernel32::register(self);
+        self.by_name.len() - before
+    }
+}
+
+/// Read the `n`-th stdcall dword argument off the guest stack.
+///
+/// At entry, `esp` points to the saved return address (pushed by
+/// the caller's CALL); the first argument is at `esp+4`, the
+/// second at `esp+8`, etc.
+pub fn arg_dword(cpu: &Cpu, mmu: &Mmu, n: u32) -> Result<u32, crate::emulator::Trap> {
+    let addr = cpu.regs.esp().wrapping_add(4u32 * (n + 1));
+    mmu.load32(addr)
+}
+
+/// Dispatch a stub call. The runtime wires this into the executor
+/// so that whenever `eip` lands on a thunk address, control
+/// transfers here instead of fetching instruction bytes.
+///
+/// On entry: the guest CALL has already pushed the return
+/// address; `eip` is the thunk address. On exit: `eax` holds the
+/// stub's return value, `eip` is the popped return address, and
+/// `arg_dwords*4` bytes have been removed from the stack
+/// (stdcall callee-cleanup).
+pub fn dispatch_stub(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+) -> Result<(), crate::Error> {
+    let addr = cpu.regs.eip;
+    let entry = registry
+        .entry(addr)
+        .ok_or_else(|| Win32Error::UnknownImport {
+            dll: "<thunk>".into(),
+            name: format!("@{:#010x}", addr),
+        })?
+        .clone();
+    // Run the host-side stub.
+    let ret = (entry.func)(cpu, mmu, state)?;
+    // stdcall: pop return address, advance esp by arg_dwords*4,
+    // set eax to the return value.
+    let ret_addr = cpu.pop32(mmu)?;
+    cpu.regs.set32(crate::emulator::regs::Reg32::Eax, ret);
+    let new_esp = cpu
+        .regs
+        .esp()
+        .wrapping_add(entry.arg_dwords.wrapping_mul(4));
+    cpu.regs.set_esp(new_esp);
+    cpu.regs.eip = ret_addr;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emulator::{mmu::Perm, Mmu};
+
+    fn dummy_stub(_cpu: &mut Cpu, _mmu: &mut Mmu, _h: &mut HostState) -> Result<u32, Win32Error> {
+        Ok(0xCAFE)
+    }
+
+    #[test]
+    fn registry_assigns_stable_thunk_addresses() {
+        let mut r = Registry::new();
+        let a = r.register("kernel32.dll", "Foo", dummy_stub, 1);
+        let b = r.register("kernel32.dll", "Bar", dummy_stub, 0);
+        let a2 = r.register("kernel32.dll", "Foo", dummy_stub, 1);
+        assert_eq!(a, a2);
+        assert_ne!(a, b);
+        assert!(r.is_thunk(a));
+    }
+
+    #[test]
+    fn registry_resolve_is_case_insensitive_on_dll_name() {
+        let mut r = Registry::new();
+        let addr = r.register("KERNEL32.DLL", "GetProcessHeap", dummy_stub, 0);
+        assert_eq!(r.resolve("kernel32.dll", "GetProcessHeap"), Some(addr));
+        assert_eq!(r.resolve("Kernel32.Dll", "GetProcessHeap"), Some(addr));
+    }
+
+    #[test]
+    fn dispatch_pops_return_addr_and_args() {
+        let mut mmu = Mmu::new();
+        mmu.map(0x4000, 0x4000, Perm::R | Perm::W);
+        let mut cpu = Cpu::new();
+        cpu.regs.set_esp(0x7000);
+
+        let mut registry = Registry::new();
+        let addr = registry.register("kernel32.dll", "Sample", dummy_stub, 2);
+
+        // Lay out a fake call frame: ret addr, arg1, arg2.
+        cpu.push32(&mut mmu, 0x4444).unwrap(); // arg2
+        cpu.push32(&mut mmu, 0x3333).unwrap(); // arg1
+        cpu.push32(&mut mmu, 0x2222).unwrap(); // saved ret addr
+        let esp_before = cpu.regs.esp();
+
+        cpu.regs.eip = addr;
+        let mut state = HostState::new(0, 0);
+        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+
+        // After: eax=0xCAFE, eip = ret addr, esp pops 12 bytes
+        // total (1 ret + 2 args).
+        assert_eq!(cpu.regs.get32(crate::emulator::regs::Reg32::Eax), 0xCAFE);
+        assert_eq!(cpu.regs.eip, 0x2222);
+        assert_eq!(cpu.regs.esp(), esp_before + 12);
+    }
+}

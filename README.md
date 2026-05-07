@@ -9,12 +9,30 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 0 — design + scaffold.** The full design contract is the
-659-line document at
+**Round 1 — "Load + DllMain + clean exit" landed.** The full
+design contract is the 659-line document at
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
-This crate currently exposes only `Error::NotImplemented`; round 1
-brings the PE loader + i386 integer ISA + minimal kernel32 stubs and
-loads Cinepak's `iccvid.dll`.
+
+This round delivers:
+
+* `emulator::mmu` — flat 4 GiB R/W/X-permissioned MMU with
+  sparse 4 KiB pages.
+* `emulator::regs` + `emulator::decode` + `emulator::isa_int`
+  — i386 integer ISA interpreter (CPUID returns canned
+  Pentium-class response; privileged + far calls + segment
+  loads trap; MMX deferred to round 2).
+* `pe` — PE32 loader: DOS + PE header parse, section mapping,
+  base relocation, IAT resolution, export-by-name. Rejects
+  PE32+ / .NET / packed binaries.
+* `win32::kernel32` — 12 stubs (heap + atomics +
+  OutputDebugStringA + GetTickCount + LoadLibraryA +
+  GetProcAddress).
+* `runtime::Sandbox` — public entry point: load a DLL, call
+  `DllMain(DLL_PROCESS_ATTACH)`, return cleanly.
+
+Round 2 will add: MMX ISA + the `vfw32` stubs (`ICOpen` /
+`ICDecompress*` / `ICClose` / `ICGetInfo`) + cdecl plumbing,
+and a "decode one Cinepak frame" end-to-end test.
 
 ## Why this exists
 
