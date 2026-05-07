@@ -27,6 +27,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
+pub mod avi_extractor;
+#[allow(dead_code)]
 pub mod mov_extractor;
 
 /// Canonical HTTPS prefix for the Intel IV5 driver bundle.

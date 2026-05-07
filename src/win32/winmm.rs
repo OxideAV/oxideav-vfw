@@ -34,6 +34,15 @@ pub fn register(registry: &mut Registry) {
         stub_def_driver_proc as StubFn,
         5,
     );
+    // Round 8 (IR50_32.DLL): the Indeo 5 codec uses
+    // `timeGetTime` as a higher-resolution wall-clock source than
+    // `GetTickCount`. Both return DWORD milliseconds.
+    registry.register(
+        "winmm.dll",
+        "timeGetTime",
+        stub_time_get_time as StubFn,
+        0,
+    );
 }
 
 /// `LRESULT DefDriverProc(DWORD_PTR dwDriverIdentifier, HDRVR
@@ -60,6 +69,20 @@ fn stub_def_driver_proc(
         | DRV_QUERYCONFIGURE | DRV_INSTALL | DRV_REMOVE => 0,
         _ => 0,
     })
+}
+
+/// `DWORD timeGetTime(void)`. Returns a monotonically-increasing
+/// millisecond counter. Real implementations have ~1 ms
+/// resolution; we synthesise a fast-counting tick — codecs only
+/// use the value as a seed or rate-limiter sentinel.
+fn stub_time_get_time(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.tick = state.tick.wrapping_add(1);
+    Ok(state.tick)
 }
 
 #[cfg(test)]

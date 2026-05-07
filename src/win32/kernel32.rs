@@ -237,6 +237,343 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
     registry.register("kernel32.dll", "WriteFile", stub_write_file as StubFn, 5);
+
+    // ---- Round-8 additions (IR50_32.DLL needs) --------------------
+    //
+    // Most of these are fail-soft "the DLL imports it but the
+    // decode path doesn't actually exercise it". Each returns the
+    // canonical "no-op success" / "no error" value per MSDN.
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-closehandle
+    registry.register("kernel32.dll", "CloseHandle", stub_close_handle as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createfilemappinga
+    registry.register(
+        "kernel32.dll",
+        "CreateFileMappingA",
+        stub_create_file_mapping_a as StubFn,
+        6,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createsemaphorea
+    registry.register(
+        "kernel32.dll",
+        "CreateSemaphoreA",
+        stub_create_semaphore_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-deletecriticalsection
+    registry.register(
+        "kernel32.dll",
+        "DeleteCriticalSection",
+        stub_delete_critical_section as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-disablethreadlibrarycalls
+    registry.register(
+        "kernel32.dll",
+        "DisableThreadLibraryCalls",
+        stub_disable_thread_library_calls as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-entercriticalsection
+    registry.register(
+        "kernel32.dll",
+        "EnterCriticalSection",
+        stub_enter_critical_section as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-leavecriticalsection
+    registry.register(
+        "kernel32.dll",
+        "LeaveCriticalSection",
+        stub_leave_critical_section as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsection
+    registry.register(
+        "kernel32.dll",
+        "InitializeCriticalSection",
+        stub_initialize_critical_section as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-findresourcea
+    registry.register(
+        "kernel32.dll",
+        "FindResourceA",
+        stub_find_resource_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+    registry.register(
+        "kernel32.dll",
+        "FlushFileBuffers",
+        stub_flush_file_buffers as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-freeenvironmentstringsa
+    registry.register(
+        "kernel32.dll",
+        "FreeEnvironmentStringsA",
+        stub_free_environment_strings as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-freeenvironmentstringsw
+    registry.register(
+        "kernel32.dll",
+        "FreeEnvironmentStringsW",
+        stub_free_environment_strings as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary
+    registry.register("kernel32.dll", "FreeLibrary", stub_free_library as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freeresource
+    registry.register(
+        "kernel32.dll",
+        "FreeResource",
+        stub_free_resource as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess
+    registry.register(
+        "kernel32.dll",
+        "GetCurrentProcess",
+        stub_get_current_process as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentthreadid
+    registry.register(
+        "kernel32.dll",
+        "GetCurrentThreadId",
+        stub_get_current_thread_id as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentstringsw
+    registry.register(
+        "kernel32.dll",
+        "GetEnvironmentStringsW",
+        stub_get_environment_strings_w as StubFn,
+        0,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getlocaleinfoa
+    registry.register(
+        "kernel32.dll",
+        "GetLocaleInfoA",
+        stub_get_locale_info_a as StubFn,
+        4,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetLocaleInfoW",
+        stub_get_locale_info_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamea
+    registry.register(
+        "kernel32.dll",
+        "GetShortPathNameA",
+        stub_get_short_path_name_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getstringtypea
+    registry.register(
+        "kernel32.dll",
+        "GetStringTypeA",
+        stub_get_string_type as StubFn,
+        5,
+    );
+    registry.register(
+        "kernel32.dll",
+        "GetStringTypeW",
+        stub_get_string_type as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemdirectorya
+    registry.register(
+        "kernel32.dll",
+        "GetSystemDirectoryA",
+        stub_get_system_directory_a as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversionexa
+    registry.register(
+        "kernel32.dll",
+        "GetVersionExA",
+        stub_get_version_ex_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalhandle
+    registry.register(
+        "kernel32.dll",
+        "GlobalHandle",
+        stub_global_handle as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalrealloc
+    registry.register(
+        "kernel32.dll",
+        "GlobalReAlloc",
+        stub_global_realloc as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapcreate
+    registry.register("kernel32.dll", "HeapCreate", stub_heap_create as StubFn, 3);
+    // https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapdestroy
+    registry.register(
+        "kernel32.dll",
+        "HeapDestroy",
+        stub_heap_destroy as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-isbadcodeptr
+    registry.register("kernel32.dll", "IsBadCodePtr", stub_is_bad_ptr as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-isbadreadptr
+    registry.register("kernel32.dll", "IsBadReadPtr", stub_is_bad_ptr as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-isbadwriteptr
+    registry.register("kernel32.dll", "IsBadWritePtr", stub_is_bad_ptr as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-lcmapstringa
+    registry.register(
+        "kernel32.dll",
+        "LCMapStringA",
+        stub_lc_map_string as StubFn,
+        6,
+    );
+    registry.register(
+        "kernel32.dll",
+        "LCMapStringW",
+        stub_lc_map_string as StubFn,
+        6,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadresource
+    registry.register(
+        "kernel32.dll",
+        "LoadResource",
+        stub_load_resource as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localhandle
+    registry.register(
+        "kernel32.dll",
+        "LocalHandle",
+        stub_local_handle as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-locallock
+    registry.register("kernel32.dll", "LocalLock", stub_local_lock as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localunlock
+    registry.register("kernel32.dll", "LocalUnlock", stub_local_unlock as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-lockresource
+    registry.register(
+        "kernel32.dll",
+        "LockResource",
+        stub_lock_resource as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile
+    registry.register(
+        "kernel32.dll",
+        "MapViewOfFile",
+        stub_map_view_of_file as StubFn,
+        5,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilemappinga
+    registry.register(
+        "kernel32.dll",
+        "OpenFileMappingA",
+        stub_open_file_mapping_a as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter
+    registry.register(
+        "kernel32.dll",
+        "QueryPerformanceCounter",
+        stub_query_performance_counter as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancefrequency
+    registry.register(
+        "kernel32.dll",
+        "QueryPerformanceFrequency",
+        stub_query_performance_frequency as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-raiseexception
+    registry.register(
+        "kernel32.dll",
+        "RaiseException",
+        stub_raise_exception as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-releasesemaphore
+    registry.register(
+        "kernel32.dll",
+        "ReleaseSemaphore",
+        stub_release_semaphore as StubFn,
+        3,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfilepointer
+    registry.register(
+        "kernel32.dll",
+        "SetFilePointer",
+        stub_set_file_pointer as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-sethandlecount
+    registry.register(
+        "kernel32.dll",
+        "SetHandleCount",
+        stub_set_handle_count as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-setstdhandle
+    registry.register(
+        "kernel32.dll",
+        "SetStdHandle",
+        stub_set_std_handle as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setunhandledexceptionfilter
+    registry.register(
+        "kernel32.dll",
+        "SetUnhandledExceptionFilter",
+        stub_set_unhandled_exception_filter as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleep
+    registry.register("kernel32.dll", "Sleep", stub_sleep as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
+    registry.register(
+        "kernel32.dll",
+        "TerminateProcess",
+        stub_terminate_process as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-tlsalloc
+    registry.register("kernel32.dll", "TlsAlloc", stub_tls_alloc as StubFn, 0);
+    registry.register("kernel32.dll", "TlsFree", stub_tls_free as StubFn, 1);
+    registry.register("kernel32.dll", "TlsGetValue", stub_tls_get_value as StubFn, 1);
+    registry.register("kernel32.dll", "TlsSetValue", stub_tls_set_value as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-unmapviewoffile
+    registry.register(
+        "kernel32.dll",
+        "UnmapViewOfFile",
+        stub_unmap_view_of_file as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
+    registry.register(
+        "kernel32.dll",
+        "WaitForSingleObject",
+        stub_wait_for_single_object as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-writeprivateprofilestringa
+    registry.register(
+        "kernel32.dll",
+        "WritePrivateProfileStringA",
+        stub_write_private_profile_string_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrlena
+    registry.register("kernel32.dll", "lstrlenA", stub_lstrlen_a as StubFn, 1);
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -390,6 +727,11 @@ fn stub_local_alloc(
     mmu.write_initializer(addr, &buf)
         .map_err(|t| trap_to_win32("LocalAlloc", t))?;
     state.heap.insert(addr, buf);
+    if state.trace_stubs {
+        state
+            .stub_trace
+            .push(format!("  LocalAlloc(flags={flags:#x}, n={n}) → {addr:#x}"));
+    }
     Ok(addr)
 }
 
@@ -1195,6 +1537,723 @@ fn trap_to_win32(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {
         stub,
         reason: format!("{t}"),
     }
+}
+
+// ====================================================================
+// Round-8 fail-soft stubs.
+// ====================================================================
+//
+// Each function below is the "minimum viable" implementation: it
+// honours the public ABI (return value semantics + arg-count for
+// stdcall cleanup) but performs no real Windows operation. Codecs
+// that genuinely depend on a side effect (e.g. a real critical
+// section excluding a phantom thread) would surface a fault later;
+// in practice IR50_32.DLL imports many of these for rarely-taken
+// branches (registry, dialog config, error-popup paths) that the
+// `IC*` decode pipeline never executes.
+
+/// `BOOL CloseHandle(HANDLE)`. Always succeeds.
+fn stub_close_handle(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `HANDLE CreateFileMappingA(...)`. Returns NULL → "no file
+/// mapping created" — the codec falls back to its in-memory path.
+fn stub_create_file_mapping_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `HANDLE CreateSemaphoreA(...)`. Returns a non-zero pseudo
+/// handle so the codec's RAII wrappers don't bail on NULL. We
+/// don't actually model semaphores.
+fn stub_create_semaphore_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xC0DE_5E3A) // pseudo-handle
+}
+
+/// `void DeleteCriticalSection(LPCRITICAL_SECTION)`. No-op.
+fn stub_delete_critical_section(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL DisableThreadLibraryCalls(HMODULE)`. We don't model
+/// per-thread DllMain calls; success is the right answer.
+fn stub_disable_thread_library_calls(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `void EnterCriticalSection(LPCRITICAL_SECTION)`. We are
+/// single-threaded; the section is always free.
+fn stub_enter_critical_section(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `void LeaveCriticalSection(LPCRITICAL_SECTION)`. No-op.
+fn stub_leave_critical_section(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `void InitializeCriticalSection(LPCRITICAL_SECTION lpcs)`.
+/// Real initialisation zeroes the structure (20 bytes for x86
+/// CRITICAL_SECTION). We mimic the zero-fill so callers that
+/// inspect the structure see a clean state.
+fn stub_initialize_critical_section(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0)
+        .map_err(|t| trap_to_win32("InitializeCriticalSection", t))?;
+    if p != 0 {
+        // 24-byte CRITICAL_SECTION on x86. Touching pages outside
+        // the structure would WriteProtectFault — the codec
+        // always allocates this from its heap, so writes succeed.
+        for i in 0..24u32 {
+            // Best-effort: ignore individual byte faults so a
+            // truncated mapping doesn't blow up the test. The
+            // structure is opaque from the codec's POV.
+            let _ = mmu.store8(p + i, 0);
+        }
+    }
+    Ok(0)
+}
+
+/// `HRSRC FindResourceA(HMODULE, LPCSTR lpName, LPCSTR lpType)`.
+/// We have no PE resource table integration; return NULL.
+fn stub_find_resource_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL FlushFileBuffers(HANDLE)`. Always succeeds.
+fn stub_flush_file_buffers(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL FreeEnvironmentStringsA/W(LPCSTR/LPCWSTR)`. No-op
+/// success.
+fn stub_free_environment_strings(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL FreeLibrary(HMODULE)`. We don't actually unload modules
+/// inside the sandbox; success keeps the codec's RAII shims happy.
+fn stub_free_library(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL FreeResource(HGLOBAL hResData)`. No-op success.
+fn stub_free_resource(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `HANDLE GetCurrentProcess(void)`. Pseudo-handle 0xFFFFFFFF
+/// per MSDN (a magic constant the codec only compares to itself).
+fn stub_get_current_process(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFF)
+}
+
+/// `DWORD GetCurrentThreadId(void)`. Synthetic 1 (single thread).
+fn stub_get_current_thread_id(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `LPWCH GetEnvironmentStringsW(void)`. We hand back the same
+/// pointer as `GetEnvironmentStrings` (an empty UTF-16 block).
+fn stub_get_environment_strings_w(
+    _cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    if state.environment_strings_ptr != 0 {
+        return Ok(state.environment_strings_ptr);
+    }
+    // 4 bytes: two UTF-16 NULs (one to end the last entry, one to
+    // terminate the block).
+    let p = state.arena_const_alloc(4)?;
+    mmu.write_initializer(p, &[0, 0, 0, 0])
+        .map_err(|t| trap_to_win32("GetEnvironmentStringsW", t))?;
+    state.environment_strings_ptr = p;
+    Ok(p)
+}
+
+/// `int GetLocaleInfoA/W(LCID, LCTYPE, LPSTR/LPWSTR, int)`.
+/// Return 0 (= "no data") and let the CRT use the default locale.
+fn stub_get_locale_info_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `DWORD GetShortPathNameA(LPCSTR, LPSTR, DWORD)`. No filesystem
+/// is modelled — return 0 = "fail". The codec falls back to the
+/// long-path string.
+fn stub_get_short_path_name_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL GetStringTypeA/W(...)`. Return 1 = "success", with no
+/// type bits actually written. Some CRTs use this for is_alpha;
+/// the codec's decode body doesn't, so leaving the buffer
+/// untouched is benign.
+fn stub_get_string_type(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `UINT GetSystemDirectoryA(LPSTR lpBuffer, UINT uSize)`.
+/// Writes "C:\\WINDOWS\\System32" into `lpBuffer` and returns the
+/// length. Codecs use this to locate sibling DLLs; we don't
+/// actually load them, but the returned string keeps the codec's
+/// path-construction code happy.
+fn stub_get_system_directory_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
+    let size = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
+    let s = b"C:\\WINDOWS\\System32";
+    if buf == 0 || size == 0 {
+        return Ok(s.len() as u32 + 1);
+    }
+    let n = (size as usize).saturating_sub(1).min(s.len());
+    for (i, &b) in s.iter().take(n).enumerate() {
+        mmu.store8(buf + i as u32, b)
+            .map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
+    }
+    mmu.store8(buf + n as u32, 0)
+        .map_err(|t| trap_to_win32("GetSystemDirectoryA", t))?;
+    Ok(n as u32)
+}
+
+/// `BOOL GetVersionExA(LPOSVERSIONINFOA)`. Fills in a Windows 95
+/// shape: 4.00.0950, VER_PLATFORM_WIN32_WINDOWS = 1.
+///
+/// OSVERSIONINFOA layout (148 bytes):
+///   DWORD dwOSVersionInfoSize     (in)
+///   DWORD dwMajorVersion
+///   DWORD dwMinorVersion
+///   DWORD dwBuildNumber
+///   DWORD dwPlatformId
+///   CHAR  szCSDVersion[128]
+fn stub_get_version_ex_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetVersionExA", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    // Skip dwOSVersionInfoSize at offset 0 (caller-supplied).
+    mmu.store32(p + 4, 4)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMajorVersion
+    mmu.store32(p + 8, 0)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwMinorVersion
+    mmu.store32(p + 12, 950)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwBuildNumber
+    mmu.store32(p + 16, 1)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?; // dwPlatformId
+    // szCSDVersion: ""
+    mmu.store8(p + 20, 0)
+        .map_err(|t| trap_to_win32("GetVersionExA", t))?;
+    Ok(1)
+}
+
+/// `HGLOBAL GlobalHandle(LPCVOID pMem)`. Return the same pointer
+/// — our heap is single-flat-arena, so `pMem` and the "handle"
+/// are the same value.
+fn stub_global_handle(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalHandle", t))?;
+    Ok(p)
+}
+
+/// `HGLOBAL GlobalReAlloc(HGLOBAL hMem, SIZE_T dwBytes, UINT
+/// uFlags)`. Same shape as `HeapReAlloc` minus the `dwFlags`
+/// argument; reuse the heap re-alloc path.
+fn stub_global_realloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
+    let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
+    let _flags = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
+    if addr == 0 {
+        let new_addr = bump_alloc(state, n)?;
+        let buf = vec![0u8; n as usize];
+        mmu.write_initializer(new_addr, &buf)
+            .map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
+        state.heap.insert(new_addr, buf);
+        return Ok(new_addr);
+    }
+    let old = state
+        .heap
+        .remove(&addr)
+        .ok_or(Win32Error::InvalidHeapBlock {
+            stub: "GlobalReAlloc",
+            addr,
+        })?;
+    let new_addr = bump_alloc(state, n)?;
+    let mut buf = vec![0u8; n as usize];
+    let copy_n = old.len().min(n as usize);
+    buf[..copy_n].copy_from_slice(&old[..copy_n]);
+    mmu.write_initializer(new_addr, &buf)
+        .map_err(|t| trap_to_win32("GlobalReAlloc", t))?;
+    state.heap.insert(new_addr, buf);
+    Ok(new_addr)
+}
+
+/// `HANDLE HeapCreate(DWORD flOptions, SIZE_T dwInitialSize,
+/// SIZE_T dwMaximumSize)`. Hand back the global heap handle —
+/// codecs don't typically pin to a private heap.
+fn stub_heap_create(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(state.process_heap_handle)
+}
+
+/// `BOOL HeapDestroy(HANDLE)`. No-op success.
+fn stub_heap_destroy(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL IsBadCodePtr/IsBadReadPtr/IsBadWritePtr(...)`. Return 0
+/// (= "the pointer is fine"); we trust the codec to read/write
+/// only validly-mapped pages.
+fn stub_is_bad_ptr(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `int LCMapStringA/W(...)`. Return 0 = failure; CRTs fall back
+/// to byte-by-byte processing.
+fn stub_lc_map_string(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `HGLOBAL LoadResource(HMODULE hModule, HRSRC hResInfo)`. We
+/// have no resource table; return NULL.
+fn stub_load_resource(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `HLOCAL LocalHandle(LPCVOID pMem)`. Round-tripping a
+/// `LocalAlloc` pointer.
+fn stub_local_handle(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalHandle", t))?;
+    Ok(p)
+}
+
+/// `LPVOID LocalLock(HLOCAL)`. The handle IS the pointer for our
+/// heap arena. Real LocalLock is a no-op for fixed (= LMEM_FIXED)
+/// allocations, which the CRT defaults to.
+fn stub_local_lock(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalLock", t))?;
+    Ok(p)
+}
+
+/// `BOOL LocalUnlock(HLOCAL)`. No-op success.
+fn stub_local_unlock(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `LPVOID LockResource(HGLOBAL)`. We never returned a resource
+/// from `LoadResource`; return NULL.
+fn stub_lock_resource(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `LPVOID MapViewOfFile(...)`. Return NULL — CreateFileMappingA
+/// already returned NULL.
+fn stub_map_view_of_file(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `HANDLE OpenFileMappingA(...)`. Return NULL.
+fn stub_open_file_mapping_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)`.
+/// Synthesise a monotonically-increasing 64-bit tick by chaining
+/// `state.tick`.
+fn stub_query_performance_counter(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("QueryPerformanceCounter", t))?;
+    state.tick = state.tick.wrapping_add(1);
+    if p != 0 {
+        mmu.store32(p, state.tick)
+            .map_err(|t| trap_to_win32("QueryPerformanceCounter", t))?;
+        mmu.store32(p + 4, 0)
+            .map_err(|t| trap_to_win32("QueryPerformanceCounter", t))?;
+    }
+    Ok(1)
+}
+
+/// `BOOL QueryPerformanceFrequency(LARGE_INTEGER* lpFreq)`. We
+/// model 1 MHz (one tick per microsecond). The codec uses this as
+/// a divisor for elapsed-time calculations.
+fn stub_query_performance_frequency(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("QueryPerformanceFrequency", t))?;
+    if p != 0 {
+        mmu.store32(p, 1_000_000)
+            .map_err(|t| trap_to_win32("QueryPerformanceFrequency", t))?;
+        mmu.store32(p + 4, 0)
+            .map_err(|t| trap_to_win32("QueryPerformanceFrequency", t))?;
+    }
+    Ok(1)
+}
+
+/// `void RaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)`.
+/// Real Windows raises a structured exception that the codec's
+/// SEH handler may catch. We have no SEH unwinder; logging the
+/// event keeps the test diagnosable while the call returns.
+fn stub_raise_exception(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let code = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("RaiseException", t))?;
+    state
+        .debug_log
+        .push(format!("RaiseException code={code:#010x}"));
+    Ok(0)
+}
+
+/// `BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG)`. No-op success.
+fn stub_release_semaphore(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `DWORD SetFilePointer(...)`. We have no real file system;
+/// return INVALID_SET_FILE_POINTER (= 0xFFFFFFFF).
+fn stub_set_file_pointer(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xFFFF_FFFF)
+}
+
+/// `UINT SetHandleCount(UINT)`. Return the input (= "we honoured
+/// the request"). The CRT uses this to bump its FILE table size.
+fn stub_set_handle_count(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let n = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("SetHandleCount", t))?;
+    Ok(n)
+}
+
+/// `BOOL SetStdHandle(DWORD nStdHandle, HANDLE hHandle)`. No-op
+/// success.
+fn stub_set_std_handle(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(...)`.
+/// Return NULL (= "no previous filter installed"). We don't run
+/// the filter on a fault.
+fn stub_set_unhandled_exception_filter(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `void Sleep(DWORD)`. We're synchronous — drop the call.
+fn stub_sleep(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL TerminateProcess(HANDLE hProcess, UINT uExitCode)`.
+/// Mirror `ExitProcess` — set the exit-requested flag so the run
+/// loop returns cleanly.
+fn stub_terminate_process(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("TerminateProcess", t))?;
+    let code = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("TerminateProcess", t))?;
+    state.exit_requested = Some(code);
+    Ok(1)
+}
+
+/// `DWORD TlsAlloc(void)`. Return a synthetic TLS index. TLS in
+/// our single-threaded sandbox is just a key/value map keyed by
+/// index; we use small integers and store via the host state's
+/// debug-log channel for visibility.
+fn stub_tls_alloc(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // tick doubles as a monotonic counter for TLS index minting.
+    state.tick = state.tick.wrapping_add(1);
+    Ok(state.tick)
+}
+
+/// `BOOL TlsFree(DWORD)`. No-op success.
+fn stub_tls_free(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `LPVOID TlsGetValue(DWORD)`. Always returns NULL — codecs use
+/// this for per-thread caches we don't model.
+fn stub_tls_get_value(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL TlsSetValue(DWORD, LPVOID)`. No-op success.
+fn stub_tls_set_value(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL UnmapViewOfFile(LPCVOID)`. No-op success.
+fn stub_unmap_view_of_file(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `DWORD WaitForSingleObject(HANDLE, DWORD)`. Return
+/// `WAIT_OBJECT_0` (= 0) — the object is "signaled" immediately.
+/// Single-threaded sandbox: any wait succeeds without blocking.
+fn stub_wait_for_single_object(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `BOOL WritePrivateProfileStringA(...)`. No-op success — we
+/// have no INI files.
+fn stub_write_private_profile_string_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `int lstrlenA(LPCSTR)`. Real strlen on the guest pointer.
+fn stub_lstrlen_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("lstrlenA", t))?;
+    if p == 0 {
+        return Ok(0);
+    }
+    let mut n: u32 = 0;
+    while n < 0x10000 {
+        match mmu.load8(p + n) {
+            Ok(0) => break,
+            Ok(_) => n = n.wrapping_add(1),
+            Err(_) => break,
+        }
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
