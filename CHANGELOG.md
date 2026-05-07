@@ -87,7 +87,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no new stubs; round 5's coverage was sufficient for the full
   decode-call cycle to enter and exit cleanly.
   - **SPECGAP**: the `IV5PLAY` redistributable bundle in
-    `samples.oxideav.org/video/windows/IV5PLAY/` ships only the
+    `samples.oxideav.org/codecs/windows/IV5PLAY/` ships only the
     codec DLLs, no `.avi` payloads. Round 6 builds a synthetic
     IV31 keyframe whose 16-byte frame header + 48-byte bitstream
     header layout matches the public Indeo 3 spec mirrored in

@@ -16,7 +16,7 @@ DLL bytes via, in order:
    (default `target/test-fixture-cache/<NAME>`). Created on
    first successful HTTPS fetch.
 5. **HTTPS fetch** from
-   `https://samples.oxideav.org/video/windows/IV5PLAY/<NAME>`,
+   `https://samples.oxideav.org/codecs/windows/IV5PLAY/<NAME>`,
    then write to the cache.
 
 **Exception**: when `CI=true` the cache is bypassed in both
@@ -31,7 +31,7 @@ tests every build.
 
 The full Intel IV5 redistributable is at:
 
-* https://samples.oxideav.org/video/windows/IV5PLAY.EXE
+* https://samples.oxideav.org/codecs/windows/IV5PLAY.EXE
   *— the original Dell-bundled installer (R19770;
   https://www.dell.com/support/home/en-us/drivers/driversdetails?driverid=r19770).
   Self-extracting CAB archive containing every component below.
@@ -49,7 +49,7 @@ Individual DLLs (replace the trailing filename to access each):
 | `IACENC.DLL`  | Indeo Audio encoder | VfW/ACM | |
 | `NPINDEO.DLL` | Netscape plugin | NSAPI | Browser-side player; not used by oxideav-vfw |
 
-Base URL: `https://samples.oxideav.org/video/windows/IV5PLAY/`.
+Base URL: `https://samples.oxideav.org/codecs/windows/IV5PLAY/`.
 Each filename above is a path under that base.
 
 ## Test paths
