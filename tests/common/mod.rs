@@ -33,7 +33,7 @@ pub mod mov_extractor;
 
 /// Canonical HTTPS prefix for the Intel IV5 driver bundle.
 /// Each filename listed in `tests/README.md` is appended verbatim.
-const BASE_URL: &str = "https://samples.oxideav.org/video/windows/IV5PLAY";
+const BASE_URL: &str = "https://samples.oxideav.org/codecs/windows/IV5PLAY";
 
 /// Canonical HTTPS prefix for the FFmpeg samples corpus,
 /// indexed by FourCC. Used by round 7+ to fetch real-codec

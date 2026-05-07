@@ -509,7 +509,7 @@ fn build_synthetic_iv31_keyframe(frame_number: u32, width: u16, height: u16) -> 
 /// the codec accepts: width/height ≥ 16, multiple of 4).
 ///
 /// **SPECGAP**: the IV5 fixture bundle in
-/// `samples.oxideav.org/video/windows/IV5PLAY` ships only DLLs,
+/// `samples.oxideav.org/codecs/windows/IV5PLAY` ships only DLLs,
 /// not `.avi` payloads. Round 6 uses a *synthetic* IV31
 /// keyframe whose header layout matches Intel's published
 /// Indeo 3 wire format (mirrored at
