@@ -54,6 +54,59 @@ return-address sentinel without an unhandled trap. If a trap
 fires, the trap variant + EIP point at exactly which Win32 stub
 or ISA opcode round 2 needs to add.
 
+## Round 2 — staged Cinepak frame decode
+
+The round-2 integration test (`tests/m2_cinepak_decode.rs`) adds
+a `test-fixtures`-gated path that exercises the full
+`ICOpen` → `ICDecompressBegin` → `ICDecompress` →
+`ICDecompressEnd` → `ICClose` lifecycle on the real
+`iccvid.dll`. The test looks for two extra files alongside
+`iccvid.dll`:
+
+* `tests/fixtures/cinepak-32x32-1frame.cvid` — a single
+  encoded Cinepak frame (no AVI container, just the raw
+  compressed payload as it would appear inside a `00dc` AVI
+  chunk).
+* `tests/fixtures/cinepak-32x32-1frame.expected.rgb`
+  *(optional)* — the byte-exact decoded frame in 24-bit RGB,
+  bottom-up scanline order, 32 × 32 × 3 = 3072 bytes total.
+  When present the test asserts byte-equality.
+
+### Generating the encoded frame from an AVI
+
+`ffmpeg` ships with Cinepak encode support. To stage a 32×32
+single-frame fixture:
+
+```sh
+ffmpeg -f lavfi -i testsrc=size=32x32:duration=0.04:rate=25 \
+       -vcodec cinepak -frames:v 1 \
+       /tmp/test.avi
+# Extract the single 00dc chunk's payload (skip 4 bytes of fcc + 4
+# bytes of size, copy `size` bytes):
+python3 -c "
+import struct
+with open('/tmp/test.avi', 'rb') as f: b = f.read()
+i = b.find(b'00dc'); sz = struct.unpack('<I', b[i+4:i+8])[0]
+open('crates/oxideav-vfw/tests/fixtures/cinepak-32x32-1frame.cvid', 'wb').write(b[i+8:i+8+sz])
+"
+```
+
+### Generating the expected ground truth
+
+Decode the same frame with `ffmpeg`'s native Cinepak decoder
+(separate from our DLL-driven pipeline) to get a byte-exact
+reference:
+
+```sh
+ffmpeg -i /tmp/test.avi -vframes 1 -f rawvideo -pix_fmt bgr24 \
+       crates/oxideav-vfw/tests/fixtures/cinepak-32x32-1frame.expected.rgb
+```
+
+(Note: `BITMAPINFOHEADER` says BI_RGB is BGR-byte-order on disk;
+our `bit_count = 24` output reflects that. If you store the
+ground truth as RGB instead of BGR, the byte-equality assertion
+will of course fail.)
+
 ## Other supported fixtures
 
 Round-1 also tries `tests/fixtures/ir50_32.dll` (Indeo 5) if

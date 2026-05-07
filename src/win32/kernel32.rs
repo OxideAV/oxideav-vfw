@@ -101,6 +101,7 @@ fn stub_get_process_heap(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     Ok(state.process_heap_handle)
 }
@@ -108,7 +109,12 @@ fn stub_get_process_heap(
 const HEAP_ZERO_MEMORY: u32 = 0x0000_0008;
 
 /// `LPVOID HeapAlloc(HANDLE, DWORD dwFlags, SIZE_T dwBytes)`.
-fn stub_heap_alloc(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> Result<u32, Win32Error> {
+fn stub_heap_alloc(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
     let _h_heap = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapAlloc", t))?;
     let flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapAlloc", t))?;
     let n = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("HeapAlloc", t))?;
@@ -129,7 +135,12 @@ fn stub_heap_alloc(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> Resul
 }
 
 /// `BOOL HeapFree(HANDLE, DWORD dwFlags, LPVOID lpMem)`.
-fn stub_heap_free(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> Result<u32, Win32Error> {
+fn stub_heap_free(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapFree", t))?;
     let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapFree", t))?;
     let addr = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("HeapFree", t))?;
@@ -151,6 +162,7 @@ fn stub_heap_realloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapReAlloc", t))?;
     let flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapReAlloc", t))?;
@@ -159,7 +171,7 @@ fn stub_heap_realloc(
     if addr == 0 {
         // MSDN: passing NULL for lpMem is undefined; we choose to
         // treat as fresh alloc for resilience.
-        return stub_heap_alloc(cpu, mmu, state);
+        return stub_heap_alloc(cpu, mmu, state, _registry);
     }
     let old = state
         .heap
@@ -219,6 +231,7 @@ fn stub_local_alloc(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let flags = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalAlloc", t))?;
     let n = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("LocalAlloc", t))?;
@@ -236,7 +249,12 @@ fn stub_local_alloc(
 }
 
 /// `HLOCAL LocalFree(HLOCAL hMem)`.
-fn stub_local_free(cpu: &mut Cpu, mmu: &mut Mmu, state: &mut HostState) -> Result<u32, Win32Error> {
+fn stub_local_free(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
     let addr = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LocalFree", t))?;
     if addr == 0 {
         return Ok(0);
@@ -260,6 +278,7 @@ fn stub_output_debug_string_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("OutputDebugStringA", t))?;
     let s = read_cstr(mmu, p, 4096)?;
@@ -274,6 +293,7 @@ fn stub_get_tick_count(
     _cpu: &mut Cpu,
     _mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     Ok(state.tick)
@@ -286,6 +306,7 @@ fn stub_interlocked_increment(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedIncrement", t))?;
     let v = mmu
@@ -302,6 +323,7 @@ fn stub_interlocked_decrement(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("InterlockedDecrement", t))?;
     let v = mmu
@@ -324,6 +346,7 @@ fn stub_load_library_a(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let p = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("LoadLibraryA", t))?;
     let name = read_cstr(mmu, p, 260)?.to_ascii_lowercase();
@@ -346,6 +369,7 @@ fn stub_get_proc_address(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
     _state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
     let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProcAddress", t))?;
     let name_p = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProcAddress", t))?;

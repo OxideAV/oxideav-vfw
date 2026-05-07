@@ -4,18 +4,16 @@
 //! integration tests + future codec wrapper layers drive.
 //!
 //! This is the highest-level public entry point in the crate.
-//! Round-1 only exposes [`Sandbox::load`] + [`Sandbox::call_dll_main`];
-//! round-2 will add the VfW `DriverProc` invocation pipeline on
-//! top.
+//! Round-1 exposed [`Sandbox::load`] + [`Sandbox::call_dll_main`];
+//! round-2 adds the generic [`Sandbox::call_export`] helper that
+//! the `vfw32` host stubs use to invoke the codec's `DriverProc`
+//! synchronously.
 
-use crate::emulator::{
-    isa_int::{StepOk, RET_SENTINEL},
-    mmu::Perm,
-    regs::Reg32,
-    Cpu, Mmu,
-};
+use crate::emulator::{mmu::Perm, Cpu, Mmu};
 use crate::pe::{Image, Loader};
-use crate::win32::{dispatch_stub, HostState, Registry};
+use crate::win32::{
+    call_guest, run_until_sentinel as run_until_sentinel_free, vfw32, HostState, Registry,
+};
 
 /// `DllMain` reason code: process is loading the DLL.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
@@ -96,42 +94,188 @@ impl Sandbox {
     pub fn call_dll_main(&mut self, image: &Image, reason: u32) -> Result<u32, crate::Error> {
         let h_module = image.image_base;
         let lpv_reserved = 0u32;
-        // Push args right-to-left.
-        self.cpu.push32(&mut self.mmu, lpv_reserved)?;
-        self.cpu.push32(&mut self.mmu, reason)?;
-        self.cpu.push32(&mut self.mmu, h_module)?;
-        // Saved return address.
-        self.cpu.push32(&mut self.mmu, RET_SENTINEL)?;
-        self.cpu.regs.eip = image.entry_point;
-        self.run_until_sentinel()?;
-        Ok(self.cpu.regs.get32(Reg32::Eax))
+        self.call_export(image, "DllMain", &[h_module, reason, lpv_reserved])
+    }
+
+    /// Generic stdcall guest-call helper. Resolves `name` against
+    /// `image`'s export table, pushes `args` right-to-left + the
+    /// `RET_SENTINEL`, and runs until the callee returns.
+    /// Returns `eax`.
+    ///
+    /// Used both internally (by [`Self::call_dll_main`]) and by
+    /// future codec adapter layers that need to drive arbitrary
+    /// codec exports — `DriverProc`, `MyCodecGetVersion`,
+    /// `MyCodecExtraInit`, etc. The round-2 `vfw32::ic_*` host
+    /// surface uses [`crate::win32::call_guest`] directly with
+    /// the codec's `DriverProc` VA.
+    pub fn call_export(
+        &mut self,
+        image: &Image,
+        name: &str,
+        args: &[u32],
+    ) -> Result<u32, crate::Error> {
+        let target = image.export(name).ok_or_else(|| {
+            crate::Error::Win32(crate::win32::Win32Error::InvalidArgument {
+                stub: "call_export",
+                reason: format!("export {name:?} not found in {:?}", image.name),
+            })
+        })?;
+        call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            target,
+            args,
+        )
     }
 
     /// Drive the CPU until `eip == RET_SENTINEL`, dispatching to
     /// Win32 stubs whenever `eip` lands on a registered thunk
-    /// address.
+    /// address. Thin wrapper over [`crate::win32::run_until_sentinel`]
+    /// kept for API stability.
     pub fn run_until_sentinel(&mut self) -> Result<(), crate::Error> {
-        loop {
-            if self.cpu.regs.eip == RET_SENTINEL {
-                return Ok(());
-            }
-            // Did we land on a Win32 stub thunk? If so, dispatch
-            // and continue.
-            if self.registry.is_thunk(self.cpu.regs.eip) {
-                dispatch_stub(&mut self.cpu, &mut self.mmu, &self.registry, &mut self.host)?;
-                continue;
-            }
-            match self.cpu.step(&mut self.mmu)? {
-                StepOk::Continued => continue,
-                StepOk::Halted => return Ok(()),
-            }
-        }
+        run_until_sentinel_free(&mut self.cpu, &mut self.mmu, &self.registry, &mut self.host)
+    }
+
+    // ---- vfw32 IC* convenience wrappers ------------------------------
+
+    /// Mark `image` as the codec the next [`Self::ic_open`] call
+    /// should target.
+    ///
+    /// Round 2 supports a single codec image per sandbox — round 3
+    /// will lift that into a multi-codec registry. The image must
+    /// export `DriverProc`.
+    pub fn install_codec(&mut self, image: &Image) -> Result<(), crate::Error> {
+        let dp = image.export("DriverProc").ok_or_else(|| {
+            crate::Error::Win32(crate::win32::Win32Error::InvalidArgument {
+                stub: "install_codec",
+                reason: format!("DriverProc not exported by {:?}", image.name),
+            })
+        })?;
+        self.host.default_driver_proc = dp;
+        Ok(())
+    }
+
+    /// Open the installed codec (`DRV_OPEN`).
+    pub fn ic_open(
+        &mut self,
+        fcc_type: u32,
+        fcc_handler: u32,
+        mode: u32,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_open(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            fcc_type,
+            fcc_handler,
+            mode,
+        )
+    }
+
+    /// Close a codec instance (`DRV_CLOSE`).
+    pub fn ic_close(&mut self, hic: u32) -> Result<u32, crate::Error> {
+        vfw32::ic_close(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+        )
+    }
+
+    /// Read the codec's `ICINFO` block.
+    pub fn ic_get_info(&mut self, hic: u32, cb: u32) -> Result<Vec<u8>, crate::Error> {
+        vfw32::ic_get_info(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            cb,
+        )
+    }
+
+    /// `ICDecompressQuery` — does the codec accept this format?
+    pub fn ic_decompress_query(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+        output: Option<&vfw32::Bih>,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_decompress_query(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+            output,
+        )
+    }
+
+    /// `ICDecompressBegin` — set up the decoder pipeline.
+    pub fn ic_decompress_begin(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+        output: &vfw32::Bih,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_decompress_begin(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+            output,
+        )
+    }
+
+    /// `ICDecompressEnd` — tear down the decoder pipeline.
+    pub fn ic_decompress_end(&mut self, hic: u32) -> Result<u32, crate::Error> {
+        vfw32::ic_decompress_end(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+        )
+    }
+
+    /// `ICDecompress` — decode one frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ic_decompress(
+        &mut self,
+        hic: u32,
+        flags: u32,
+        input_bih: &vfw32::Bih,
+        input_bytes: &[u8],
+        output_bih: &vfw32::Bih,
+        output_capacity: u32,
+    ) -> Result<(u32, Vec<u8>), crate::Error> {
+        vfw32::ic_decompress(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            flags,
+            input_bih,
+            input_bytes,
+            output_bih,
+            output_capacity,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emulator::isa_int::RET_SENTINEL;
+    use crate::emulator::regs::Reg32;
     use crate::pe::test_image::build_minimal_dll;
 
     #[test]

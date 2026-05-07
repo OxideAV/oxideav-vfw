@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use crate::emulator::{Cpu, Mmu};
 
 pub mod kernel32;
+pub mod vfw32;
 
 /// First synthetic thunk address. Chosen well above any plausible
 /// `ImageBase + section.VirtualAddress` so it cannot be mistaken
@@ -40,7 +41,12 @@ const THUNK_STRIDE: u32 = 16;
 /// [`Cpu`] / [`Mmu`] handles. The runtime takes care of popping
 /// `arg_dwords * 4` bytes from the guest stack after the stub
 /// returns (stdcall callee-cleanup).
-pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState) -> Result<u32, Win32Error>;
+///
+/// `&Registry` is passed so a stub can re-enter the run-loop to
+/// call back into the guest (used by the round-2 `vfw32` stub
+/// surface, which has to dispatch the codec DLL's `DriverProc`
+/// before returning to the IAT caller).
+pub type StubFn = fn(&mut Cpu, &mut Mmu, &mut HostState, &Registry) -> Result<u32, Win32Error>;
 
 /// Information stored alongside each stub.
 #[derive(Clone)]
@@ -86,6 +92,24 @@ impl core::fmt::Display for Win32Error {
     }
 }
 
+/// One entry in the open-codec table — a "Handle to Installable
+/// Compressor" in MSDN's vfw32 vocabulary.
+#[derive(Debug, Clone)]
+pub struct HicEntry {
+    /// 4-byte fcc type ('VIDC' for video).
+    pub fcc_type: u32,
+    /// 4-byte fcc handler ('cvid' for Cinepak, 'IV50' for Indeo 5).
+    pub fcc_handler: u32,
+    /// Open mode (1 = ICMODE_DECOMPRESS, 2 = ICMODE_COMPRESS, …).
+    pub mode: u32,
+    /// VA of the codec DLL's `DriverProc` export (the entry point
+    /// that every IC* call dispatches into).
+    pub driver_proc_va: u32,
+    /// `dwDriverId` to pass back to `DriverProc` on every call —
+    /// the value `DriverProc(_, _, DRV_OPEN, _, _)` returned.
+    pub driver_id: u32,
+}
+
 /// The host-side state every stub may read or mutate.
 ///
 /// This is the "operating system" of the sandbox — the heap, the
@@ -110,6 +134,18 @@ pub struct HostState {
     /// Lines that the codec wrote to `OutputDebugString*`. Tests
     /// can introspect to confirm a known string was emitted.
     pub debug_log: Vec<String>,
+    /// Open codec handles. Synthesised inside the host (no codec
+    /// guest memory is consumed); each handle is a small integer
+    /// the codec sees as an `HIC`.
+    pub hics: BTreeMap<u32, HicEntry>,
+    /// Counter for the next synthetic HIC. Starts at 1; 0 means
+    /// "open failed".
+    pub next_hic: u32,
+    /// Default `DriverProc` VA used when a host caller invokes an
+    /// `IC*` stub but has not staged a real codec image (i.e. for
+    /// the no-fixture unit tests). Set to 0 when no codec is
+    /// loaded — `ICOpen` then refuses to mint a HIC.
+    pub default_driver_proc: u32,
 }
 
 impl HostState {
@@ -126,7 +162,43 @@ impl HostState {
             heap: BTreeMap::new(),
             modules: BTreeMap::new(),
             debug_log: Vec::new(),
+            hics: BTreeMap::new(),
+            next_hic: 1,
+            default_driver_proc: 0,
         }
+    }
+
+    /// Allocate a fresh slab in the heap arena and return its
+    /// guest address. Used by the round-2 marshalling helpers to
+    /// stage `ICDECOMPRESS` / `BITMAPINFOHEADER` / raw-frame
+    /// buffers in guest memory before calling `DriverProc`.
+    pub fn arena_alloc(&mut self, n: u32) -> Result<u32, Win32Error> {
+        let aligned = n
+            .checked_add(15)
+            .map(|v| v & !15u32)
+            .ok_or(Win32Error::InvalidArgument {
+                stub: "arena_alloc",
+                reason: "size overflow".into(),
+            })?;
+        let addr = self.heap_cursor;
+        let next = addr
+            .checked_add(aligned)
+            .ok_or(Win32Error::InvalidArgument {
+                stub: "arena_alloc",
+                reason: "heap address-space overflow".into(),
+            })?;
+        if next > self.heap_arena_end {
+            return Err(Win32Error::InvalidArgument {
+                stub: "arena_alloc",
+                reason: format!(
+                    "arena exhausted (need {n}, have {})",
+                    self.heap_arena_end - addr
+                ),
+            });
+        }
+        self.heap_cursor = next;
+        self.heap.insert(addr, vec![0u8; n as usize]);
+        Ok(addr)
     }
 }
 
@@ -231,7 +303,7 @@ pub fn dispatch_stub(
         })?
         .clone();
     // Run the host-side stub.
-    let ret = (entry.func)(cpu, mmu, state)?;
+    let ret = (entry.func)(cpu, mmu, state, registry)?;
     // stdcall: pop return address, advance esp by arg_dwords*4,
     // set eax to the return value.
     let ret_addr = cpu.pop32(mmu)?;
@@ -245,12 +317,77 @@ pub fn dispatch_stub(
     Ok(())
 }
 
+/// Run the emulator until `eip == RET_SENTINEL`, dispatching to
+/// any Win32 stub thunk addresses encountered along the way.
+///
+/// This is the shared run-loop body used both by [`crate::Sandbox`]
+/// and by re-entrant host stubs (notably the `vfw32` surface,
+/// which dispatches the codec's `DriverProc` synchronously
+/// inside an outer `IC*` call).
+pub fn run_until_sentinel(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+) -> Result<(), crate::Error> {
+    use crate::emulator::isa_int::{StepOk, RET_SENTINEL};
+    loop {
+        if cpu.regs.eip == RET_SENTINEL {
+            return Ok(());
+        }
+        if registry.is_thunk(cpu.regs.eip) {
+            dispatch_stub(cpu, mmu, registry, state)?;
+            continue;
+        }
+        match cpu.step(mmu)? {
+            StepOk::Continued => continue,
+            StepOk::Halted => return Ok(()),
+        }
+    }
+}
+
+/// Push args right-to-left, push the synthetic `RET_SENTINEL`,
+/// jump to `target_va`, run the emulator until it returns,
+/// and report the final `eax` value.
+///
+/// This is the building block both `Sandbox::call_dll_main`
+/// and the round-2 `vfw32` stub surface use to invoke an
+/// exported guest function with stdcall calling convention.
+/// On entry, `cpu.regs.eip` may be anything; on exit it is
+/// the popped return address (= `RET_SENTINEL`). Caller-saved
+/// registers are not preserved beyond what the guest callee
+/// preserves itself.
+pub fn call_guest(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    target_va: u32,
+    args: &[u32],
+) -> Result<u32, crate::Error> {
+    use crate::emulator::isa_int::RET_SENTINEL;
+    use crate::emulator::regs::Reg32;
+    // Push args right-to-left.
+    for a in args.iter().rev() {
+        cpu.push32(mmu, *a)?;
+    }
+    cpu.push32(mmu, RET_SENTINEL)?;
+    cpu.regs.eip = target_va;
+    run_until_sentinel(cpu, mmu, registry, state)?;
+    Ok(cpu.regs.get32(Reg32::Eax))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::emulator::{mmu::Perm, Mmu};
 
-    fn dummy_stub(_cpu: &mut Cpu, _mmu: &mut Mmu, _h: &mut HostState) -> Result<u32, Win32Error> {
+    fn dummy_stub(
+        _cpu: &mut Cpu,
+        _mmu: &mut Mmu,
+        _h: &mut HostState,
+        _r: &Registry,
+    ) -> Result<u32, Win32Error> {
         Ok(0xCAFE)
     }
 

@@ -2,8 +2,7 @@
 //! host. Lets oxideav delegate decoding (and eventually encoding)
 //! to legitimately-licensed Windows codec DLLs on any platform.
 //!
-//! **Round 1 — "Load + DllMain + clean exit".** The crate now
-//! ships:
+//! **Round 1 — "Load + DllMain + clean exit".** The crate ships:
 //!
 //! * [`emulator::mmu`] — flat 4 GiB virtual address space, sparse
 //!   4 KiB pages with R/W/X permission bits.
@@ -19,6 +18,22 @@
 //!   `OutputDebugStringA` / `GetTickCount` /
 //!   `InterlockedIncrement` / `InterlockedDecrement` /
 //!   `LoadLibraryA` / `GetProcAddress`.
+//!
+//! **Round 2 — "Decode one Cinepak frame".** Adds:
+//!
+//! * [`Sandbox::call_export`] — generic stdcall guest-call helper.
+//! * [`win32::vfw32`] — `BITMAPINFOHEADER` marshalling, `ICDECOMPRESS`
+//!   layout, and the `IC*` host surface (`ICOpen`, `ICClose`,
+//!   `ICGetInfo`, `ICDecompressBegin`, `ICDecompressQuery`,
+//!   `ICDecompress`, `ICDecompressEnd`) that drives the codec
+//!   DLL's `DriverProc` end-to-end.
+//! * [`Sandbox::install_codec`] / [`Sandbox::ic_open`] etc — the
+//!   ergonomic Rust-side wrappers the integration test uses.
+//!
+//! MMX is deliberately **deferred** to round 3: Cinepak does not
+//! use it, and our test corpus first targets Cinepak. Indeo 5
+//! (`ir50_32.dll`) and most later codecs do, so MMX lands when
+//! the test corpus expands.
 //!
 //! Modern codecs (H.264 / HEVC / AV1 / Opus / AAC / …) are decoded
 //! natively elsewhere in the workspace; this crate exists for
@@ -37,6 +52,24 @@ pub mod runtime;
 pub mod win32;
 
 pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
+pub use win32::vfw32::Bih;
+
+/// Sibling registration entry point. Round 2 is a no-op — the
+/// `oxideav-core` `RuntimeContext` does not yet have a "register
+/// codec discovery for opaque guest DLLs" hook, and the codec-id
+/// story for VfW-loaded modules will land in round 3 (one
+/// `CodecImplementation` per loaded DLL with a generic
+/// `vfw_<fcc>` codec_id).
+///
+/// Today this exists purely so `oxideav-meta` can wire the crate
+/// into the umbrella registration cascade without a special case.
+#[cfg(feature = "registry")]
+pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {
+    // Round-2 placeholder — see module doc for round-3 plans.
+}
+
+#[cfg(feature = "registry")]
+oxideav_core::register!("oxideav-vfw", register);
 
 /// Crate-local error type. Each layer (MMU / decoder / executor /
 /// PE loader / Win32 stub) has its own variant; sublayers nest
