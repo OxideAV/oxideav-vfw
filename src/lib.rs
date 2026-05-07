@@ -30,10 +30,26 @@
 //! * [`Sandbox::install_codec`] / [`Sandbox::ic_open`] etc — the
 //!   ergonomic Rust-side wrappers the integration test uses.
 //!
-//! MMX is deliberately **deferred** to round 3: Cinepak does not
-//! use it, and our test corpus first targets Cinepak. Indeo 5
-//! (`ir50_32.dll`) and most later codecs do, so MMX lands when
-//! the test corpus expands.
+//! **Round 3 — "Real-codec smoke against IR32_32.DLL".** Adds:
+//!
+//! * `tests/common/mod.rs` — fixture-discovery helper:
+//!   `OXIDEAV_VFW_FIXTURE_DIR` env var → Wine prefix → Windows
+//!   system32 → on-disk cache → HTTPS fetch from
+//!   `samples.oxideav.org`. CI=true bypasses the cache.
+//! * `tests/m1_load_dll_main.rs::staged_codec_dll_lists_round_four_todo_imports`
+//!   — fetches Intel's published Indeo 3 DLL and asserts the
+//!   exact set of 49 Win32 imports (gdi32 / user32 / winmm + 24
+//!   extra kernel32) the round-1+2 stub registry does not yet
+//!   satisfy. That set is round 4's deliverable.
+//! * `tests/m2_indeo3_driverproc.rs` — synthetic-codec walkthrough
+//!   coverage retained; plus a forward-compatible Indeo 3
+//!   `DllMain → ICOpen → ICGetInfo → ICClose` walkthrough that
+//!   activates once round 4 closes the import gaps.
+//!
+//! MMX is deliberately **deferred** to round 5+: Indeo 3 is
+//! pre-MMX, so it stays unblocked. Indeo 5 (`ir50_32.dll`) and
+//! most later codecs use MMX, so MMX support lands when the test
+//! corpus expands to one of those.
 //!
 //! Modern codecs (H.264 / HEVC / AV1 / Opus / AAC / …) are decoded
 //! natively elsewhere in the workspace; this crate exists for
@@ -54,18 +70,18 @@ pub mod win32;
 pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
 pub use win32::vfw32::Bih;
 
-/// Sibling registration entry point. Round 2 is a no-op — the
+/// Sibling registration entry point. Currently a no-op — the
 /// `oxideav-core` `RuntimeContext` does not yet have a "register
 /// codec discovery for opaque guest DLLs" hook, and the codec-id
-/// story for VfW-loaded modules will land in round 3 (one
-/// `CodecImplementation` per loaded DLL with a generic
-/// `vfw_<fcc>` codec_id).
+/// story for VfW-loaded modules waits for the loader to clear
+/// the round-4 import-stub gap before any `CodecImplementation`
+/// can be advertised (one `vfw_<fcc>` entry per loaded DLL).
 ///
 /// Today this exists purely so `oxideav-meta` can wire the crate
 /// into the umbrella registration cascade without a special case.
 #[cfg(feature = "registry")]
 pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {
-    // Round-2 placeholder — see module doc for round-3 plans.
+    // Placeholder — see module-level doc for the milestone plan.
 }
 
 #[cfg(feature = "registry")]

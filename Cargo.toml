@@ -15,12 +15,12 @@ categories = ["multimedia::encoding", "multimedia::video", "emulators"]
 [features]
 default = ["registry"]
 registry = ["dep:oxideav-core"]
-# When enabled, end-to-end tests look for staged codec DLLs under
-# tests/fixtures/. The DLLs are NOT committed to git — see tests/README.md
-# for legitimate sources (K-Lite codec pack, Microsoft Windows
-# redistributables, QuickTime installers, etc.). With the feature off
-# the e2e tests silently skip so CI is not blocked on fixture presence.
-test-fixtures = []
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Used by tests/common/mod.rs to fetch codec DLL fixtures on
+# demand from samples.oxideav.org. Dev-dep only, so the
+# production crate's dependency tree is unaffected.
+ureq = { version = "2", default-features = false, features = ["tls"] }

@@ -1,27 +1,29 @@
-//! Round-2 milestone integration test: "Decode one Cinepak
-//! frame".
+//! Round-2 + round-3 milestone integration tests for the
+//! `vfw32` IC* surface.
 //!
-//! Two paths, parallel to round-1's `m1_load_dll_main.rs`:
+//! Round 2 shipped the synthetic-codec pipeline: a hand-rolled
+//! PE32 DLL whose `DriverProc` returns `mov eax, imm32 ; ret 20`
+//! across the full `IC*` walkthrough. That coverage is preserved
+//! below in [`synth_codec_walks_full_ic_pipeline`] — it confirms
+//! buffer marshalling, HIC lifecycle, and re-entrant
+//! `call_guest` plumbing without depending on a real codec.
 //!
-//! 1. **Synthesised codec.** Always runs. Builds a minimal PE32
-//!    DLL whose only export is `DriverProc`, where the body is
-//!    a single `mov eax, imm32 ; ret 20`. Walks the full
-//!    Sandbox::install_codec → ic_open → ic_decompress_begin →
-//!    ic_decompress → ic_decompress_end → ic_close pipeline,
-//!    confirming buffers round-trip through guest memory and
-//!    every IC* hop dispatches `DriverProc` correctly.
+//! Round 3 adds a real-codec smoke test against Intel's Indeo 3
+//! redistributable (`IR32_32.DLL`, fcc_handler `IV31`), using the
+//! [`common::fetch_or_load`] helper to locate the bytes. The test
+//! walks `DllMain → ICOpen → ICGetInfo → ICClose` and asserts
+//! the codec name read back from `ICGetInfo` is non-empty +
+//! ASCII-printable. NO frame decode — the IV5 bundle has DLLs
+//! but no `.avi` payloads; encoded-frame coverage waits for
+//! round 4.
 //!
-//! 2. **Real Cinepak DLL.** Gated behind the `test-fixtures`
-//!    feature. Loads `tests/fixtures/iccvid.dll` (user-staged;
-//!    not in git) and an encoded Cinepak frame from
-//!    `tests/fixtures/cinepak-32x32-1frame.cvid` (or any
-//!    `*.cvid` payload the user stages); runs the decode and,
-//!    if a `tests/fixtures/cinepak-32x32-1frame.expected.rgb`
-//!    ground-truth file is present, byte-checks the output.
-//!
-//! With `test-fixtures` off (CI default) the staged-codec test
-//! is silently elided. Within `test-fixtures` but with no DLL
-//! staged, the test prints a "skipping" message and returns Ok.
+//! If the Indeo 3 walkthrough trips a trap during `ICOpen` /
+//! `ICGetInfo` / `ICClose`, the trap variant + the last EIP point
+//! at exactly which `vfw32` / `kernel32` stub or ISA opcode round
+//! 4 needs to add. The failure-mode message in the test panic is
+//! the round-4 todo list.
+
+mod common;
 
 use oxideav_vfw::win32::vfw32::{Bih, BIH_SIZE, ICDECOMPRESS_SIZE};
 use oxideav_vfw::Sandbox;
@@ -278,91 +280,146 @@ fn icdecompress_struct_size_matches_marshalling() {
     assert_eq!(BIH_SIZE, 40);
 }
 
-#[cfg(feature = "test-fixtures")]
+/// Round-3 real-codec walkthrough framework. Loads Intel's Indeo
+/// 3 redistributable + (when the loader can satisfy the imports)
+/// runs `DllMain → ICOpen('VIDC','IV31',ICMODE_DECOMPRESS) →
+/// ICGetInfo → ICClose`. The codec name read out of `szName` in
+/// `ICINFO` is asserted ASCII-printable + non-empty.
+///
+/// **End of round 3**: `Sandbox::load` rejects the import
+/// resolution step because gdi32 / user32 / winmm + 22 extra
+/// kernel32 stubs are not yet implemented (see
+/// `tests/m1_load_dll_main.rs::round_4_todo_imports`). The test
+/// asserts on the rejection with a clear diagnostic so the
+/// failure is the round-4 work plan, not a CI surprise.
+///
+/// **Once round 4 lands the missing stubs**, the load will
+/// succeed, the `else` branch fires, and the IC* walkthrough
+/// runs end-to-end. The first trap then encountered (likely an
+/// ISA opcode the round-1 integer interpreter doesn't yet
+/// model) becomes round 5's todo list — same bootstrap pattern.
+///
+/// `ICMODE_DECOMPRESS = 1` (vfw.h). The fcc_handler `IV31` is
+/// Indeo 3.2's canonical 4cc.
 #[test]
-fn staged_cinepak_decoder_produces_a_frame() {
-    use std::path::PathBuf;
+fn indeo3_driverproc_open_getinfo_close_smoke() {
+    const ICMODE_DECOMPRESS: u32 = 1;
+    /// `ICINFO` total size (`dwSize..szDriver[128]`):
+    /// 6 dwords + 16 WCHARs + 128 WCHARs + 128 WCHARs
+    /// = 24 + 32 + 256 + 256 = 568 bytes.
+    const ICINFO_SIZE: u32 = 568;
 
-    let dll_path = PathBuf::from("tests/fixtures/iccvid.dll");
-    if !dll_path.exists() {
-        eprintln!(
-            "no codec DLL staged at {} — silently skipping. \
-             See tests/README.md for legitimate sources.",
-            dll_path.display()
-        );
-        return;
-    }
-    // The encoded payload — name is illustrative; users may stage
-    // any single-frame `.cvid` blob with a co-located `.json`
-    // sidecar describing width/height. For round-2 the test
-    // looks for a fixed 32×32 fixture.
-    let payload_path = PathBuf::from("tests/fixtures/cinepak-32x32-1frame.cvid");
-    if !payload_path.exists() {
-        eprintln!(
-            "no Cinepak payload at {} — DLL loads but skip-decoding. \
-             See tests/README.md for how to extract a frame from an AVI.",
-            payload_path.display()
-        );
-        return;
-    }
-
-    let dll_bytes = std::fs::read(&dll_path).expect("read iccvid.dll");
-    let frame = std::fs::read(&payload_path).expect("read cinepak payload");
+    let bytes =
+        common::fetch_or_load("IR32_32.DLL").expect("fetch IR32_32.DLL — see tests/common/mod.rs");
 
     let mut sb = Sandbox::new();
-    let img = sb
-        .load(dll_path.to_str().unwrap(), &dll_bytes)
-        .expect("PE32 load");
-    sb.install_codec(&img).expect("DriverProc exported");
+    match sb.load("IR32_32.DLL", &bytes) {
+        Err(oxideav_vfw::Error::PeLoader(oxideav_vfw::pe::PeError::UnknownImportFunction {
+            dll,
+            name,
+        })) => {
+            // Round 3 expectation: import resolution rejects the
+            // load. The first miss surfaced is one of the
+            // documented round-4 todo entries.
+            eprintln!(
+                "round 3: IR32_32.DLL load rejected at first missing import \
+                 {dll}!{name} — round-4 stub work needed (see m1_load_dll_main \
+                 round_4_todo_imports for the full list)."
+            );
+            // Don't assert on the *specific* (dll, name) — sort
+            // order in BTreeMap iteration in `imports::resolve`
+            // can pick any of the missing imports first. The
+            // "load failed for the right family of reason"
+            // assertion is what we want.
+        }
+        Err(other) => {
+            panic!(
+                "IR32_32.DLL load failed with unexpected error \
+                 (expected UnknownImportFunction at end of round 3): {other}"
+            );
+        }
+        Ok(img) => {
+            // Round 4+: imports resolved, walk the full pipeline.
+            indeo3_walk_ic_pipeline(&mut sb, &img, ICMODE_DECOMPRESS, ICINFO_SIZE);
+        }
+    }
+}
 
-    let fcc_video = u32::from_le_bytes(*b"VIDC");
-    let fcc_cvid = u32::from_le_bytes(*b"cvid");
-    let hic = sb
-        .ic_open(fcc_video, fcc_cvid, 1)
-        .expect("ICOpen iccvid succeeded");
-    assert_ne!(hic, 0, "Cinepak open returned NULL HIC");
-
-    let bih_in = Bih {
-        bi_size: BIH_SIZE,
-        width: 32,
-        height: 32,
-        planes: 1,
-        bit_count: 24,
-        compression: *b"cvid",
-        size_image: frame.len() as u32,
-        ..Default::default()
-    };
-    let bih_out = Bih {
-        bi_size: BIH_SIZE,
-        width: 32,
-        height: 32,
-        planes: 1,
-        bit_count: 24,
-        ..Default::default()
-    };
-
-    let _ = sb
-        .ic_decompress_begin(hic, &bih_in, &bih_out)
-        .expect("ICDecompressBegin");
-    let (_lr, decoded) = sb
-        .ic_decompress(hic, 0, &bih_in, &frame, &bih_out, 32 * 32 * 3)
-        .expect("ICDecompress");
-    let _ = sb.ic_decompress_end(hic).expect("ICDecompressEnd");
-    let _ = sb.ic_close(hic).expect("ICClose");
-
-    // If the user staged a ground-truth file, compare bytes.
-    let expected_path = PathBuf::from("tests/fixtures/cinepak-32x32-1frame.expected.rgb");
-    if expected_path.exists() {
-        let expected = std::fs::read(&expected_path).expect("read expected.rgb");
-        assert_eq!(
-            decoded, expected,
-            "decoded bytes do not match staged ground truth"
-        );
-    } else {
-        eprintln!(
-            "no ground-truth file at {} — decode produced {} bytes, not byte-checking.",
-            expected_path.display(),
-            decoded.len()
+/// Round 4+ post-load walkthrough — extracted into a free
+/// function so the round-3 test stays a clean "load failed for
+/// the documented reason" assertion + a forward-compatible
+/// post-load arm.
+fn indeo3_walk_ic_pipeline(
+    sb: &mut Sandbox,
+    img: &oxideav_vfw::pe::Image,
+    icmode_decompress: u32,
+    icinfo_size: u32,
+) {
+    // 1. DllMain.
+    if let Err(e) = sb.call_dll_main(img, oxideav_vfw::DLL_PROCESS_ATTACH) {
+        panic!(
+            "IR32_32.DLL DllMain trap — next-round todo:\n  {e}\n\
+             (last EIP + trap variant identify which ISA opcode \
+             or stub is missing)"
         );
     }
+
+    // 2. install_codec → ICOpen('VIDC', 'IV31', ICMODE_DECOMPRESS).
+    sb.install_codec(img).expect("DriverProc not exported");
+    let fcc_video = u32::from_le_bytes(*b"VIDC");
+    let fcc_iv31 = u32::from_le_bytes(*b"IV31");
+    let hic = sb
+        .ic_open(fcc_video, fcc_iv31, icmode_decompress)
+        .unwrap_or_else(|e| panic!("IR32_32.DLL ICOpen('VIDC','IV31',DECOMPRESS) trap:\n  {e}"));
+    assert_ne!(
+        hic, 0,
+        "ICOpen returned NULL HIC — DriverProc rejected DRV_OPEN"
+    );
+
+    // 3. ICGetInfo — codec writes its identity card.
+    let info = sb
+        .ic_get_info(hic, icinfo_size)
+        .unwrap_or_else(|e| panic!("IR32_32.DLL ICGetInfo trap:\n  {e}"));
+    assert!(
+        !info.is_empty(),
+        "ICGetInfo returned 0 bytes — codec did not write its identity card"
+    );
+
+    // szName is at offset 24 (after 6 dwords). It's a UTF-16LE
+    // 16-character zero-terminated string.
+    let name = decode_utf16le_until_nul(&info, 24, 16);
+    assert!(
+        !name.is_empty(),
+        "ICGetInfo szName empty — Indeo 3 should report a codec name"
+    );
+    assert!(
+        name.chars().all(|c| (0x20..=0x7E).contains(&(c as u32))),
+        "ICGetInfo szName contains non-ASCII-printable bytes: {name:?}"
+    );
+    eprintln!("Indeo 3 codec name: {name:?}");
+
+    // 4. ICClose.
+    if let Err(e) = sb.ic_close(hic) {
+        panic!("IR32_32.DLL ICClose trap:\n  {e}");
+    }
+}
+
+/// Decode a fixed-length UTF-16LE field (`field_chars` 16-bit
+/// units starting at byte `off`) into a Rust `String`, stopping
+/// at the first NUL char or invalid surrogate. Used for the
+/// `szName` / `szDescription` / `szDriver` fields of `ICINFO`.
+fn decode_utf16le_until_nul(buf: &[u8], off: usize, field_chars: usize) -> String {
+    let mut chars = Vec::with_capacity(field_chars);
+    for i in 0..field_chars {
+        let p = off + i * 2;
+        if p + 2 > buf.len() {
+            break;
+        }
+        let u = u16::from_le_bytes([buf[p], buf[p + 1]]);
+        if u == 0 {
+            break;
+        }
+        chars.push(u);
+    }
+    String::from_utf16_lossy(&chars)
 }

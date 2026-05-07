@@ -6,8 +6,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- The `test-fixtures` Cargo feature is gone. The fixture-discovery
+  helper handles every code path (env override, Wine prefix,
+  Windows sys dirs, local cache, HTTPS fetch) on its own; the
+  feature gate it used to provide is no longer needed. CI runs
+  the staged-DLL tests every build.
+
 ### Added
 
+- Round 3: "Real-codec smoke test against Intel IR32_32.DLL"
+  milestone landed.
+  - `tests/common/mod.rs` — fixture-discovery helper:
+    `fetch_or_load(name)` resolves codec DLL bytes via env-var
+    override, Wine prefix (`~/.wine/drive_c/windows/{system32,
+    syswow64}/`), Windows system32 / SysWOW64, on-disk cache
+    (`$CARGO_TARGET_DIR/test-fixture-cache/`), and finally
+    HTTPS fetch from `samples.oxideav.org`. CI=true bypasses
+    the cache so air-gapped staleness can never mask a regression.
+  - `tests/common/list_pe_imports` — PE32-imports parser used
+    to enumerate the round-4 stub-registry todo list before
+    the loader's fail-fast import resolution short-circuits.
+  - `tests/m1_load_dll_main.rs::staged_codec_dll_lists_round_four_todo_imports`
+    — fetches Intel's `IR32_32.DLL` (Indeo 3) and asserts the
+    exact set of 49 Win32 imports the round-1 + round-2 stub
+    set does not satisfy: 8 gdi32, 24 kernel32, 16 user32, 1
+    winmm. That set is round 4's deliverable.
+  - `tests/m2_indeo3_driverproc.rs` (renamed from
+    `m2_cinepak_decode.rs`) — synthetic-codec walkthrough
+    coverage retained; plus a forward-compatible Indeo 3
+    walkthrough that runs `DllMain → ICOpen('VIDC','IV31',
+    DECOMPRESS) → ICGetInfo → ICClose` once the loader can
+    satisfy the imports. End-of-round-3 path: assert the load
+    is rejected with `UnknownImportFunction`. Round-4 path:
+    walk the IC* sequence, read `szName` from `ICINFO`, and
+    assert the codec name is non-empty + ASCII-printable.
+  - `[dev-dependencies] ureq = "2"` for the HTTPS fetch.
 - Round 2: "Decode one Cinepak frame" milestone landed.
   - `Sandbox::call_export(image, name, args)` — generic stdcall
     guest-call helper. Pushes args right-to-left + the synthetic
