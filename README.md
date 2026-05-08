@@ -20,6 +20,8 @@ correctness fixes the codec's CPUID-detection block depends on:
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 | `ICERR_OK` (8/8 frames each) |
+| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) / `mpg4ds32.ax` (DShow) | TBD — winxp + wmpcdcs8-2001 binaries staged | 20 (planned) | PE-load blocked on 13 / 6 / 22 imports; see milestone 3.1 |
+| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD — same import set as `mpg4ds32.ax` | 20 (planned) | PE-load blocked on 6 imports |
 
 Round 19's `tests/round19_mmx_dispatch_analysis.rs` byte-scans
 each Indeo binary's executable section for `0F D0..FF` (MMX
@@ -45,7 +47,19 @@ trace + commit narrative in `CHANGELOG.md`.
 Round 13's MMX module (1007 LOC, ~50 opcodes) remains
 correct-semantics-pending-real-codec-validation; round 19
 does not change that, but it produces the first concrete
-fix-list for round 20 to act on. The round-17 SPECGAP
+fix-list for round 20 to act on.
+
+Round 20 has **two parallel sub-goals**: (a) trace the write
+to `[0x1c4a9a38]` `[ebp-8]` Indeo MMX-enable gate so the
+existing `IR41_32.AX` / `IR50_32.DLL` pipelines start
+exercising MMX kernels, and (b) close the MSMPEG4 v3
+PE-load blockers (13 imports for `mpg4c32.dll`, 6 each for
+`mpg4ds32.ax` + `wmvds32.ax`) so `Sandbox::load()` succeeds
+on the codec the project has otherwise been unable to
+decode. The two sub-goals touch disjoint binaries and
+disjoint emulator surfaces, so they can be batched into a
+single round. Concrete import lists per binary live in
+`docs/winmf/winmf-emulator.md` Milestone 3.1. The round-17 SPECGAP
 recorded in `tests/round17_corpus_specgap.rs` (no non-Indeo
 Win32 codec available on `samples.oxideav.org/codecs/windows/`)
 is unchanged. The full design contract lives in
