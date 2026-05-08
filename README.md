@@ -9,6 +9,51 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 25 — DirectShow IBaseFilter scaffolding lands. All five
+stages reached on `MPG4DS32.AX`** (`IID_ICLASSFACTORY` returned,
+IBaseFilter spawned, Stop/Pause/Run all `S_OK`, IPin enumerated,
+input pin reachable for round-26 `Receive`). Round 24 verdict:
+`WMVDS32.AX`/`MPG4DS32.AX` lack `DriverProc` entirely — they're
+DirectShow filters reachable via COM. Round 25 builds that COM
+ABI surface (`src/com/`, ~600 LOC: `Guid` parser, 11 IID
+constants, `ComObjectTable` AddRef/Release bookkeeping,
+`vtable_ptr`/`method_va`/`call_method`/`query_interface`
+helpers) and drives it end-to-end:
+
+* **Stage 1 (always-runs).** `Guid` parser round-trips MIDL
+  `{xxxxxxxx-xxxx-…}` strings; 11 hardcoded IIDs (IUnknown,
+  IClassFactory, IPersist, IMediaFilter, IBaseFilter, IPin,
+  IMemInputPin, IEnumPins, IMemAllocator, IMediaSample,
+  IFilterGraph) sourced from public MSDN documentation +
+  Windows SDK MIDL-generated headers (no BaseClasses sample
+  source consulted).
+* **Stage 2 (DllGetClassObject).** `MPG4DS32.AX` returns a
+  class factory at guest VA `0x600000B0` for the bundle's
+  MPEG-4 v3 decoder filter CLSID
+  `{82CCD3E0-F71A-11D0-9FE5-00609778EA66}`.
+* **Stage 3 (CreateInstance + IBaseFilter spawn).**
+  `IClassFactory::CreateInstance(NULL, IID_IBaseFilter, ppv)`
+  returns a real IBaseFilter at `0x600000EC`; QueryInterface
+  succeeds for IUnknown/IPersist/IMediaFilter/IBaseFilter;
+  Release drops the chain to refcount 0.
+* **Stage 4 (IBaseFilter::Run reach goal).**
+  `IBaseFilter::Stop` / `Pause` / `Run(0)` all return `S_OK`
+  without an attached filter graph. `IBaseFilter::EnumPins`
+  also `S_OK`.
+* **Stage 5 stretch (IPin walk).** `IEnumPins::Next` returns
+  one IPin at `0x6000025C`; `IPin::QueryDirection` reports
+  `PIN_INPUT`. The MPG4DS32 input pin is now reachable from
+  the host for round-26 to push samples through.
+
+`ole32.dll` upgrades alongside: `CoCreateInstance` is now a
+real lookup against the in-process class-factory cache (no
+more blind `E_NOTIMPL`), `CoInitializeEx` and
+`CoTaskMemRealloc` join the stub set. Test count: 363 → 395
+(+32). `WMVDS32.AX` returns `CLASS_E_CLASSNOTAVAILABLE` for
+the MPEG-4 CLSID — its actual filter CLSID is the round-26
+follow-up (the candidate list needs the WMV decoder GUID per
+`wmvax.inf`).
+
 **Round 24 — multi-frame MP43 decode at 352×288 + WMV
 DirectShow-ABI verdict.** Round 23 unblocked I+P at 176×144
 on a 2-frame fixture; round 24 scales to the 5..6 frame

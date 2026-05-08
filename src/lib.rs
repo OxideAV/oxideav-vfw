@@ -191,6 +191,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod com;
 pub mod emulator;
 pub mod pe;
 pub mod runtime;
@@ -198,6 +199,11 @@ pub mod runtime;
 pub mod trace;
 pub mod win32;
 
+pub use com::{
+    Guid, GuidParseError, IID_IBASEFILTER, IID_ICLASSFACTORY, IID_IENUMPINS, IID_IFILTERGRAPH,
+    IID_IMEDIAFILTER, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR, IID_IMEMINPUTPIN, IID_IPERSIST,
+    IID_IPIN, IID_IUNKNOWN,
+};
 pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
 #[cfg(feature = "trace")]
 pub use trace::{TraceState, WatchMode, Watchpoint};

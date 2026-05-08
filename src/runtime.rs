@@ -362,6 +362,196 @@ impl Sandbox {
         self.mmu.trace.set_sink(sink);
     }
 
+    // ---- COM / DirectShow surface (round 25) ------------------------
+
+    /// Drive `DllGetClassObject(rclsid, riid, ppv)` on `image`,
+    /// staging the GUID arguments + the `ppv` out-slot in a
+    /// freshly-allocated heap region inside the sandbox.  On
+    /// success returns the guest pointer the codec wrote into
+    /// `*ppv` — typically a guest-side `IClassFactory`.
+    ///
+    /// When `riid == IID_IClassFactory`, the returned pointer is
+    /// also registered with [`crate::com::ComObjectTable::register_class_factory`]
+    /// keyed under `clsid`, so subsequent
+    /// [`Self::co_create_instance`] calls can resolve `clsid`
+    /// without re-driving `DllGetClassObject`.
+    ///
+    /// MSDN: `HRESULT DllGetClassObject(REFCLSID rclsid, REFIID
+    /// riid, LPVOID *ppv)` — every COM in-process server
+    /// exports it; DirectShow filter binaries (`.ax`) export it
+    /// instead of `DriverProc`.
+    pub fn dll_get_class_object(
+        &mut self,
+        image: &crate::pe::Image,
+        clsid: crate::com::Guid,
+        riid: crate::com::Guid,
+    ) -> Result<u32, crate::Error> {
+        let target = image.export("DllGetClassObject").ok_or_else(|| {
+            crate::Error::Win32(crate::win32::Win32Error::InvalidArgument {
+                stub: "dll_get_class_object",
+                reason: format!("DllGetClassObject not exported by {:?}", image.name),
+            })
+        })?;
+        // Stage the two GUIDs + the out-pointer slot in
+        // contiguous arena memory: 16 + 16 + 4 = 36 bytes.
+        let scratch = self.host.arena_alloc(36).map_err(crate::Error::Win32)?;
+        clsid
+            .stage(&mut self.mmu, scratch)
+            .map_err(crate::Error::Trap)?;
+        riid.stage(&mut self.mmu, scratch + 16)
+            .map_err(crate::Error::Trap)?;
+        // Zero the ppv slot.
+        self.mmu
+            .write_initializer(scratch + 32, &0u32.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+        let hr = call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            target,
+            &[scratch, scratch + 16, scratch + 32],
+        )?;
+        if hr != crate::com::S_OK {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "dll_get_class_object",
+                    reason: format!("DllGetClassObject returned HRESULT {hr:#010x}"),
+                },
+            ));
+        }
+        let out_ptr = self.mmu.load32(scratch + 32).map_err(crate::Error::Trap)?;
+        if out_ptr == 0 {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "dll_get_class_object",
+                    reason: "DllGetClassObject succeeded but *ppv is NULL".into(),
+                },
+            ));
+        }
+        // Bookkeep the new object.  If it is a class factory,
+        // also register it under `clsid` so `CoCreateInstance`
+        // can pick it up.
+        self.host.com.intern(out_ptr, Some(riid));
+        if riid == crate::com::IID_ICLASSFACTORY {
+            self.host.com.register_class_factory(clsid, out_ptr);
+        }
+        Ok(out_ptr)
+    }
+
+    /// Drive `CoCreateInstance(clsid, NULL, CLSCTX_INPROC_SERVER,
+    /// riid, ppv)` against the in-process class-factory cache.
+    /// The CLSID must already be registered (typically by a
+    /// prior [`Self::dll_get_class_object`] call); otherwise
+    /// surfaces `CLASS_E_CLASSNOTAVAILABLE` as an error.
+    pub fn co_create_instance(
+        &mut self,
+        clsid: crate::com::Guid,
+        riid: crate::com::Guid,
+    ) -> Result<u32, crate::Error> {
+        let factory = self.host.com.lookup_class_factory(&clsid).ok_or_else(|| {
+            crate::Error::Win32(crate::win32::Win32Error::InvalidArgument {
+                stub: "co_create_instance",
+                reason: format!(
+                    "CLSID {clsid} not registered; \
+                     call dll_get_class_object first"
+                ),
+            })
+        })?;
+        // Stage IID + out slot.
+        let scratch = self.host.arena_alloc(20).map_err(crate::Error::Win32)?;
+        riid.stage(&mut self.mmu, scratch)
+            .map_err(crate::Error::Trap)?;
+        self.mmu
+            .write_initializer(scratch + 16, &0u32.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+        let r = crate::com::call::call_method(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            factory,
+            crate::com::SLOT_CLASS_FACTORY_CREATE_INSTANCE,
+            &[0, scratch, scratch + 16],
+        )?;
+        if r != crate::com::S_OK {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "co_create_instance",
+                    reason: format!("CreateInstance returned HRESULT {r:#010x}"),
+                },
+            ));
+        }
+        let out = self.mmu.load32(scratch + 16).map_err(crate::Error::Trap)?;
+        if out != 0 {
+            self.host.com.intern(out, Some(riid));
+        }
+        Ok(out)
+    }
+
+    /// Drive `obj->QueryInterface(riid, ppv)` on a guest COM
+    /// object, staging the IID + out-slot in arena memory.
+    /// Returns the new interface pointer on success, or surfaces
+    /// the HRESULT in an error message.
+    pub fn query_interface(
+        &mut self,
+        obj: u32,
+        riid: crate::com::Guid,
+    ) -> Result<u32, crate::Error> {
+        let scratch = self.host.arena_alloc(20).map_err(crate::Error::Win32)?;
+        riid.stage(&mut self.mmu, scratch)
+            .map_err(crate::Error::Trap)?;
+        self.mmu
+            .write_initializer(scratch + 16, &0u32.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+        let r = crate::com::call::query_interface(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            obj,
+            scratch,
+            scratch + 16,
+        )?;
+        if r != crate::com::S_OK {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "query_interface",
+                    reason: format!("QueryInterface returned HRESULT {r:#010x}"),
+                },
+            ));
+        }
+        let out = self.mmu.load32(scratch + 16).map_err(crate::Error::Trap)?;
+        if out != 0 {
+            self.host.com.intern(out, Some(riid));
+        }
+        Ok(out)
+    }
+
+    /// Drive `obj->AddRef()`.  Returns the codec-reported new
+    /// refcount; the host's bookkeeping is updated automatically.
+    pub fn com_add_ref(&mut self, obj: u32) -> Result<u32, crate::Error> {
+        crate::com::call::add_ref(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            obj,
+        )
+    }
+
+    /// Drive `obj->Release()`.  Returns the codec-reported new
+    /// refcount.  The host's bookkeeping is updated automatically.
+    pub fn com_release(&mut self, obj: u32) -> Result<u32, crate::Error> {
+        crate::com::call::release(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            obj,
+        )
+    }
+
     /// `ICDecompress` — decode one frame.
     #[allow(clippy::too_many_arguments)]
     pub fn ic_decompress(

@@ -207,6 +207,15 @@ pub struct HostState {
     /// chain bails at `0x10034d31 (jz 0x10034f61)` and
     /// `[0x1009c770]` stays NULL.
     pub module_resource_dirs: BTreeMap<u32, u32>,
+    /// Round 25 — host-side bookkeeping for COM objects the
+    /// guest has handed back to the test harness (live class
+    /// factories + IBaseFilter pointers etc).  See
+    /// [`crate::com::ComObjectTable`] for the data layout.  Each
+    /// `ole32!CoCreateInstance` and every test-side
+    /// `query_interface` / `add_ref` / `release` updates this
+    /// table so a missing `Release` surfaces as a non-zero
+    /// `total_refcount()` at end-of-test.
+    pub com: crate::com::ComObjectTable,
 }
 
 impl HostState {
@@ -244,6 +253,7 @@ impl HostState {
             stub_trace: Vec::new(),
             loaded_drivers: std::collections::BTreeSet::new(),
             module_resource_dirs: BTreeMap::new(),
+            com: crate::com::ComObjectTable::new(),
         }
     }
 

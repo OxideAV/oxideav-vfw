@@ -8,6 +8,82 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 25 — **DirectShow IBaseFilter scaffolding (Stages 1-5
+  all landed against MPG4DS32.AX).** Round 24 closed with the
+  verdict that `WMVDS32.AX` and `MPG4DS32.AX` lack a
+  `DriverProc` export entirely — they are pure DirectShow
+  filters. Round 25 builds the COM/DirectShow ABI surface that
+  reaches in through their actual entry points:
+  - **Stage 1 (COM scaffolding).** New `src/com/` module
+    (~600 LOC) defines `Guid` (with MIDL-string parser +
+    16-byte LE round-trip), 11 hardcoded IID constants
+    (IUnknown, IClassFactory, IPersist, IMediaFilter,
+    IBaseFilter, IPin, IMemInputPin, IEnumPins, IMemAllocator,
+    IMediaSample, IFilterGraph), 8 public HRESULT codes
+    (`S_OK`, `S_FALSE`, `E_NOINTERFACE`, `E_NOTIMPL`,
+    `E_POINTER`, `E_FAIL`, `E_UNEXPECTED`,
+    `CLASS_E_CLASSNOTAVAILABLE`), the standard
+    vtable-slot-index constants for every method we drive,
+    `ComObjectTable` host-side AddRef/Release bookkeeping +
+    in-process class-factory cache, and the
+    `vtable_ptr` / `method_va` / `vtable_is_plausible` /
+    `call_method` / `query_interface` / `add_ref` / `release`
+    helpers. All sourced from public MSDN documentation +
+    Windows SDK MIDL-generated headers — never the BaseClasses
+    sample source.
+  - **Stage 2 (DllGetClassObject + IClassFactory).**
+    `Sandbox::dll_get_class_object(image, clsid, riid)` stages
+    the two GUIDs + an out-pointer slot in arena memory,
+    drives the codec's `DllGetClassObject` export, and on
+    success registers the returned IClassFactory under
+    `clsid` in the host's class-factory cache.
+    `MPG4DS32.AX` succeeds with the bundle's MPEG-4 v3
+    decoder filter CLSID `{82CCD3E0-F71A-11D0-9FE5-
+    00609778EA66}` (returned at guest VA `0x600000B0`).
+    `WMVDS32.AX` returns `CLASS_E_CLASSNOTAVAILABLE` against
+    the MPEG-4 CLSID — its actual filter CLSID is not yet
+    in the candidate list (round-26 follow-up to enumerate).
+  - **Stage 2.5 (QueryInterface on the class factory).**
+    `Sandbox::query_interface(obj, riid)` succeeds against
+    the IClassFactory for `IID_IUnknown` (returns the same
+    underlying object pointer per COM ABI rules).
+  - **Stage 3 (CreateInstance + IBaseFilter spawn).**
+    `Sandbox::co_create_instance(clsid, riid)` consults the
+    cache and drives `IClassFactory::CreateInstance(NULL,
+    IID_IBaseFilter, ppv)`. **MPG4DS32 spawns a real
+    IBaseFilter** at guest VA `0x600000EC`. `QueryInterface`
+    succeeds for `IID_IUnknown` (`0x600000E0`),
+    `IID_IPersist`, `IID_IMediaFilter`, `IID_IBaseFilter`
+    (each returns `0x600000EC` — the filter satisfies the
+    inheritance chain through a single tear-off interface).
+    `Release` on the chain drops the refcount cleanly to 0.
+  - **Stage 4 (IBaseFilter::Run reach goal).**
+    `IBaseFilter::Stop` → `S_OK`, `IBaseFilter::Pause` →
+    `S_OK`, `IBaseFilter::Run(0)` → `S_OK`. The codec's
+    internal state-machine accepts every transition without a
+    filter graph attached. `IBaseFilter::EnumPins(ppEnum)`
+    also returns `S_OK` with a valid `IEnumPins` pointer
+    (`0x60000210`).
+  - **Stage 5 stretch (IPin walk).** Driving
+    `IEnumPins::Next(1, ppPins, &fetched)` returns one IPin
+    pointer at `0x6000025C` with `fetched=1`, and
+    `IPin::QueryDirection` reports `dir=0x0` (PIN_INPUT).
+    The MPG4DS32 input pin is now reachable from the host.
+  - **Bookkeeping additions.** `HostState` grows a
+    `com: ComObjectTable` field. `ole32!CoCreateInstance`
+    upgraded from a blind `E_NOTIMPL` to a real lookup
+    against the class-factory cache (returns
+    `CLASS_E_CLASSNOTAVAILABLE` on miss). New ole32 stubs
+    `CoInitializeEx` (S_OK) + `CoTaskMemRealloc` (allocs
+    fresh slab + copies prior bytes).
+  - **Test count: +32 tests** (363 → 395 total). The new
+    `tests/round25_directshow_com_scaffold.rs` exercises
+    every stage; binary-fixture-gated tests skip cleanly when
+    `wmpcdcs8-2001/` is absent.
+  - **Reach for round 26.** WMVDS32 needs a different CLSID
+    in the candidate list. Pushing a real WMV1/WMV2 sample
+    through `IPin::ReceiveConnection → IPin::Receive` is the
+    natural next step now that the pin is reachable.
 - Round 24 — **Multi-frame MP43 decode + WMV/DirectShow ABI
   verdict + ICGetInfo `cb` size-gate fix +
   user32!UnregisterClassA stub**. Twin main sub-goals plus
