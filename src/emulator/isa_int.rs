@@ -25,6 +25,7 @@ use super::decode::{
 use super::mmu::Mmu;
 use super::regs::{Flags, Reg16, Reg32, Reg8, Regs};
 use super::Trap;
+use std::collections::BTreeSet;
 
 /// Sentinel return address pushed by host-initiated calls. When
 /// `eip` reaches the sentinel after a `ret`, [`Cpu::run`] stops.
@@ -124,6 +125,21 @@ pub struct Cpu {
     /// Cap on `trace_ring` capacity; once full the oldest entry
     /// rolls off. 0 disables.
     pub trace_ring_cap: usize,
+    /// Round-19 instrument: when `true`, every distinct entry-EIP
+    /// is inserted into [`Self::visited_eips`]. Lets a research
+    /// test answer "did the codec ever step at this RVA?" via a
+    /// `BTreeSet::contains` lookup, far cheaper than capturing
+    /// every instruction's EIP in a `Vec`. Used by
+    /// `tests/round19_mmx_dispatch_analysis.rs` to compute the
+    /// set-difference between MMX-byte RVAs in the binary and
+    /// EIPs the decode actually reached.
+    pub track_visited_eips: bool,
+    /// Sorted set of every distinct entry-EIP observed while
+    /// [`Self::track_visited_eips`] was on. Capped only by host
+    /// memory; a decode of ~10⁷ instructions over a ~10⁶-byte
+    /// .text section yields at most ~10⁶ unique entries. Cleared
+    /// by [`Self::take_visited_eips`].
+    pub visited_eips: BTreeSet<u32>,
 }
 
 /// Segment-override prefix selector.
@@ -167,7 +183,33 @@ impl Cpu {
             cpuid_dispatch_count: 0,
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
+            track_visited_eips: false,
+            visited_eips: BTreeSet::new(),
         }
+    }
+
+    /// Round-19: enable per-instruction unique-EIP tracking. Every
+    /// subsequent [`Self::step`] inserts the entry-EIP into
+    /// [`Self::visited_eips`]. Cheap (one `BTreeSet` membership
+    /// probe + insert per instruction); the set's memory cost is
+    /// proportional to the number of *unique* code addresses the
+    /// codec actually steps through, not the total instruction
+    /// count.
+    pub fn enable_visited_eip_tracking(&mut self) {
+        self.track_visited_eips = true;
+    }
+
+    /// Round-19: disable tracking. The accumulated set is
+    /// preserved; call [`Self::take_visited_eips`] to consume it.
+    pub fn disable_visited_eip_tracking(&mut self) {
+        self.track_visited_eips = false;
+    }
+
+    /// Round-19: drain the accumulated set, returning every
+    /// unique EIP recorded since tracking was enabled (or since
+    /// the last `take`).
+    pub fn take_visited_eips(&mut self) -> BTreeSet<u32> {
+        std::mem::take(&mut self.visited_eips)
     }
 
     /// Enable instruction-level trace ring (capacity = `cap`
@@ -341,6 +383,13 @@ impl Cpu {
                 self.trace_ring.remove(0);
             }
             self.trace_ring.push(entry_eip);
+        }
+
+        // Round-19: record unique EIPs if tracking is on. The
+        // BTreeSet's `insert` is idempotent; the per-instruction
+        // cost is O(log N) over the visited-set size.
+        if self.track_visited_eips {
+            self.visited_eips.insert(entry_eip);
         }
 
         // Consume legacy prefixes (max ~4; we cap at 8 to avoid
@@ -1235,6 +1284,24 @@ impl Cpu {
                 self.write_op8(dst, bit, mmu)?;
                 Ok(StepOk::Continued)
             }
+            // 0x0F 0x31 — RDTSC. Reads the time-stamp counter
+            // into EDX:EAX. Round-19 codecs sometimes use RDTSC
+            // to micro-benchmark a candidate decode kernel and
+            // pick the fastest at `DRV_LOAD` time. We synthesise
+            // a monotonically-increasing counter derived from
+            // [`Cpu::instr_count`]: every two instructions
+            // advance the TSC by one tick, so a benchmark of N
+            // instructions sees ~N/2 ticks. EDX = 0 (we never
+            // overflow 32-bit in any plausible decode path).
+            //
+            // Reference: Intel SDM Vol. 2B `RDTSC` instruction
+            // reference.
+            0x31 => {
+                let tsc = self.instr_count >> 1;
+                self.regs.set32(Reg32::Eax, tsc as u32);
+                self.regs.set32(Reg32::Edx, (tsc >> 32) as u32);
+                Ok(StepOk::Continued)
+            }
             // 0x0F 0xA2 — CPUID
             0xA2 => {
                 self.cpuid();
@@ -1445,20 +1512,38 @@ impl Cpu {
                 self.regs.set32(Reg32::Ecx, u32::from_le_bytes(*b"ntel"));
             }
             1 => {
-                // Pentium MMX model (family 5, model 4, stepping 0)
-                // — bumped from round-1's plain Pentium so codecs
-                // gated on CPUID.MMX (bit 23 of EDX) take their
-                // MMX-accelerated path. Round 13 implements the MMX
-                // semantics those paths actually use; reporting
-                // MMX is what wires them up.
-                self.regs.set32(Reg32::Eax, (5 << 8) | (4 << 4));
+                // Pentium II Klamath (family 6, model 3,
+                // stepping 0). Round-19 finding: round-13's Pentium
+                // MMX (family 5) reading kept Indeo's MMX block
+                // unreached because the codec's
+                // `family << 8 ; cmp 0x600` discriminator routes
+                // family-5 CPUs to the integer path. Family 6 is
+                // the lowest where the MMX dispatcher actually
+                // selects MMX kernels. Pentium II is the choice
+                // because it supports MMX (CPUID.EDX bit 23) but
+                // NOT SSE (bit 25) — the codec's SSE / SSE2
+                // paths would trip our integer-only emulator.
+                //
+                // References: Intel SDM Vol. 2B `CPUID` reference
+                // §"Family/Model/Stepping in EAX"; Intel Processor
+                // Identification Application Note AP-485 Table 5
+                // ("Pentium II Klamath" = family 6, model 3).
+                self.regs.set32(Reg32::Eax, (6 << 8) | (3 << 4));
                 self.regs.set32(Reg32::Ebx, 0);
                 self.regs.set32(Reg32::Ecx, 0);
-                // Feature bits: FPU(0)+TSC(4)+CX8(8)+MMX(23). Still
-                // no SSE / SSE2 (the codec's SSE2 paths would need
-                // a 16-byte SIMD register file we don't have yet).
-                self.regs
-                    .set32(Reg32::Edx, (1 << 0) | (1 << 4) | (1 << 8) | (1 << 23));
+                // Feature bits: FPU(0)+TSC(4)+CX8(8)+CMOV(15)+MMX(23).
+                // CMOV (`0F 40..4F`) is round-5 implemented; we
+                // already advertise it implicitly by passing the
+                // codec's runtime CMOV path (no codec we've seen
+                // gates on this bit, but reporting it matches the
+                // Pentium II feature set we claim to be).
+                // No SSE (25), no SSE2 (26) — those need a 16-byte
+                // SIMD register file and ~150 opcodes we haven't
+                // implemented.
+                self.regs.set32(
+                    Reg32::Edx,
+                    (1 << 0) | (1 << 4) | (1 << 8) | (1 << 15) | (1 << 23),
+                );
             }
             _ => {
                 self.regs.set32(Reg32::Eax, 0);
@@ -3476,6 +3561,109 @@ mod tests {
             }) => (),
             other => panic!("expected hlt trap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rdtsc_returns_monotonic_counter_in_edx_eax() {
+        // Round-19: `0F 31` RDTSC reads the time-stamp counter.
+        // We synthesise it from `instr_count >> 1`, so two calls
+        // separated by N integer instructions produce a delta of
+        // floor(N/2). Pin the contract: returns non-zero, second
+        // call > first.
+        let (mut cpu, mut mmu) = make();
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x0F, 0x31, // rdtsc — first read
+                0x89, 0xC1, // mov ecx, eax (save EAX from first read)
+                0x90, 0x90, 0x90, 0x90, // four nop fillers
+                0x0F, 0x31, // rdtsc — second read
+                0xC3, // ret
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        let second = cpu.regs.get32(Reg32::Eax);
+        let first = cpu.regs.get32(Reg32::Ecx);
+        assert!(
+            second > first,
+            "TSC must be monotonic ({first} -> {second})"
+        );
+    }
+
+    #[test]
+    fn pushfd_popfd_toggles_id_bit_for_cpuid_detection() {
+        // Round-19: this is the round-19 unblocking sequence —
+        // the codec's CPUID-supported probe. Without modelling
+        // bit 21 of EFLAGS, this sequence concluded "no CPUID"
+        // and skipped the entire MMX-feature block.
+        //
+        //   pushfd ; pop eax           ; eax = original EFLAGS
+        //   mov ebx, eax               ; save baseline
+        //   xor eax, 0x200000          ; toggle ID bit
+        //   push eax ; popfd           ; load toggled EFLAGS
+        //   pushfd ; pop eax           ; read back EFLAGS
+        //   xor eax, ebx               ; diff
+        //   and eax, 0x200000          ; isolate ID-bit difference
+        //
+        // The contract: eax must be NON-ZERO at the end, meaning
+        // the toggle survived the round-trip. Pre-round-19 the
+        // diff was always 0 (bit 21 never showed up in pack()).
+        let (mut cpu, mut mmu) = make();
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0x9C, // pushfd
+                0x58, // pop eax
+                0x89, 0xC3, // mov ebx, eax
+                0x35, 0x00, 0x00, 0x20, 0x00, // xor eax, 0x00200000
+                0x50, // push eax
+                0x9D, // popfd
+                0x9C, // pushfd
+                0x58, // pop eax
+                0x31, 0xD8, // xor eax, ebx
+                0x25, 0x00, 0x00, 0x20, 0x00, // and eax, 0x00200000
+                0xC3, // ret
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        assert_eq!(
+            cpu.regs.get32(Reg32::Eax),
+            0x0020_0000,
+            "ID-bit toggle must round-trip through pushfd/popfd",
+        );
+    }
+
+    #[test]
+    fn cpuid_leaf_1_reports_pentium_ii_with_mmx() {
+        // Round-19: leaf 1 must report family >= 6 (Intel SDM
+        // family-codes) so the IR41/IR50 codec's
+        // `cmp ebx, 0x600` family discriminator picks the
+        // post-PPro path. Round-13 reported family 5 (Pentium
+        // MMX), which IS itself MMX-capable, but the codec's
+        // SSE/MMX dispatcher requires family-6+.
+        let (mut cpu, mut mmu) = make();
+        write_code(
+            &mut mmu,
+            0x1000,
+            &[
+                0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                0x0F, 0xA2, // cpuid
+                0xC3, // ret
+            ],
+        );
+        cpu.run(&mut mmu).unwrap();
+        let eax = cpu.regs.get32(Reg32::Eax);
+        let edx = cpu.regs.get32(Reg32::Edx);
+        // Family bits = (eax & 0xF00) >> 8 must be 6.
+        assert_eq!((eax & 0xF00) >> 8, 6, "family must be 6 (Pentium II/III)");
+        // MMX bit (23 of EDX) must be set.
+        assert_ne!(edx & (1 << 23), 0, "CPUID.EDX.MMX must be set");
+        // SSE bit (25 of EDX) must NOT be set — we don't have
+        // a 16-byte SIMD register file, so reporting SSE would
+        // route the codec into an emulator-trapping path.
+        assert_eq!(edx & (1 << 25), 0, "CPUID.EDX.SSE must NOT be set");
     }
 
     #[test]

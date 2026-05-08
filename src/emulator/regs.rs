@@ -134,6 +134,27 @@ pub struct Flags {
     pub df: bool,
     /// Overflow flag (OF, bit 11).
     pub of: bool,
+    /// Identification flag (ID, bit 21). Toggleable via
+    /// `pushfd / and / xor / popfd` sequences; software uses this
+    /// as the "is CPUID supported" probe (Intel SDM Vol. 1
+    /// §3.4.3.4 + the `CPUID` instruction reference). Modern
+    /// codecs sniff CPUID feature bits at `DRV_LOAD` time using
+    /// exactly this idiom, then branch off to MMX / SSE
+    /// specialisations. We model the bit as state so the toggle
+    /// round-trips and the codec's "no CPUID, take integer-only
+    /// path" branch is correctly **not** taken when our CPU
+    /// does support CPUID.
+    ///
+    /// Round-19 finding: round 13 advertises MMX in CPUID leaf 1
+    /// EDX bit 23, but rounds 12..17 reported 0 MMX dispatches
+    /// because every Indeo decoder skipped the entire feature
+    /// block at the `pushfd / xor 0x200000 / popfd / pushfd`
+    /// detection (`Flags::pack` returned a constant value from
+    /// modelled bits only, so the toggle test always reported
+    /// "ID-bit not settable → no CPUID"). With the bit modelled
+    /// the codec reaches CPUID, sees MMX, and takes the MMX
+    /// path.
+    pub id: bool,
 }
 
 impl Flags {
@@ -163,6 +184,9 @@ impl Flags {
         if self.of {
             v |= 1 << 11;
         }
+        if self.id {
+            v |= 1 << 21;
+        }
         v
     }
 
@@ -177,6 +201,7 @@ impl Flags {
             sf: (v & (1 << 7)) != 0,
             df: (v & (1 << 10)) != 0,
             of: (v & (1 << 11)) != 0,
+            id: (v & (1 << 21)) != 0,
         }
     }
 
@@ -308,6 +333,37 @@ mod tests {
         let packed = f.pack();
         let back = Flags::unpack(packed);
         assert_eq!(f, back);
+    }
+
+    #[test]
+    fn id_flag_round_trips_through_pack_unpack() {
+        // Round-19: the codec's `pushfd / xor 0x200000 / popfd /
+        // pushfd` toggle test is the canonical CPUID-supported
+        // probe (Intel SDM Vol. 1 §3.4.3.4). Until round 19 we
+        // dropped bit 21 in `pack()`, so the toggle round-tripped
+        // as a no-op and every codec concluded "CPUID not
+        // supported". Pin the contract: bit 21 round-trips.
+        let f_set = Flags {
+            id: true,
+            ..Flags::default()
+        };
+        let packed = f_set.pack();
+        assert_ne!(packed & (1 << 21), 0, "ID bit must appear at bit 21");
+        let back = Flags::unpack(packed);
+        assert!(back.id, "unpack must preserve ID bit");
+
+        let f_clr = Flags {
+            id: false,
+            ..Flags::default()
+        };
+        let packed_clr = f_clr.pack();
+        assert_eq!(
+            packed_clr & (1 << 21),
+            0,
+            "ID bit must NOT appear when cleared"
+        );
+        let back_clr = Flags::unpack(packed_clr);
+        assert!(!back_clr.id);
     }
 
     #[test]

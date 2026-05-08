@@ -9,10 +9,11 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 17 — corpus byte-scan + larger IV41 fixture +
-`LIST rec ` walker.** Three real-codec end-to-end pipelines
-remain green; round 17 widens the IV41 test surface to a
-larger fixture and documents the MMX-codec SPECGAP:
+**Round 19 — Lead A: trace-coverage analysis identifies the
+EFLAGS.ID-bit gap as the rounds-12..17 zero-MMX-dispatch root
+cause.** Three real-codec end-to-end pipelines stay green; round
+19 lands an instruction-EIP-tracking instrument plus four
+correctness fixes the codec's CPUID-detection block depends on:
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
@@ -20,20 +21,34 @@ larger fixture and documents the MMX-codec SPECGAP:
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 | `ICERR_OK` (8/8 frames each) |
 
-Each fixture's first keyframe decodes to RGB24 with > 25 % non-zero
-pixels; round 13 ran 8 sequential `cat_attack.avi` IV50 frames
-through a single shared `hic`, round 16 ratcheted the same
-discipline onto the IV41 path, and round 17 widens IV41 to a
-larger 320×240 fixture (`indeo41.avi`). The round-13 MMX
-module remains correct-semantics scaffolding waiting for a
-non-Indeo Win32 codec — round 17's
-`tests/round17_corpus_specgap.rs` enumerates every plausible
-candidate (Cinepak, MS Video 1, MS RLE, MS-MPEG-4 v3, DivX,
-TSCC, WMV) and confirms all 16 candidate URLs return 404
-from `samples.oxideav.org/codecs/windows/`. The test-side
-AVI extractor now recognises chained `RIFF AVIX` segments
-(OpenDML / AVI 2.0) AND `LIST rec ` containers (interleaved
-AVI 1.0). The full design contract lives in
+Round 19's `tests/round19_mmx_dispatch_analysis.rs` byte-scans
+each Indeo binary's executable section for `0F D0..FF` (MMX
+arithmetic) and `0F A2` (CPUID), drives the standard 8-frame
+decode pipeline with `Cpu::enable_visited_eip_tracking()` on,
+and computes the set-difference. Pre-round-19, IR41 reached
+0 / 2 CPUID sites and 0 / 1032 MMX-arith sites; the codec's
+`pushfd / xor 0x200000 / popfd / pushfd` ID-bit toggle
+test concluded "no CPUID supported" because our `Flags::pack`
+returned a constant value over the modelled bits (bit 21
+absent). Post-round-19 (with `Flags::id` modelled, RDTSC
+implemented, CPUID family bumped to 6 model 3 Pentium II so
+the codec's `cmp ebx, 0x600` family discriminator picks the
+post-PPro path), CPUID reaches 2 / 2 on both IR41 and IR50
+and the global MMX feature mask `[0x1c4a9a54] = 0x800000`
+gets written. **MMX-byte reachability is still 0**, however:
+the codec's "use MMX kernels" decision flag `[0x1c4a9a38]`
+also requires `[ebp-8] != 0` (a caller-provided per-
+instance enable we have not yet localised). Round 20 will
+trace the write to identify the gating source. Full byte-
+trace + commit narrative in `CHANGELOG.md`.
+
+Round 13's MMX module (1007 LOC, ~50 opcodes) remains
+correct-semantics-pending-real-codec-validation; round 19
+does not change that, but it produces the first concrete
+fix-list for round 20 to act on. The round-17 SPECGAP
+recorded in `tests/round17_corpus_specgap.rs` (no non-Indeo
+Win32 codec available on `samples.oxideav.org/codecs/windows/`)
+is unchanged. The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

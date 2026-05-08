@@ -6,6 +6,124 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 19 — **Lead A: trace-coverage analysis identifies the
+  EFLAGS.ID-bit gap as the root cause of zero-MMX-dispatch in
+  rounds 12..17.** The crate's MMX module
+  (`src/emulator/isa_mmx.rs`, ~1007 LOC, ~50 opcodes) was
+  semantically validated by its 19 unit + 13 emulator step
+  tests, but rounds 12..17 multi-frame decode pipelines
+  reported `mmx_dispatch_count = 0` for every IV31/IV41/IV50
+  fixture across the corpus despite the IR41/IR50 binaries
+  containing 1094 / 2518 `0F D0..FF` MMX-arithmetic byte
+  patterns + 2 / 2 `0F A2` CPUID instructions in their
+  executable sections (round 17 byte-scan finding).
+  - **Cpu::track_visited_eips + Cpu::visited_eips: BTreeSet<u32>**
+    — round-19 instrument (~10 LOC delta in `src/emulator/isa_int.rs`).
+    `enable_visited_eip_tracking()` arms a per-instruction probe
+    in [`Cpu::step`] that inserts every distinct entry-EIP into
+    a sorted set; `take_visited_eips()` drains it. Memory cost is
+    O(unique instruction addresses), not O(total instructions) —
+    a 20-million-instruction IV41 decode visits ~11 K unique
+    EIPs, well within a single-run BTreeSet. The set lets a
+    research test answer "did the codec ever step at this RVA?"
+    via a `BTreeSet::contains(&va)` lookup.
+  - **`tests/round19_mmx_dispatch_analysis.rs`** (~570 LOC) —
+    drives `indeo41.avi` (IV41, 320×240) through `IR41_32.AX`
+    AND `cat_attack.avi` (IV50, 320×240) through `IR50_32.DLL`
+    with unique-EIP tracking on, then computes the
+    set-difference between MMX-byte VAs in each binary's
+    executable section and the visited-EIP set. Output is the
+    full inventory of CPUID sites (preceding 64 B + following
+    96 B for each, so the gating branch is visible directly in
+    the test stderr) plus first/last 5 unreached MMX bytes.
+  - **Round-19 finding: EFLAGS.ID bit (bit 21) was missing from
+    `Flags::pack()` / `Flags::unpack()`.** Both Indeo binaries'
+    DRV_LOAD-time CPUID-detection runs the canonical Intel-SDM
+    §3.4.3.4 toggle test:
+      ```
+      pushfd ; pop eax        ; baseline EFLAGS
+      mov ebx, eax
+      xor eax, 0x200000        ; toggle ID bit
+      push eax ; popfd         ; load toggled EFLAGS
+      pushfd ; pop eax         ; read back
+      xor eax, ebx ; and eax, 0x200000   ; isolate diff
+      jz <skip-cpuid-block>    ; if bit didn't toggle, no CPUID
+      ```
+    Pre-round-19 our `Flags::pack` always returned a constant
+    value over the modelled bits — bit 21 was simply not in
+    the layout. The toggle round-tripped as a no-op, the diff
+    was always 0, the `jz` always taken, and the entire
+    feature-bit detection block (including the `0F A2` CPUIDs
+    AND the `mov [...], <mmx-flag>` writes that follow) was
+    skipped. Cause was identical in IR41 and IR50.
+  - Fix: `regs::Flags::id: bool` packed into bit 21 of
+    `pack()` / `unpack()`. With the round-trip preserved, both
+    Indeo binaries' CPUIDs now reach (`reached=true` / 2 of 2)
+    in `tests/round19_mmx_dispatch_analysis.rs`.
+  - Companion fix: `0x0F 0x31 RDTSC` handler. After the
+    EFLAGS-toggle gate cleared, IR50's DRV_LOAD path advanced
+    further and tripped on a previously-unimplemented opcode
+    at `eip=0x10001A98` — the codec micro-benchmarks two
+    candidate kernels with `rdtsc / call kernel / rdtsc`. We
+    synthesise the time-stamp counter from `instr_count >> 1`,
+    so two consecutive RDTSC calls separated by N integer
+    instructions report a delta of floor(N/2) — monotonic but
+    not real-clock-tied. Implementation in
+    `src/emulator/isa_int.rs::dispatch_0f`.
+  - Companion change: CPUID leaf 1 EAX bumped from family 5
+    model 4 (Pentium MMX) to family 6 model 3 (Pentium II
+    Klamath). The IR41 / IR50 dispatchers run a
+    `cmp ebx, 0x600` family discriminator that routes
+    family-5-or-lower CPUs to the integer path even when MMX
+    is reported. Pentium II is the lowest pre-SSE family-6
+    chip that still supports MMX. CPUID.EDX additionally
+    advertises CMOV (bit 15), already implemented since
+    round 5; SSE / SSE2 stay off because we don't have a
+    16-byte SIMD register file.
+  - **Reachability outcome (round 19 finding for round 20)**:
+    With the four fixes (ID-bit, RDTSC, family/model, MMX
+    bit), CPUID is now reached 2/2 in both IR41 and IR50.
+    The codec's global feature-flag write `[0x1c4a9a54] =
+    0x800000` (raw MMX mask) succeeds — verified by the
+    test's post-decode MMU snapshot. **However the
+    "use MMX kernels" decision flag at `[0x1c4a9a38]` stays
+    at 0**: the codec's CPUID-detection routine combines the
+    MMX bit AND a local `[ebp-8] != 0` check (some caller-
+    provided per-instance enable flag we have not yet
+    located) before setting the global "MMX is on" sentinel
+    that the `ICDecompress` per-frame dispatcher consults.
+    Therefore MMX-byte reachability stays at 0/1032 for
+    IR41 and 0/2442 for IR50 even with all CPUID gates
+    cleared — the round-13 MMX module remains correct
+    semantics waiting for round 20 to localise the
+    `[ebp-8]` source.
+  - **Round-20 plan (queued)**: Use the `trace` Cargo feature
+    (round 18) to install a watchpoint on `[0x1c4a9a38]` and
+    capture the call-stack of every write attempt. The
+    `[ebp-8]` value is plausibly:
+    1. A registry value the codec reads via
+       `RegQueryValueExA` (we'd need a new fixture for the
+       Intel-Indeo registry layout in our `advapi32` stub).
+    2. An environment variable like `INDEO_FORCE_MMX=1`
+       which our `kernel32` GetEnvironmentStrings stub
+       returns empty for.
+    3. A `DRV_LOAD` lparam from a vfw32-side caller we don't
+       currently mimic.
+    The trace will distinguish these. If the gate is config-
+    based, round 20 either supplies the right config or
+    flips the conditional gate via a memory-write hook.
+  - Three new lib unit tests pin the round-19 contract:
+    `id_flag_round_trips_through_pack_unpack` (regs.rs);
+    `pushfd_popfd_toggles_id_bit_for_cpuid_detection` +
+    `rdtsc_returns_monotonic_counter_in_edx_eax` +
+    `cpuid_leaf_1_reports_pentium_ii_with_mmx` (isa_int.rs).
+    Plus 2 integration tests
+    (`ir41_mmx_byte_reachability_during_iv41_decode` +
+    `ir50_cpuid_reachability_during_iv50_decode`) recording
+    the set-difference inventory.
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.2...v0.0.3) - 2026-05-08
 
 ### Other
