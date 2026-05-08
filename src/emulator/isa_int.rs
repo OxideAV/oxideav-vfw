@@ -89,6 +89,12 @@ pub struct Cpu {
     /// Reset value 0x037F (RC=00 round-to-nearest, PC=11 64-bit
     /// extended precision, all exception masks set).
     pub fpu_cw: u16,
+    /// x87 FPU state — eight ST(i) registers + TOP + status
+    /// word. Round-21 lights up real FPU semantics so codec
+    /// CRT init paths (`_initterm` global-double copy) and
+    /// codec inner loops (FADD/FMUL/FDIV chains) execute. See
+    /// [`super::isa_fpu`] for the supported subset.
+    pub fpu: super::isa_fpu::FpuState,
     /// MMX register file `mm0..mm7`, eight 64-bit registers.
     ///
     /// Per Intel SDM Vol. 1 §9.2.1, the architectural MMX
@@ -178,6 +184,7 @@ impl Cpu {
             fs_base: 0,
             gs_base: 0,
             fpu_cw: 0x037F,
+            fpu: super::isa_fpu::FpuState::new(),
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
             cpuid_dispatch_count: 0,
@@ -262,11 +269,16 @@ impl Cpu {
     /// memory operands get `seg_base` added; register operands
     /// pass through unchanged. Use this on every operand returned
     /// from [`resolve_modrm32`].
-    fn seg_apply(&self, op: Operand) -> Operand {
+    pub(super) fn seg_apply(&self, op: Operand) -> Operand {
         match op {
             Operand::Mem32(a) => Operand::Mem32(self.seg_translate(a)),
             other => other,
         }
+    }
+
+    /// Pub re-export for sibling modules ([`super::isa_fpu`]).
+    pub(super) fn seg_apply_pub(&self, op: Operand) -> Operand {
+        self.seg_apply(op)
     }
 
     /// Run until the instruction at `eip` is the synthetic return
@@ -1007,15 +1019,14 @@ impl Cpu {
             // 0xD3 — Group 2 (shifts) r/m32, CL
             0xD3 => self.group2_rm32(mmu, ShiftCount::Cl),
 
-            // x87 escapes 0xD8..=0xDF. We do not model the FPU
-            // stack or any arithmetic. Codec DLL prologues commonly
-            // use `D9 /5 fldcw m16` + `D9 /7 fnstcw m16` to save +
-            // restore the rounding-mode CW so a particular block
-            // can compute integer-truncating math without disturbing
-            // the host's CW. We model exactly that one round-trip
-            // by shadowing the CW in [`Cpu::fpu_cw`]; any other
-            // x87 escape traps as `PrivilegedOpcode`.
-            0xD9 => self.fpu_d9(mmu, entry_eip),
+            // x87 escapes 0xD8..=0xDF. Round 21 dispatches to a
+            // real FPU executor in [`super::isa_fpu`]; the
+            // executor models an eight-deep f64 stack + the
+            // memory and reg-form ops codec DLLs touch. Forms
+            // outside the implemented subset trap as
+            // `PrivilegedOpcode` with a sub-form-named mnemonic
+            // so the next contributor can localise.
+            0xD8..=0xDF => super::isa_fpu::dispatch(self, mmu, op, entry_eip),
 
             // 0xC2 — RETN imm16 ; 0xC3 — RETN
             0xC2 => {
@@ -2222,57 +2233,6 @@ impl Cpu {
         Ok(StepOk::Continued)
     }
 
-    /// x87 escape `0xD9` — round-10 partial coverage. We honor
-    /// only the two memory forms `D9 /5 FLDCW m16` and `D9 /7
-    /// FNSTCW m16` (the codec-prologue idiom for saving and
-    /// restoring the rounding-mode control word). Every other
-    /// `D9 ...` form traps as `PrivilegedOpcode` so the
-    /// implementer can localise it.
-    ///
-    /// Reference: Intel SDM Vol. 2A "FLDCW" + "FSTCW/FNSTCW".
-    fn fpu_d9(&mut self, mmu: &mut Mmu, entry_eip: u32) -> Result<StepOk, Trap> {
-        let mr = self.fetch_modrm(mmu)?;
-        if mr.mode == 0b11 {
-            // ST(i)-form FPU ops (FLD ST, FXCH, FCHS, FABS, …) —
-            // not modelled.
-            return Err(Trap::PrivilegedOpcode {
-                eip: entry_eip,
-                mnemonic: "x87 D9 /reg-form (FPU not modelled)",
-            });
-        }
-        let bytes = self.peek_after_modrm(mmu, 16)?;
-        let (op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
-        self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
-        let op = self.seg_apply(op);
-        let addr = match op {
-            Operand::Mem32(a) => a,
-            Operand::Reg32(_) => unreachable!(),
-        };
-        match mr.reg {
-            5 => {
-                // FLDCW m16: load FPU control word from m16
-                self.fpu_cw = mmu.load16(addr)?;
-                Ok(StepOk::Continued)
-            }
-            7 => {
-                // FNSTCW m16: store FPU control word to m16
-                mmu.store16(addr, self.fpu_cw)?;
-                Ok(StepOk::Continued)
-            }
-            other => Err(Trap::PrivilegedOpcode {
-                eip: entry_eip,
-                mnemonic: match other {
-                    0 => "x87 D9 /0 FLD m32 (FPU not modelled)",
-                    2 => "x87 D9 /2 FST m32 (FPU not modelled)",
-                    3 => "x87 D9 /3 FSTP m32 (FPU not modelled)",
-                    4 => "x87 D9 /4 FLDENV m28 (FPU not modelled)",
-                    6 => "x87 D9 /6 FNSTENV m28 (FPU not modelled)",
-                    _ => "x87 D9 /reg unknown",
-                },
-            }),
-        }
-    }
-
     /// 16-bit group-3 (`F7 /n` under 0x66): TEST/NOT/NEG/MUL/IMUL/
     /// DIV/IDIV r/m16. The TEST sub-form has imm16 not imm32; MUL
     /// targets DX:AX rather than EDX:EAX; the divide narrows.
@@ -3469,7 +3429,7 @@ pub(crate) fn exec_mnemonic_hint(b: u8) -> &'static str {
         0xC9 => "LEAVE",
         0xCC => "INT3",
         0xD0..=0xD3 => "shift r/m, 1/cl",
-        0xD9 => "x87 FPU",
+        0xD8..=0xDF => "x87 FPU",
         0xE8 => "CALL rel32",
         0xE9 => "JMP rel32",
         0xEB => "JMP rel8",

@@ -8,6 +8,83 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 21 — **x87 FPU executor + MSMPEG4 v3 DRV_OPEN unblock**.
+  Round 20 left mpg4c32's `ICOpen('VIDC','MP43')` returning
+  hic=0 because the abbreviated CRT-startup DllMain bailed at
+  the first FPU instruction (the static-ctor table walked by
+  `_initterm` contained `dd 05 88 18 20 1c` — `FLD QWORD
+  […]`), leaving the codec's stored DllMain pointer at
+  `[0x1c2ae55c]` NULL and the handler table uninitialised.
+  Sub-goal A roots out two distinct gates; sub-goal B
+  finishes the DirectShow-filter PE-load pass.
+  - **Sub-goal A1 — x87 FPU lights up** (`src/emulator/isa_fpu.rs`,
+    ~700 LOC). New `FpuState` (eight `f64` ST(i) slots + TOP +
+    SW with C0..C3 condition codes) attached to `Cpu`; new
+    dispatcher routes every `0xD8..=0xDF` form. Memory-form
+    coverage: FLD/FST/FSTP m32/m64, FLD m80, FILD/FIST/FISTP
+    m16/m32/m64, FADD/FSUB/FMUL/FDIV/FDIVR/FCOM/FCOMP across
+    all four operand sizes (single, double, i32, i16),
+    FLDCW/FNSTCW/FLDENV/FNSTENV. Reg-form coverage: FLD ST(i),
+    FXCH, FCHS, FABS, FTST, FLD1/FLDPI/FLDZ/FLDL2T/FLDL2E
+    /FLDLG2/FLDLN2, FRNDINT, FSQRT, FNCLEX, FNINIT, FFREE,
+    FUCOM/FUCOMP, FNSTSW AX, FCOMPP, the eight FADDP/FMULP/
+    FSUBP/FSUBRP/FDIVP/FDIVRP variants. After landing, the
+    abbreviated CRT entry now runs **85 instructions** to
+    DllMain return (was 45 before, returning 0); the second
+    `_initterm` table entry (`0x1c228546: e9 00 00 00 00 dd
+    05 …` — load + store of a global double constant) executes
+    cleanly, and the codec's `[0x1c2ae55c]` stored-DllMain
+    pointer is populated. Real CRT-init signals follow:
+    `kernel32!DisableThreadLibraryCalls` is now invoked by
+    the user's stored DllMain.
+  - **Sub-goal A2 — `vfw32::ic_open` lower-cases ICOPEN
+    fccType / fccHandler** (`src/win32/vfw32.rs`). The
+    Microsoft codec checks `cmp dword [ebx+4], 'vidc'`
+    (lower-case `mmioFOURCC('v','i','d','c')` — the
+    canonical `vfw.h ICTYPE_VIDEO`); Indeo predecessors did
+    not check fccType at all so previous tests passed
+    `b"VIDC"` verbatim. Real Win32 `vfw32!ICOpen`
+    canonicalises the user-supplied 4CC to lower case before
+    staging the ICOPEN block; round 21 mirrors that. After
+    the lower-case fix, **`ICOpen('VIDC','MP43')` returns
+    `hic = 0x1`** (was `0`); 206 instructions of DriverProc
+    then run end-to-end through `DRV_LOAD` + `DRV_ENABLE` +
+    `DRV_OPEN`, allocating per-instance state via
+    `operator new`, copying the `MP43` handler tag into a
+    codec-local slot, and returning a non-zero driver_id.
+    `ICDecompressQuery(input=MP43, output=BI_RGB 24bpp)`
+    returns `ICERR_OK`; `ICDecompressBegin` returns
+    `ICERR_INTERNAL` (-100) — the next-blocker for
+    bit-perfect decode but past the round-21 reach goal of
+    "DRV_OPEN unblocked + ICOpen returns non-zero hic".
+  - **Sub-goal B — `mpg4ds32.ax` + `wmvds32.ax` PE-load
+    closes** with three new `msvcrt` stubs:
+    * `_onexit(_onexit_t func)` — record nothing, return
+      `func` (success per MSDN).
+    * `__dllonexit(_PVFV func, _PVFV** pbegin, _PVFV** pend)`
+      — same shortcut.
+    * `sprintf(buf, fmt, ...)` — supports `%s %d %i %u %x %X
+      %c %p %%` plus width / precision / flag modifiers.
+    Both DirectShow filters now `Sandbox::load()` cleanly
+    (65 imports, 0 missing); image_base 0x1c400000, four
+    exports each.
+- Round 21 sentinel tests:
+  * `tests/round21_fpu_smoke.rs` — seven hand-built code
+    sequences covering FLD m32/m64 + FADD m32 + FILD/FISTP
+    + FNSTSW AX + FXCH + FLDCW/FNSTCW round-trip.
+  * `tests/round21_dsax_load.rs` — both DirectShow
+    filters' `Sandbox::load` closure.
+  * `tests/round21_mp43_decompress.rs` — drives `ICOpen
+    + ICDecompressQuery + ICDecompressBegin +
+    ICDecompress` against the `fourcc-MP43/input.avi`
+    fixture. The `mp43_drv_open_returns_nonzero_hic`
+    sub-test asserts `hic != 0` (the round-21 reach
+    gate); `mp43_keyframe_decompress_through_real_codec`
+    runs the rest of the chain end-to-end without
+    asserting on the bit pattern (deferred to a future
+    round once `ICDecompressBegin`'s remaining
+    `ICERR_INTERNAL` is rooted out).
+
 - Round 20 — **MMX kernels dispatch + MSMPEG4 v3 PE-load
   unblock**, two parallel sub-goals.
   - **Sub-goal A — `[ebp-8]` MMX-enable gate localised to a

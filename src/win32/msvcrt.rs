@@ -74,6 +74,22 @@ pub fn register(registry: &mut Registry) {
     );
     registry.register("msvcrt.dll", "_initterm", stub_initterm as StubFn, 0);
     registry.register("msvcrt.dll", "_purecall", stub_purecall as StubFn, 0);
+    // CRT exit-handler registry (atexit / DLL-onexit hooks). Real
+    // CRTs append the pointer to a per-module list; we let the
+    // codec register handlers, then never actually run them
+    // (DLL_PROCESS_DETACH is not driven through our sandbox).
+    // Both stubs return their first argument verbatim — the MSVC
+    // contract: `_onexit` returns the registered pointer on
+    // success or NULL on failure. Round 21 — surfaced by the
+    // mpg4ds32.ax / wmvds32.ax DirectShow filters.
+    registry.register("msvcrt.dll", "_onexit", stub_onexit as StubFn, 0);
+    registry.register("msvcrt.dll", "__dllonexit", stub_dllonexit as StubFn, 0);
+    // CRT formatted-string family. We support the headline
+    // `sprintf(buf, fmt, ...)` form with `%s`, `%d`, `%u`, `%x`,
+    // `%c`, `%p`, `%%`. Codec messages aren't user-visible so
+    // the formatter doesn't need to match Microsoft's exact
+    // padding / locale behaviour — just a faithful conversion.
+    registry.register("msvcrt.dll", "sprintf", stub_sprintf as StubFn, 0);
     // C heap.
     registry.register("msvcrt.dll", "malloc", stub_malloc as StubFn, 0);
     registry.register("msvcrt.dll", "free", stub_free as StubFn, 0);
@@ -232,6 +248,202 @@ fn stub_free(
     }
     let _ = state.heap.remove(&p);
     Ok(0)
+}
+
+/// `_onexit_t _onexit(_onexit_t func)`. cdecl. Real CRT
+/// appends `func` to a per-module list of process-exit
+/// handlers. We never invoke `DLL_PROCESS_DETACH`, so the
+/// handlers never run — recording them is unnecessary. Return
+/// the input pointer on success per MSDN.
+fn stub_onexit(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let func = arg_dword(cpu, mmu, 0).map_err(|t| trap("_onexit", t))?;
+    Ok(func)
+}
+
+/// `int __dllonexit(_PVFV func, _PVFV** pbegin, _PVFV** pend)`.
+/// cdecl. The MSVC CRT helper that powers `atexit` /
+/// `_onexit` for DLLs. Same shortcut as
+/// [`stub_onexit`] — record nothing, return success.
+fn stub_dllonexit(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let func = arg_dword(cpu, mmu, 0).map_err(|t| trap("__dllonexit", t))?;
+    Ok(func)
+}
+
+/// `int sprintf(char* buffer, const char* format, ...)`. cdecl
+/// variadic. Implements the small subset of conversion specs
+/// codec DLLs actually emit (debug / FOURCC / driver name
+/// strings): `%s %d %u %x %X %c %p %%`. Width and precision
+/// modifiers are accepted and applied with simple
+/// space-padding. Returns the byte count (not including the
+/// terminating NUL) on success.
+fn stub_sprintf(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let buf = arg_dword(cpu, mmu, 0).map_err(|t| trap("sprintf", t))?;
+    let fmt = arg_dword(cpu, mmu, 1).map_err(|t| trap("sprintf", t))?;
+    let mut arg_idx: u32 = 2;
+    let mut out: Vec<u8> = Vec::with_capacity(64);
+    let mut p = fmt;
+    loop {
+        let b = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+        if b == 0 {
+            break;
+        }
+        p = p.wrapping_add(1);
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        // Flags/width/precision parsing — we accept and drop
+        // most of them; for `%s` we honour width via padding.
+        let mut left_align = false;
+        let mut zero_pad = false;
+        let mut width: usize = 0;
+        let mut precision: Option<usize> = None;
+        // Flags
+        loop {
+            let c = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+            match c {
+                b'-' => {
+                    left_align = true;
+                    p = p.wrapping_add(1);
+                }
+                b'0' => {
+                    zero_pad = true;
+                    p = p.wrapping_add(1);
+                }
+                b'+' | b' ' | b'#' => {
+                    p = p.wrapping_add(1);
+                }
+                _ => break,
+            }
+        }
+        // Width
+        loop {
+            let c = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+            if c.is_ascii_digit() {
+                width = width.saturating_mul(10) + (c - b'0') as usize;
+                p = p.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
+        // Precision
+        let mut prec_seen = false;
+        if mmu.load8(p).map_err(|t| trap("sprintf", t))? == b'.' {
+            p = p.wrapping_add(1);
+            prec_seen = true;
+            let mut prec: usize = 0;
+            loop {
+                let c = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+                if c.is_ascii_digit() {
+                    prec = prec.saturating_mul(10) + (c - b'0') as usize;
+                    p = p.wrapping_add(1);
+                } else {
+                    break;
+                }
+            }
+            precision = Some(prec);
+        }
+        // Length modifiers we silently drop (`l`, `h`, `ll`,
+        // `I32`, `I64`, …) — the codec only uses dword args.
+        loop {
+            let c = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+            match c {
+                b'l' | b'h' | b'L' | b'I' | b'j' | b'z' | b't' => p = p.wrapping_add(1),
+                _ => break,
+            }
+        }
+        let spec = mmu.load8(p).map_err(|t| trap("sprintf", t))?;
+        p = p.wrapping_add(1);
+        let _ = prec_seen;
+        let formatted: Vec<u8> = match spec {
+            b'%' => vec![b'%'],
+            b's' => {
+                let s_addr = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                let mut s = Vec::new();
+                let mut q = s_addr;
+                let limit = precision.unwrap_or(8192);
+                for _ in 0..limit {
+                    let c = mmu.load8(q).map_err(|t| trap("sprintf", t))?;
+                    if c == 0 {
+                        break;
+                    }
+                    s.push(c);
+                    q = q.wrapping_add(1);
+                }
+                s
+            }
+            b'c' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                vec![v as u8]
+            }
+            b'd' | b'i' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))? as i32;
+                arg_idx += 1;
+                format!("{v}").into_bytes()
+            }
+            b'u' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                format!("{v}").into_bytes()
+            }
+            b'x' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                format!("{v:x}").into_bytes()
+            }
+            b'X' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                format!("{v:X}").into_bytes()
+            }
+            b'p' => {
+                let v = arg_dword(cpu, mmu, arg_idx).map_err(|t| trap("sprintf", t))?;
+                arg_idx += 1;
+                format!("{v:08X}").into_bytes()
+            }
+            other => {
+                // Unknown spec — emit the raw `%X` literal so the
+                // text isn't silently lost.
+                arg_idx += 1;
+                vec![b'%', other]
+            }
+        };
+        // Apply width padding.
+        let pad = width.saturating_sub(formatted.len());
+        if !left_align {
+            let fill = if zero_pad { b'0' } else { b' ' };
+            out.resize(out.len() + pad, fill);
+        }
+        out.extend_from_slice(&formatted);
+        if left_align {
+            out.resize(out.len() + pad, b' ');
+        }
+    }
+    // NUL-terminate.
+    out.push(0);
+    // Write to guest buffer.
+    for (i, byte) in out.iter().enumerate() {
+        mmu.store8(buf.wrapping_add(i as u32), *byte)
+            .map_err(|t| trap("sprintf", t))?;
+    }
+    Ok((out.len() as u32).saturating_sub(1))
 }
 
 fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {

@@ -320,21 +320,33 @@ pub fn ic_open(
     //
     // ICOPEN layout (vfw.h, 36 bytes, 9 dwords):
     //   +0  DWORD   dwSize       = 36
-    //   +4  DWORD   fccType      = caller's `fcc_type`  ('VIDC')
-    //   +8  DWORD   fccHandler   = caller's `fcc_handler` ('IV31')
+    //   +4  DWORD   fccType      = caller's `fcc_type`  ('vidc')
+    //   +8  DWORD   fccHandler   = caller's `fcc_handler` ('iv31')
     //   +12 DWORD   dwVersion    = 0x00010000 (vfw 1.0)
     //   +16 DWORD   dwFlags      = caller's `mode`
     //   +20 LRESULT dwError      = 0 (out — codec sets on err)
     //   +24 LPVOID  pV1Reserved  = 0
     //   +28 LPVOID  pV2Reserved  = 0
     //   +32 DWORD   dnDevNode    = 0
+    //
+    // Round 21: real Win32 vfw32.dll lowercases fccType /
+    // fccHandler before staging ICOPEN — `vfw.h` defines
+    // `ICTYPE_VIDEO = mmioFOURCC('v','i','d','c')` (lowercase)
+    // and the codec INF files register lowercase handler 4CCs
+    // ('mp43', 'iv31', 'cvid', …). The strict mpg4c32 DRV_OPEN
+    // path tests `[ebx+4] == 'vidc'` (lower); Indeo codecs are
+    // permissive about casing so earlier rounds got away with
+    // passing 'VIDC' through verbatim. Canonicalising here
+    // matches `vfw32!ICOpen` and unblocks MSMPEG4 v3.
     const ICOPEN_SIZE: u32 = 36;
     let icopen = state.arena_alloc(ICOPEN_SIZE)?;
+    let fcc_type_canon = fourcc_to_lower(fcc_type);
+    let fcc_handler_canon = fourcc_to_lower(fcc_handler);
     let bytes: [u8; 36] = {
         let mut b = [0u8; 36];
         b[0..4].copy_from_slice(&ICOPEN_SIZE.to_le_bytes());
-        b[4..8].copy_from_slice(&fcc_type.to_le_bytes());
-        b[8..12].copy_from_slice(&fcc_handler.to_le_bytes());
+        b[4..8].copy_from_slice(&fcc_type_canon.to_le_bytes());
+        b[8..12].copy_from_slice(&fcc_handler_canon.to_le_bytes());
         b[12..16].copy_from_slice(&0x0001_0000u32.to_le_bytes());
         b[16..20].copy_from_slice(&mode.to_le_bytes());
         // dwError, pV1, pV2, dnDevNode all left as 0
@@ -412,6 +424,26 @@ pub fn ic_close(
 /// only when a real codec binary lands in the corpus and surfaces
 /// the same n=0 shape — the fallback is a host-side cushion, not
 /// a registry replacement.
+/// Lower-case every ASCII byte of a FOURCC, leaving non-letter
+/// bytes untouched. The Win32 vfw32 ABI canonicalises 4CCs to
+/// lower case before passing them to the codec — `vfw.h`
+/// defines `ICTYPE_VIDEO = 'vidc'` (lowercase) and codec INF
+/// entries register lowercase handler tags. Round 21 surfaced
+/// the asymmetry with mpg4c32: its `DRV_OPEN` literally tests
+/// `cmp dword [ebx+4], 'vidc'` (lower-case), and Indeo
+/// predecessors only happened to ignore the field. Use this
+/// in [`ic_open`] when staging the ICOPEN block.
+fn fourcc_to_lower(fcc: u32) -> u32 {
+    let bytes = fcc.to_le_bytes();
+    let lowered = [
+        bytes[0].to_ascii_lowercase(),
+        bytes[1].to_ascii_lowercase(),
+        bytes[2].to_ascii_lowercase(),
+        bytes[3].to_ascii_lowercase(),
+    ];
+    u32::from_le_bytes(lowered)
+}
+
 fn is_known_short_return_fcc(fcc: u32) -> bool {
     matches!(
         &fcc.to_le_bytes(),

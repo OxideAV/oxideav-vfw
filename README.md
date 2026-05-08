@@ -9,31 +9,42 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 20 — MMX kernels light up + MSMPEG4 v3 PE-load
-unblocked.** Two parallel sub-goals landed: (A) the round-19
-`[ebp-8]` MMX-enable gate is identified as the
-`HKLM\HARDWARE\DESCRIPTION\System\FloatingPointProcessor`
-registry probe — `RegOpenKeyExA` now synthesises ERROR_SUCCESS
-for that path, the AND-gate closes, and IV50 / IV41 decode
-pipelines start dispatching MMX kernels at scale (1.5M–5M MMX
-instructions per frame); (B) the 13 missing `mpg4c32.dll`
-imports per Milestone 3.1 (kernel32 CreateEventA / CreateThread
-/ SetEvent + msvcrt operator-new / operator-delete /
-_adjust_fdiv / _except_handler3 / _initterm / malloc / free +
-user32 GetScrollPos / SetScrollPos / SetScrollRange + winmm
-GetDriverModuleHandle) land alongside a `data_imports`
-registry channel that handles `_adjust_fdiv` (a *data* symbol,
-not a function — the codec dereferences the IAT slot value).
-`Sandbox::load("mpg4c32.dll", …)` now returns Ok and the PE
-entry point runs through `_initterm` to completion.
+**Round 21 — x87 FPU executor + MSMPEG4 v3 DRV_OPEN
+unblock.** The abbreviated CRT-startup DllMain in mpg4c32
+walks `_initterm`'s static-ctor table; the second entry
+issues `FLD QWORD [const]` + `FSTP QWORD [global]` to copy
+a constant double into a global, but round 20's emulator
+treated every x87 escape as `UndefinedOpcode`. Round 21
+implements an eight-deep f64 FPU (~700 LOC in
+`src/emulator/isa_fpu.rs`) covering FLD/FST/FSTP for m32 /
+m64 / m80 / i16 / i32 / i64, FADD/FSUB/FMUL/FDIV across all
+operand widths, FXCH/FCHS/FABS/FSQRT/FRNDINT, the FCOM /
+FUCOM family with C0..C3 condition-code bookkeeping,
+FNSTSW AX, and FLDCW/FNSTCW/FLDENV/FNSTENV. With the FPU
+lit up, mpg4c32's CRT entry now runs **85** instructions
+(was 45) to DllMain returning **`1`** (was `0`); the
+codec's stored DllMain pointer is populated; and a real
+`kernel32!DisableThreadLibraryCalls` call surfaces. A
+parallel fix in `vfw32::ic_open` lower-cases the ICOPEN
+fccType / fccHandler before calling DriverProc — the
+Microsoft codec literally checks `cmp dword [ebx+4],
+'vidc'` (lowercase, per `vfw.h ICTYPE_VIDEO`); Indeo
+predecessors ignored the field so callers passed `b"VIDC"`
+verbatim. After both fixes, **`ICOpen('VIDC','MP43')`
+returns `hic = 0x1`** and DriverProc dispatches
+DRV_LOAD/DRV_ENABLE/DRV_OPEN end-to-end. ICDecompressBegin
+is the next-blocker (returns `ICERR_INTERNAL`). Sub-goal B
+adds three msvcrt stubs (`_onexit`, `__dllonexit`,
+`sprintf`) which closes the PE-load gate for `mpg4ds32.ax`
++ `wmvds32.ax` (DirectShow filters).
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 / 20 | `ICERR_OK` (8/8 frames; **MMX kernels active**) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 / 20 | `ICERR_OK` (8/8 frames each; **MMX kernels active**) |
-| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 20 | PE-load + entry point ✓; ICOpen('MP43') reaches DriverProc but rejects FOURCC pending DllMain rework |
-| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD — same import set as `mpg4ds32.ax` | 21 (planned) | PE-load blocked on 6 imports |
+| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 21 | DRV_LOAD/DRV_ENABLE/DRV_OPEN ✓; ICOpen('MP43') returns hic=1; ICDecompressBegin returns `ICERR_INTERNAL` (next-blocker) |
+| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD | 21 | PE-load ✓ (`mpg4ds32.ax` + `wmvds32.ax` DS filters); DriverProc unexplored |
 
 Round 20 sub-goal A localised the MMX gate to a registry
 probe: the codec calls
@@ -64,9 +75,20 @@ it (initial value 0 = "no Pentium-FDIV fix-up needed").
 `AddressOfEntryPoint` when no `DllMain` named export is
 present (mpg4c32 ships only `DriverProc`). With this in
 place, mpg4c32's CRT entry runs through `malloc` + `_initterm`
-to completion. ICOpen('MP43') reaches DriverProc and
-dispatches DRV_OPEN; round 21 picks up where the codec
-rejects the FOURCC.
+to completion.
+
+Round 21 closes the DRV_OPEN gate for `mpg4c32.dll`: real
+x87 FPU semantics in a new `emulator::isa_fpu` module
+(eight ST(i) slots + TOP + status word, full m32/m64/m80
+load+store + arithmetic + condition codes) light up the
+`_initterm` static-ctor path, and `vfw32::ic_open`
+canonicalises the ICOPEN fcc fields to lower case to match
+the `vfw.h ICTYPE_VIDEO = mmioFOURCC('v','i','d','c')`
+ABI. ICOpen('VIDC','MP43') now returns hic=1; the next
+blocker is `ICDecompressBegin`'s `ICERR_INTERNAL`. Sub-goal
+B adds three more msvcrt stubs (`_onexit`, `__dllonexit`,
+`sprintf`) that close the PE-load gate for `mpg4ds32.ax` +
+`wmvds32.ax`.
 
 The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
