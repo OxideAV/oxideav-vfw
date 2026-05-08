@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 29 — **`oxideav_core::Decoder` trait wired end-to-end for
+  VfW codecs discovered through round-28's auto-discovery path.**
+  `SandboxedVfwDecoder` (in `discovery::codec`) now retains the
+  `Sandbox` + the `HIC` across `send_packet` / `receive_frame`
+  calls and threads the full `ICDecompressQuery →
+  ICDecompressBegin → ICDecompress → ICDecompressEnd` lifecycle:
+  - `ensure_open()` — lazy on the first `send_packet`. Loads the
+    DLL, runs DllMain, opens the codec, runs query+begin against a
+    synthesised input `BITMAPINFOHEADER` (FourCC from the
+    `DiscoveryRecord`, 24bpp, dimensions from `CodecParameters`)
+    + a fixed BI_RGB 24bpp output BIH. Width/height are required
+    on `CodecParameters` — round 24 confirmed VfW codecs cannot
+    infer dimensions from the bitstream alone.
+  - `receive_frame()` — calls `ic_decompress` with
+    `ICDECOMPRESS_NOTKEYFRAME` set unless `packet.flags.keyframe`,
+    then materialises the codec's bottom-up BGR24 output as a
+    top-down `Frame::Video` with `PixelFormat::Bgr24` (the new
+    `oxideav_vfw::discovery::output_pixel_format()` helper exposes
+    the format choice for downstream wiring).
+  - `Drop` — calls `ic_decompress_end` (when begin completed)
+    + `ic_close` so the codec's per-instance state and the HIC
+    table both unwind cleanly.
+  - DirectShow codecs (`Kind::DirectShow`) still return
+    `Error::Unsupported` from `make_decoder` — that path needs
+    `IMemAllocator` + `IMediaSample` host stubs (round 30+).
+  - `tests/round29_decoder_trait_integration.rs` — 16 new tests
+    (workspace total 473) covering: BGR24 pixel-format contract,
+    `width-is-None` rejection, DirectShow `Unsupported`
+    preservation, `codec_id_for` stability, and 4 byte-equality
+    checks (`gop-30 / with-skip-mbs / motion-pan / intra-pred-active`)
+    that drive 1..3 frames through *both* the new trait path and
+    the round-24 manual `Sandbox::ic_decompress` path and assert
+    the per-frame BGR24 output is byte-identical (after the
+    bottom-up→top-down flip the trait path applies). Confirms the
+    trait integration adds no semantic skew vs the manual path.
+
 - Round 28 — **codec auto-discovery at `register()` time.** New
   `src/discovery/` module (~700 LOC) walks a configurable
   discovery path, probes every `*.dll` / `*.ax`, and registers

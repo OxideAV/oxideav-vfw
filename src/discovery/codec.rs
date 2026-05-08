@@ -17,8 +17,10 @@ use std::sync::{Mutex, OnceLock};
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecTag, Decoder, Error, Frame,
-    Packet, Result, RuntimeContext,
+    Packet, PixelFormat, Result, RuntimeContext, VideoFrame, VideoPlane,
 };
+
+use crate::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
 
 use super::probe::{fourcc_to_bytes, Kind};
 
@@ -145,15 +147,29 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 }
 
 // ────────────────────────────────────────────────────────────────
-// SandboxedVfwDecoder — thin Decoder impl that holds the Sandbox
-// + the codec FourCC and dispatches `send_packet` →
-// `ic_decompress`. Round 28 keeps the implementation minimal: we
-// hold the sandbox open across packets but defer real frame
-// reception (with an actual ICDecompressBegin/End handshake) to
-// the existing manual API. The auto-discovery path's job is to
-// **register** the codec; full per-frame decode through the
-// generic `Decoder` trait can ride on the sandboxed manual API
-// once consumers wire the pixel-format negotiation.
+// SandboxedVfwDecoder — Decoder impl that holds the Sandbox + the
+// codec instance handle (HIC) across packets and dispatches
+// `send_packet` → `ic_decompress` → `Frame::Video`.
+//
+// Round 29 wires the full ICDecompressQuery → ICDecompressBegin →
+// ICDecompress → ICDecompressEnd handshake:
+//
+// * `ensure_open` (lazy on first `send_packet`) loads the DLL,
+//   drives DllMain, opens the codec handle, runs the
+//   query+begin handshake against a synthesised input
+//   `BITMAPINFOHEADER` (FOURCC = record.fourcc, 24bpp coded
+//   from the codec parameters) and a fixed BI_RGB 24bpp output
+//   `BITMAPINFOHEADER`.
+// * `receive_frame` consumes the pending packet, calls
+//   `ic_decompress` with `ICDECOMPRESS_NOTKEYFRAME` set unless
+//   `packet.flags.keyframe`, then materialises the codec's
+//   bottom-up BGR24 output as a top-down `Frame::Video` with
+//   `PixelFormat::Bgr24`.
+// * `Drop` calls `ic_decompress_end` then `ic_close`.
+//
+// DirectShow codecs (`Kind::DirectShow`) still return
+// `Error::Unsupported` — that path needs `IMemAllocator` +
+// `IMediaSample` host stubs (round 30+).
 // ────────────────────────────────────────────────────────────────
 
 struct SandboxedVfwDecoder {
@@ -169,56 +185,180 @@ struct SandboxedVfwDecoder {
     image: Option<crate::pe::Image>,
     /// Currently-open ICOpen handle. `0` means "not opened yet".
     hic: u32,
+    /// True once `ICDecompressBegin` has run successfully on
+    /// `hic`. `Drop` calls `ICDecompressEnd` only when set.
+    begin_done: bool,
+    /// Stream width / height taken from `CodecParameters`. Required
+    /// — VfW codecs need explicit dimensions in the input BIH
+    /// (the bitstream alone is insufficient for pre-decode setup).
+    width: u32,
+    height: u32,
+    /// Source BIH FOURCC, derived from `record.fourcc`.
+    fourcc_bytes: [u8; 4],
+    /// Pending packet awaiting `receive_frame`. Cleared on each
+    /// frame surfaced.
     pending: Option<Packet>,
     eof: bool,
 }
 
 impl SandboxedVfwDecoder {
     fn new(record: DiscoveryRecord, params: CodecParameters) -> Result<Self> {
+        let width = params.width.ok_or_else(|| {
+            Error::invalid(
+                "vfw discovery: CodecParameters.width is None — VfW codecs \
+                 need an explicit coded width to populate BITMAPINFOHEADER \
+                 before ICDecompressBegin",
+            )
+        })?;
+        let height = params.height.ok_or_else(|| {
+            Error::invalid(
+                "vfw discovery: CodecParameters.height is None — VfW codecs \
+                 need an explicit coded height to populate BITMAPINFOHEADER \
+                 before ICDecompressBegin",
+            )
+        })?;
+        let fourcc_bytes = fourcc_to_bytes(&record.fourcc).ok_or_else(|| {
+            Error::other(format!(
+                "vfw discovery: bad fourcc {:?} in record",
+                record.fourcc
+            ))
+        })?;
         Ok(SandboxedVfwDecoder {
             codec_id: params.codec_id.clone(),
             record,
             sandbox: None,
             image: None,
             hic: 0,
+            begin_done: false,
+            width,
+            height,
+            fourcc_bytes,
             pending: None,
             eof: false,
         })
     }
 
+    /// Build the input BIH used for query/begin — `size_image` is
+    /// stubbed to 0 here; per-packet `ic_decompress` overrides the
+    /// field with the actual encoded byte count.
+    fn build_input_bih(&self, size_image: u32) -> Bih {
+        Bih {
+            bi_size: 40,
+            width: self.width as i32,
+            height: self.height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: self.fourcc_bytes,
+            size_image,
+            x_pels_per_meter: 0,
+            y_pels_per_meter: 0,
+            clr_used: 0,
+            clr_important: 0,
+        }
+    }
+
+    /// Build the output BIH — fixed BI_RGB 24bpp (BGR byte order
+    /// on disk; bottom-up since `height` is positive). round-24
+    /// confirmed mpg4c32 honours BI_RGB but rejects 32bpp; Indeo
+    /// (IR32_32 / IR50_32 round 7+) likewise.
+    fn build_output_bih(&self) -> Bih {
+        Bih {
+            bi_size: 40,
+            width: self.width as i32,
+            height: self.height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: [0; 4], // BI_RGB
+            size_image: self.output_capacity(),
+            x_pels_per_meter: 0,
+            y_pels_per_meter: 0,
+            clr_used: 0,
+            clr_important: 0,
+        }
+    }
+
+    fn output_capacity(&self) -> u32 {
+        self.width * self.height * 3
+    }
+
+    /// Lazy: load DLL, install codec, ICOpen, run ICDecompressQuery
+    /// + ICDecompressBegin so the codec is primed for per-packet
+    ///   `ic_decompress` calls.
     fn ensure_open(&mut self) -> Result<()> {
-        if self.sandbox.is_some() {
+        if self.begin_done {
             return Ok(());
         }
-        let bytes = std::fs::read(&self.record.dll_path)
-            .map_err(|e| Error::other(format!("vfw discovery: read DLL failed: {e}")))?;
-        let mut sb = crate::Sandbox::new();
-        let img = sb
-            .load("codec.dll", &bytes)
-            .map_err(|e| Error::other(format!("vfw discovery: Sandbox::load failed: {e}")))?;
-        sb.install_codec(&img)
-            .map_err(|e| Error::other(format!("vfw discovery: install_codec failed: {e}")))?;
-        // Drive DllMain so any per-DLL CRT init runs.
-        let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
-        let fcc = fourcc_to_bytes(&self.record.fourcc).ok_or_else(|| {
-            Error::other(format!(
-                "vfw discovery: bad fourcc {:?} in record",
-                self.record.fourcc
-            ))
-        })?;
-        let fcc_handler = u32::from_le_bytes(fcc);
-        let fcc_type = u32::from_le_bytes(*b"VIDC");
-        let hic = sb
-            .ic_open(fcc_type, fcc_handler, 0)
-            .map_err(|e| Error::other(format!("vfw discovery: ic_open failed: {e}")))?;
-        if hic == 0 {
-            return Err(Error::other(
-                "vfw discovery: ICOpen returned NULL (codec rejected handler FourCC)",
-            ));
+        if self.sandbox.is_none() {
+            let bytes = std::fs::read(&self.record.dll_path)
+                .map_err(|e| Error::other(format!("vfw discovery: read DLL failed: {e}")))?;
+            let mut sb = crate::Sandbox::new();
+            // VfW codecs (esp. mpg4c32) need a generous instruction
+            // budget to walk the larger fixtures' P-frames; the
+            // round-24 manual path uses 8 G instructions for the
+            // 5-6-frame 352×288 fixtures.
+            sb.cpu.set_instr_limit(8_000_000_000);
+            let img = sb
+                .load("codec.dll", &bytes)
+                .map_err(|e| Error::other(format!("vfw discovery: Sandbox::load failed: {e}")))?;
+            sb.install_codec(&img)
+                .map_err(|e| Error::other(format!("vfw discovery: install_codec failed: {e}")))?;
+            // Drive DllMain so any per-DLL CRT init runs.
+            let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+
+            let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
+            let fcc_type = u32::from_le_bytes(*b"VIDC");
+            // Mode 2 = ICMODE_COMPRESS in vfw.h — but the round-24
+            // manual path uses 2 here for MP43 because Microsoft's
+            // codecs have historically been permissive about the
+            // mode word at DRV_OPEN; keep the same value as the
+            // manual path so the trait + manual paths exercise the
+            // identical DRV_OPEN sequence (round-29 byte-equality
+            // requirement). See `tests/round24_mp43_multiframe_and_wmv.rs`.
+            let hic = sb
+                .ic_open(fcc_type, fcc_handler, 2)
+                .map_err(|e| Error::other(format!("vfw discovery: ic_open failed: {e}")))?;
+            if hic == 0 {
+                return Err(Error::other(
+                    "vfw discovery: ICOpen returned NULL (codec rejected handler FourCC)",
+                ));
+            }
+            self.sandbox = Some(sb);
+            self.image = Some(img);
+            self.hic = hic;
         }
-        self.sandbox = Some(sb);
-        self.image = Some(img);
-        self.hic = hic;
+
+        // ICDecompressQuery + ICDecompressBegin against the input/
+        // output BIH templates. We run these here (not in `new`)
+        // because the sandbox is constructed lazily and the
+        // pre-handshake DllMain call may have already mutated the
+        // codec's internal state — running query/begin before the
+        // first packet keeps the trait path's lifecycle predictable.
+        let bih_in = self.build_input_bih(0);
+        let bih_out = self.build_output_bih();
+        let hic = self.hic;
+        let sb = self
+            .sandbox
+            .as_mut()
+            .expect("sandbox just constructed above");
+        let q = sb
+            .ic_decompress_query(hic, &bih_in, Some(&bih_out))
+            .map_err(|e| Error::other(format!("vfw discovery: ic_decompress_query failed: {e}")))?;
+        if q != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery: ic_decompress_query returned {q:#010x} \
+                 (want 0 = ICERR_OK; codec rejected the input/output format)"
+            )));
+        }
+        let b = sb
+            .ic_decompress_begin(hic, &bih_in, &bih_out)
+            .map_err(|e| Error::other(format!("vfw discovery: ic_decompress_begin failed: {e}")))?;
+        if b != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery: ic_decompress_begin returned {b:#010x} \
+                 (want 0 = ICERR_OK)"
+            )));
+        }
+        self.begin_done = true;
         Ok(())
     }
 }
@@ -240,26 +380,62 @@ impl Decoder for SandboxedVfwDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if self.pending.take().is_none() {
-            return if self.eof {
-                Err(Error::Eof)
-            } else {
-                Err(Error::NeedMore)
-            };
+        let packet = match self.pending.take() {
+            Some(p) => p,
+            None => {
+                return if self.eof {
+                    Err(Error::Eof)
+                } else {
+                    Err(Error::NeedMore)
+                };
+            }
+        };
+
+        let hic = self.hic;
+        let bih_in = self.build_input_bih(packet.data.len() as u32);
+        let bih_out = self.build_output_bih();
+        let cap = self.output_capacity();
+        let flags = if packet.flags.keyframe {
+            0
+        } else {
+            ICDECOMPRESS_NOTKEYFRAME
+        };
+        let sb = self.sandbox.as_mut().ok_or_else(|| {
+            Error::other("vfw discovery: receive_frame called without prior send_packet")
+        })?;
+        let (lr, raw) = sb
+            .ic_decompress(hic, flags, &bih_in, &packet.data, &bih_out, cap)
+            .map_err(|e| Error::other(format!("vfw discovery: ic_decompress trapped: {e}")))?;
+        if lr != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery: ic_decompress returned {lr:#010x} (want 0 = ICERR_OK)"
+            )));
         }
-        // Round 28: the auto-discovery path REGISTERS the codec —
-        // full per-frame decode through the generic `Decoder`
-        // trait still leans on the manual `Sandbox::ic_decompress`
-        // API (consumers must drive ICDecompressBegin / pixel-format
-        // negotiation manually). The trait surface returns a clear
-        // "use the manual API" error rather than silently dropping
-        // the packet.
-        Err(Error::unsupported(
-            "vfw discovery: per-frame Frame production through the generic \
-             Decoder trait is not yet wired (round 28 registers the codec; \
-             round 29 wires ICDecompress* + pixel-format negotiation). \
-             Use the manual `Sandbox::ic_decompress` API in the meantime.",
-        ))
+
+        // Codec wrote BGR24 bottom-up because `bih_out.height >= 0`.
+        // Convert to top-down so consumers can treat the buffer as
+        // a row-major frame without container-aware flipping.
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let stride = width * 3;
+        let mut data = vec![0u8; stride * height];
+        if raw.len() < stride * height {
+            return Err(Error::other(format!(
+                "vfw discovery: ic_decompress returned {} bytes, expected {} (stride*height)",
+                raw.len(),
+                stride * height,
+            )));
+        }
+        for row in 0..height {
+            let src_off = (height - 1 - row) * stride;
+            let dst_off = row * stride;
+            data[dst_off..dst_off + stride].copy_from_slice(&raw[src_off..src_off + stride]);
+        }
+
+        Ok(Frame::Video(VideoFrame {
+            pts: packet.pts,
+            planes: vec![VideoPlane { stride, data }],
+        }))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -270,12 +446,26 @@ impl Decoder for SandboxedVfwDecoder {
 
 impl Drop for SandboxedVfwDecoder {
     fn drop(&mut self) {
-        if let (Some(sb), hic) = (self.sandbox.as_mut(), self.hic) {
-            if hic != 0 {
-                let _ = sb.ic_close(hic);
+        if let Some(sb) = self.sandbox.as_mut() {
+            if self.hic != 0 {
+                if self.begin_done {
+                    let _ = sb.ic_decompress_end(self.hic);
+                }
+                let _ = sb.ic_close(self.hic);
             }
         }
     }
+}
+
+/// Stream-level pixel format for [`Frame::Video`]s emitted by
+/// [`SandboxedVfwDecoder`]. The decoder always renders to
+/// [`PixelFormat::Bgr24`] — VfW codecs reliably honour BI_RGB
+/// 24bpp output (round-24 confirmed mpg4c32 rejects 32bpp + most
+/// YUV outputs); the bottom-up storage is flipped to top-down
+/// before the frame leaves the decoder, so consumers always
+/// receive a row-major BGR24 buffer.
+pub fn output_pixel_format() -> PixelFormat {
+    PixelFormat::Bgr24
 }
 
 #[cfg(test)]
