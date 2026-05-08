@@ -144,6 +144,63 @@ pub fn register(registry: &mut Registry) {
     registry.register("user32.dll", "SetScrollPos", stub_zero4 as StubFn, 4);
     // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setscrollrange
     registry.register("user32.dll", "SetScrollRange", stub_zero5 as StubFn, 5);
+
+    // ---- Round-24 additions (msadds32.ax PE-load surface) ---------
+    //
+    // The MS-Audio splitter `msadds32.ax` registers + tears down a
+    // hidden window class on `DLL_PROCESS_ATTACH` /
+    // `DLL_PROCESS_DETACH`. We never enter that window-class code
+    // because we never drive `msadds32` through `DllMain`, but the
+    // import must resolve at PE-load time. Per MSDN both functions
+    // are `__stdcall`, return `BOOL` (`1` = success), and
+    // `RegisterClassExA` returns an `ATOM` (non-zero on success).
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclassexa
+    // ATOM RegisterClassExA(const WNDCLASSEXA *lpwcx)  — 1 arg.
+    registry.register(
+        "user32.dll",
+        "RegisterClassExA",
+        stub_register_class_ex_a as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-unregisterclassa
+    // BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance)
+    // — 2 args, ret 8.
+    registry.register(
+        "user32.dll",
+        "UnregisterClassA",
+        stub_unregister_class_a as StubFn,
+        2,
+    );
+}
+
+/// `ATOM RegisterClassExA(const WNDCLASSEXA *lpwcx)` — return a
+/// non-zero synthetic atom (`0xC001`, the first valid global atom
+/// per MSDN AddAtom / `MAXINTATOM = 0xC000`). The codec only
+/// inspects the return for `non-zero == success`; the host never
+/// looks the atom up later because no window is ever created.
+fn stub_register_class_ex_a(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0xC001)
+}
+
+/// `BOOL UnregisterClassA(LPCSTR lpClassName, HINSTANCE hInstance)`
+/// — return `TRUE` (1). The codec calls this from its `DLL_PROCESS_DETACH`
+/// teardown to drop the class registration; with no window class
+/// actually registered host-side, "success" is the right answer
+/// (mirrors what real Windows would return for an in-process
+/// class that was never registered against a real desktop).
+fn stub_unregister_class_a(
+    _: &mut Cpu,
+    _: &mut Mmu,
+    _: &mut HostState,
+    _: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
 }
 
 // ---- Generic fail-soft stubs reused across many user32 entries -----

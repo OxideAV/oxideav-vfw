@@ -9,36 +9,55 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 23 — MSMPEG4 v3 ffmpeg-oracle keyframe cross-check +
-I+P 2-frame decode.** Round 22 landed the first MP43 keyframe
-decode but only checked "any non-zero output". Round 23
-raises the bar:
+**Round 24 — multi-frame MP43 decode at 352×288 + WMV
+DirectShow-ABI verdict.** Round 23 unblocked I+P at 176×144
+on a 2-frame fixture; round 24 scales to the 5..6 frame
+fixtures at 352×288 and resolves the WMV1/WMV2 question.
 
-* **A — ffmpeg-oracle PSNR cross-check.** A new
-  `tests/round23_mp43_pframe_and_oracle.rs::mp43_keyframe_matches_ffmpeg_oracle_psnr`
-  spawns `ffmpeg -frames:v 1 -pix_fmt bgr24 -f rawvideo -` as
-  a black-box validator and compares mpg4c32's BGR24 output
-  against ffmpeg's. Today's run reports **PSNR 42.90 dB** on
-  the solid-blue 176×144 keyframe — well above the 30 dB
-  pass floor. Drift is YUV→BGR matrix difference (mpg4c32
-  output `ff 02 04`, ffmpeg swscale `ff 01 01`); no
-  structural decode mismatch. Skipped gracefully when ffmpeg
-  is not on `PATH`.
-* **B — sequential I + P decode.** The
-  `i-frame-then-p-frame-176x144` fixture (a `-vtag DIV3`
-  2-frame I+P encode whose elementary bitstream is plain
-  MSMPEG4 v3) decodes through both frames: `ICERR_OK` on
-  both, I-frame writes 67 639 / 76 032 non-zero bytes,
-  P-frame writes 67 698 / 76 032 — mpg4c32 maintains its
-  reference-frame state across calls. The 97-byte P-frame
-  consumes 1.13 M emulator instructions (vs. 13 M for the
-  keyframe).
-* **C — state-field audit.** The round-22 wrapper-handshake
-  plant at `[+0xb4..+0xc8]` survives `ICDecompressBegin`
-  intact; the disasm-flagged copy target at
-  `[+0x15b0..+0x15c4]` stays zero throughout BEGIN +
-  keyframe DECOMPRESS — the relocation path does not fire
-  under the current plant.
+* **A — multi-frame MP43.** New
+  `tests/round24_mp43_multiframe_and_wmv.rs` walks mpg4c32
+  through five `docs/video/msmpeg4-fixtures/` fixtures at
+  352×288: **17/17 frames** all return `ICERR_OK` with
+  > 25% non-zero output (gop-30 6/6, with-skip-mbs 5/5,
+  motion-pan 4/4, intra-pred-active 1/1, qscale-high 1/1).
+  Exercises `use_skip_mb_code=1` + alternate-MV-VLC +
+  qscale=16 + AC-prediction paths the round-23 fixture
+  didn't reach. Per-352×288 P-frame settles at ~5 M
+  emulator instructions; state carries cleanly across six
+  successive `ICDecompress` calls inside one `ICOpen`.
+* **B — WMV1/WMV2 verdict.** Same test file probes
+  `WMVDS32.AX` and `MPG4DS32.AX` through `DRV_LOAD →
+  DRV_ENABLE → DRV_OPEN` with every plausible handler 4CC.
+  Both binaries **lack a `DriverProc` export** — they are
+  pure DirectShow filters (`.ax` extension, expose
+  `DllGetClassObject` + `IBaseFilter`-derived COM objects),
+  not VfW drivers. The VfW message ABI is therefore
+  fundamentally absent in the wmpcdcs8-2001 bundle.
+  Round-25+ would either implement a minimal IBaseFilter /
+  IPin / IMemAllocator DirectShow wrapper, or source a
+  VfW-shaped WMV decoder (some early WMP releases shipped
+  `wmvcore.dll` with VfW-compat exports).
+* **Matrix delta probe.** mpg4c32 rejects every YUV output
+  4CC (YV12 / I420 / IYUV / YUY2 / UYVY → `ICERR_BADFORMAT`)
+  through `ICDecompressQuery`; only BI_RGB is honoured.
+  The round-23 ~12 dB delta vs ffmpeg is therefore a
+  property of the codec's internal BGR converter, not a
+  selectable host-side option. The same test file ships a
+  clean-room BT.601 limited-range YUV→BGR converter (from
+  BT.601-7 Annex 1) ready for the round-25 host-side
+  renderer once mpg4c32 is rerouted (or replaced) to
+  surface its YUV.
+* **ICINFO_SIZE = 568 strict-codec gate.** New constant
+  documents mpg4c32's `cmp [ebp+0x10], 0x238 / jb
+  .return_zero` gate at `DriverProc+0x999`. Round-20's
+  experimental `ICGetInfo(cb=80)` hit it silently;
+  `cb=568` populates the full identity card
+  (`fccType='vidc' / fccHandler='MP43' / dwFlags=0x28 /
+  dwVersion=1 / dwVersionICM=0x104`). Two `user32` stubs
+  added (`RegisterClassExA` → 0xC001, `UnregisterClassA`
+  → TRUE) for the `msadds32.ax` audio-splitter PE-load
+  surface; the splitter itself remains parked off the
+  critical path.
 
 **Round 22 — MSMPEG4 v3 ICDecompressBegin + first keyframe
 decode unblock.** Round 21 left ICDecompressBegin returning
@@ -61,8 +80,8 @@ init the begin path runs after the GUID gate clears.
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 / 20 | `ICERR_OK` (8/8 frames; **MMX kernels active**) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 / 20 | `ICERR_OK` (8/8 frames each; **MMX kernels active**) |
-| MSMPEG4 v3 (DIV3/MP43) | `mpg4c32.dll` (VfW) | `fourcc-MP43` keyframe + `i-frame-then-p-frame` I+P | 22 / 23 | `ICERR_OK` (I+P 2/2 frames; **PSNR 42.9 dB vs ffmpeg oracle**) |
-| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD | 21 | PE-load ✓ (`mpg4ds32.ax` + `wmvds32.ax` DS filters); DriverProc unexplored |
+| MSMPEG4 v3 (DIV3/MP43) | `mpg4c32.dll` (VfW) | `fourcc-MP43` keyframe + I+P 176×144 + 5 multi-frame 352×288 fixtures | 22 / 23 / 24 | `ICERR_OK` (**17/17 frames** at 352×288 + 2/2 at 176×144; PSNR 42.9 dB vs ffmpeg oracle) |
+| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` (DS filter) | n/a | 21 / 24 | PE-load ✓; lacks `DriverProc` export — DirectShow ABI, not VfW. Needs IBaseFilter wrapper |
 
 Round 20 sub-goal A localised the MMX gate to a registry
 probe: the codec calls

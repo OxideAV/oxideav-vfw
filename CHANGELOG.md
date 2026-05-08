@@ -8,6 +8,128 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 24 — **Multi-frame MP43 decode + WMV/DirectShow ABI
+  verdict + ICGetInfo `cb` size-gate fix +
+  user32!UnregisterClassA stub**. Twin main sub-goals plus
+  two follow-ups on top of the round-23 I+P unblock:
+  - **Follow-up 1 — ICGetInfo against mpg4c32 returns 568
+    bytes (was 0).** Round-20 noted that `ICGetInfo` came back
+    empty on mpg4c32 even though `ICOpen` + `ICDecompressQuery`
+    succeeded. Static disasm of `mpg4c32!DriverProc+0x999..0x99c`
+    surfaced the gate:
+    ```text
+        mov  ebx, 0x238       ; sizeof(ICINFO) = 568
+        cmp  [ebp+0x10], ebx  ; lParam2 (cb)
+        jb   .return_zero
+    ```
+    Real `vfw32!ICGetInfo` always passes `sizeof(ICINFO) = 568`
+    as `lParam2`; round-20's research call passed `cb=80`,
+    which is `< 568`, so mpg4c32 short-returned 0 silently
+    (no error indication). Fix: new public constant
+    `oxideav_vfw::win32::vfw32::ICINFO_SIZE = 568`, round-20
+    test updated to use it, doc-comment on
+    `vfw32::ic_get_info` calls out the strict-codec
+    requirement, and a new test
+    `tests/round24_mp43_multiframe_and_wmv.rs::mp43_get_info_returns_full_icinfo_record`
+    verifies mpg4c32 with `cb=568` returns:
+    `dwSize=0x238`, `fccType='vidc'`, `fccHandler='MP43'`,
+    `dwFlags=0x28`, `dwVersion=1`, `dwVersionICM=0x104`, plus
+    `szName="MP43"` (UTF-16LE). Indeo predecessors
+    (`IR32_32.DLL`, `IR41_32.AX`) accept `cb < 568` and write
+    a truncated header — they're the lenient case; mpg4c32 is
+    the strict case host code must conform to.
+  - **Follow-up 2 — `user32!UnregisterClassA` +
+    `RegisterClassExA` stubs registered.** `msadds32.ax` (the
+    audio splitter from wmpcdcs8-2001) imports both for
+    hidden-window-class registration in its
+    `DLL_PROCESS_ATTACH` / `DLL_PROCESS_DETACH` hooks.
+    Fail-soft stubs ship in `src/win32/user32.rs` —
+    `RegisterClassExA → 0xC001` (synthetic global atom),
+    `UnregisterClassA → 1` (TRUE per MSDN BOOL convention).
+    Test
+    `tests/round24_mp43_multiframe_and_wmv.rs::user32_unregister_class_a_stub_registered`
+    asserts both stubs resolve through the registry. msadds32
+    has additional unsatisfied imports
+    (CreateWindowExA / GetMessageA / DispatchMessageA / …);
+    the audio-splitter window pump is parked off the round-24
+    critical path — closing those imports is a future-round
+    responsibility per user instruction
+    ("wire the stub, don't drive msadds32 through DRV_LOAD or
+    anything else").
+  - **Sub-goal A — multi-frame MP43 across the larger
+    fixtures.** Round 23 only exercised a 2-frame I+P fixture
+    (176×144). New test
+    `tests/round24_mp43_multiframe_and_wmv.rs` drives mpg4c32
+    through the larger `docs/video/msmpeg4-fixtures/` fixtures
+    at 352×288: gop-30 (6/6 frames), with-skip-mbs (5/5),
+    motion-pan (4/4), intra-pred-active (1/1), qscale-high
+    (1/1) — **17/17 frames** total, every one returning
+    `ICERR_OK` with > 25% non-zero output. Exercises mb-skip
+    + alternate-MV-VLC + `use_skip_mb_code=1` + qscale=16
+    paths the round-23 fixture didn't reach. Per-frame cost
+    settles at ~5 M emulator instructions on a 352×288
+    P-frame (vs. ~8–9 M for the I-frame and the round-23 13 M
+    that included codec startup). State carries cleanly across
+    six successive `ICDecompress` calls inside one `ICOpen`.
+  - **Sub-goal B — WMV1/WMV2 DirectShow ABI verdict.** New
+    test probes drive `WMVDS32.AX` and `MPG4DS32.AX` (both
+    PE-load green since round 21) through the VfW
+    `DRV_LOAD → DRV_ENABLE → DRV_OPEN` sequence with every
+    plausible handler 4CC (`WMV1`/`WMV2`/`wmv1`/`wmv2`/`WMVA`/
+    `WMVP` for WMV; `MP43`/`mp43`/`DIV3`/`div3` for MPG4DS32).
+    Verdict: **neither binary exports `DriverProc`.** Both are
+    pure DirectShow filters (`.ax` extension, expose
+    `DllGetClassObject` + `IBaseFilter`-derived COM objects);
+    the VfW `DriverProc` ABI is fundamentally absent.
+    Conclusion: WMV1/WMV2 decode through the wmpcdcs8-2001
+    bundle requires a DirectShow IBaseFilter wrapper — a
+    different ABI than VfW. Future round candidates: (a)
+    implement a minimal IBaseFilter / IPin / IMemAllocator
+    wrapper to drive `wmvds32.ax` through DirectShow, or (b)
+    source a VfW-shaped WMV decoder (Microsoft shipped
+    `wmvcore.dll` with VfW-compat exports in some early WMP
+    releases). Round-23 mpg4c32 path (a real VfW driver, not
+    a DirectShow filter) remains the project's MSMPEG4-family
+    decode story.
+  - **Pivot probes — matrix delta investigation.** Same test
+    file runs `ICDecompressQuery` against five YUV output
+    candidates (YV12 / I420 / IYUV / YUY2 / UYVY) to test
+    whether mpg4c32 will hand back its native YUV frame and
+    bypass its internal BGR converter. Verdict: every YUV
+    candidate returns `0xfffffffe` (`ICERR_BADFORMAT`); the
+    codec only honours BI_RGB output via this VfW surface.
+    The round-23 ~12 dB matrix delta vs ffmpeg is therefore
+    a property of mpg4c32's internal BGR converter and would
+    need either a disasm-driven mirror of its coefficients or
+    a host-side post-processor — deferred to round-25+.
+    Helper module ships a clean-room BT.601 limited-range
+    YUV4:2:0 → BGR24 converter (transcribed from BT.601-7
+    Annex 1) plus self-consistency unit tests
+    (`bt601_yuv_to_bgr_helper_handles_solid_blue` /
+    `_handles_grayscale_ramp` / `_psnr_self_consistency`),
+    ready for the round-25 host-side renderer when mpg4c32
+    is rerouted (or replaced) to surface YUV.
+  - **ICINFO_SIZE strict-codec gate.** New
+    `vfw32::ICINFO_SIZE = 568` constant + `mpg4c32`'s strict
+    `cmp [ebp+0x10], 0x238 / jb .return_zero` gate at
+    `mpg4c32!DriverProc+0x999..0x99c` documented inline. The
+    round-20 experimental `ICGetInfo(cb=80)` call hit that
+    gate and the codec returned 0 bytes silently; the round-20
+    test now passes `cb = ICINFO_SIZE` so the full 568-byte
+    identity card lands. New
+    `mp43_get_info_returns_full_icinfo_record` unit test
+    asserts the populated fields:
+    `dwSize=0x238 / fccType='vidc' / fccHandler='MP43' /
+    dwFlags=0x28 / dwVersion=1 / dwVersionICM=0x104`.
+  - **user32 stubs `RegisterClassExA` + `UnregisterClassA`.**
+    The MS-Audio splitter `msadds32.ax` (sibling of
+    `mpg4c32.dll` in wmpcdcs8-2001) imports both for hidden
+    window-class registration in its DllMain hooks. Round 24
+    ships fail-soft stubs (`RegisterClassExA → 0xC001`,
+    `UnregisterClassA → TRUE`) so those user32 import slots
+    resolve at PE-load time. The audio splitter remains parked
+    off the critical path; the stubs are scoped to PE-load
+    surface only and registered in the user32 module.
 - Round 23 — **MSMPEG4 v3 ffmpeg-oracle keyframe cross-check +
   I+P 2-frame decode**. Round 22 decoded the MP43 keyframe and
   asserted "any non-zero output". Round 23 raises the bar:

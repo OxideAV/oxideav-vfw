@@ -118,6 +118,28 @@ pub const ICERR_UNSUPPORTED: i32 = -1;
 /// `vfw.h`: `ICERR_BADFORMAT = -2`.
 pub const ICERR_BADFORMAT: i32 = -2;
 
+/// `vfw.h` `ICINFO` total size — 6 dwords (`dwSize`, `fccType`,
+/// `fccHandler`, `dwFlags`, `dwVersion`, `dwVersionICM`) +
+/// `WCHAR szName[16]` (32 B) + `WCHAR szDescription[128]`
+/// (256 B) + `WCHAR szDriver[128]` (256 B) = 24 + 32 + 256 + 256
+/// = **568 bytes**. Real `vfw32!ICGetInfo` always passes this
+/// value as `lParam2` of `ICM_GETINFO`.
+///
+/// **Round 24 — ICGetInfo callers MUST pass `cb >= ICINFO_SIZE`.**
+/// MS-MPEG-4 v3 (`mpg4c32.dll`) gates its handler at
+/// `mpg4c32!DriverProc+0x999..0x99c`:
+/// ```text
+///     mov  ebx, 0x238           ; 0x238 = 568
+///     cmp  [ebp+0x10], ebx      ; lParam2 (cb)
+///     jb   .return_zero
+/// ```
+/// — codecs that gate this way silently return 0 bytes when `cb`
+/// is short, with no error indication. Indeo predecessors
+/// (`IR32_32.DLL`, `IR41_32.AX`) accept `cb < 568` and write a
+/// truncated header, but that's the lenient case; the strict
+/// case is what host code must conform to.
+pub const ICINFO_SIZE: u32 = 568;
+
 // --- BITMAPINFOHEADER ------------------------------------------------
 
 /// `wingdi.h` `BITMAPINFOHEADER` — 40 bytes. Round-2 only models
@@ -473,6 +495,13 @@ fn is_known_short_return_fcc(fcc: u32) -> bool {
 /// codec writes zero bytes, we synthesise a `cb`-sized buffer with
 /// the standard ICINFO header (dwSize / fccType / fccHandler) plus
 /// the fcc-derived szName WCHAR string.
+///
+/// Round 24 — caller must pass `cb >= ICINFO_SIZE` (= 568) for
+/// strict codecs; mpg4c32 gates the handler at
+/// `cmp [ebp+0x10], 0x238 / jb .return_zero`. Round-20's
+/// experimental call passed `cb=80`, hitting that gate and
+/// returning 0 bytes silently. We still accept smaller `cb`
+/// values for the lenient Indeo codecs.
 pub fn ic_get_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,

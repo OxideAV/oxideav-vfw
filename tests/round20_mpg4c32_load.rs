@@ -186,8 +186,15 @@ fn mpg4c32_drv_load_drv_open_ic_open_attempt() {
             }
 
             // 3. ICGetInfo
+            //
+            // Round 24 — `cb` MUST be `>= ICINFO_SIZE` (= 568).
+            // Round-20's original `cb=80` hit mpg4c32's strict
+            // `cmp [ebp+0x10], 0x238 / jb .return_zero` gate at
+            // `mpg4c32!DriverProc+0x999..0x99c`, so the codec
+            // returned 0 bytes silently. With `cb=568` the codec
+            // populates the full ICINFO record.
             let pre2 = sb.cpu.instr_count;
-            match sb.ic_get_info(hic, 80) {
+            match sb.ic_get_info(hic, oxideav_vfw::win32::vfw32::ICINFO_SIZE) {
                 Ok(info) => {
                     eprintln!(
                         "round20: ICGetInfo returned {} bytes after {} instructions",
