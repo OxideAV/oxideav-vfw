@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 15: **IV41 (Indeo 4) decode through `IR41_32.AX`'s
+  `DriverProc` export.** Round 14 Part B's surface probe
+  established that `IR41_32.AX` is a dual-shape binary
+  (DirectShow filter + VfW driver) and exports `DriverProc`,
+  so the existing IC* pipeline that round 8..14 drove against
+  `IR50_32.DLL` is reusable verbatim. The new
+  `tests/round15_ir41_probe.rs` ratchets the IV41 path to the
+  same milestone bar rounds 7 (cubes.mov / IR32) and 12
+  (cat_attack.avi / IR50) hit — `ICDecompress` returns
+  `ICERR_OK` (0) with > 25% non-zero RGB24 output. Decoded
+  fixture: the smallest properly-aligned IV41 entry in the
+  ffmpeg corpus, `crashtest.avi` (5 MiB, 240×180 yuv410p) —
+  the smaller `mario001.mov` (300×225) trips
+  `ICDecompressBegin` with `ICERR_BADIMAGESIZE = -201`
+  because Indeo 4 requires picture dimensions divisible by 4
+  (per `docs/video/indeo/indeo4/wiki/Indeo_4.wiki`
+  §"Bitstream format description"). End-to-end run: DllMain
+  → ICOpen IV41 (driver_id `0x6007f650`) → ICDecompressQuery
+  (0) → ICDecompressBegin (0) → ICDecompress (0; 73789 of
+  129600 RGB24 bytes non-zero) → ICDecompressEnd → ICClose.
+  The full decode runs in ~2.5M emulator instructions.
+- `kernel32!HeapSize` stub — IR41 queries `HeapSize` after
+  `HeapAlloc` to size a follow-up copy. Returns the live
+  block size from `HostState::heap` or `(SIZE_T)-1` on a
+  bad pointer per MSDN.
+- `user32!GetDlgItemTextA` fail-soft stub — IR41's
+  Configure dialog reads its quality / bitrate edit boxes
+  through this; the decode path never enters the dialog
+  code, but the import must resolve at PE-load time.
+- `tests/common/avi_extractor.rs` — `ChunkWalker::next` now
+  clamps oversized chunk-size declarations to the bytes that
+  remain in the buffer. The IV41 corpus's `crashtest.avi`
+  ships a truncated head of a 20 MiB AVI (`LIST movi
+  size=20353990` but only 5 MiB of the file is present); the
+  round-8 strict-bounds walker bailed out at "no LIST movi"
+  even though the first ~700 sample chunks are intact. The
+  clamped walker hands out a partial movi payload and the
+  inner sample iterator finds sample 0 cleanly.
+
 - Round 14 Part A: **multi-fixture IV50 decode + structural MMX
   finding.** New `tests/round14_iv50_force_mmx.rs` (~370 LOC)
   drives three additional IV50 fixtures from the FFmpeg samples

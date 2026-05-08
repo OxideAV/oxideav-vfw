@@ -9,19 +9,18 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 6 — "Drive the full IC* decode pipeline end-to-end against
-Intel IR32_32.DLL" landed.** Indeo 3's redistributable DLL now
-walks the entire VfW decode-call cycle in the sandbox: load, run
-`DllMain` to clean exit, install codec, open with `('VIDC','IV31',
-ICMODE_DECOMPRESS)`, read back the `ICINFO` identity card,
-`ICDecompressQuery` (→ `ICERR_OK`), `ICDecompressBegin`
-(→ `ICERR_OK`), `ICDecompress` against a synthetic IV31 keyframe
-(→ `ICERR_BADIMAGE`; SPECGAP — the IV5PLAY fixture bundle has no
-real `.avi` payloads), `ICDecompressEnd` (→ `ICERR_OK`), and
-`ICClose`. No new ISA opcodes or Win32 stubs were needed beyond
-round 5 — segment-prefix routing + the 8-bit ALU + REP string
-ops + `0F`-extension subset round 5 added all carried over. The
-full design contract is the 659-line document at
+**Round 15 — IV41 (Indeo 4) decode through `IR41_32.AX::DriverProc`
+landed.** Three real-codec end-to-end pipelines are now green:
+
+| Codec | DLL | Test fixture | Round | `ICDecompress` |
+|-------|-----|--------------|-------|----------------|
+| Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
+| Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
+| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 | 15 | `ICERR_OK` |
+
+Each fixture's first keyframe decodes to RGB24 with > 25 % non-zero
+pixels; round 13 also runs P-frames 1..7 of `cat_attack.avi`
+through a single shared `hic`. The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

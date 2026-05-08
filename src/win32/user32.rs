@@ -104,6 +104,12 @@ pub fn register(registry: &mut Registry) {
     registry.register("user32.dll", "GetDesktopWindow", stub_zero0 as StubFn, 0);
     registry.register("user32.dll", "GetDlgCtrlID", stub_zero1 as StubFn, 1);
     registry.register("user32.dll", "GetDlgItem", stub_zero2 as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdlgitemtexta
+    // Round 15 — IR41_32.AX's configure-dialog code reads its
+    // "Quality" / "Bitrate" edit boxes via GetDlgItemTextA. The
+    // decode path never enters this code, but the import must
+    // resolve at load time. Return 0 (no chars copied).
+    registry.register("user32.dll", "GetDlgItemTextA", stub_zero4 as StubFn, 4);
     registry.register("user32.dll", "GetFocus", stub_zero0 as StubFn, 0);
     registry.register("user32.dll", "InvalidateRect", stub_zero3 as StubFn, 3);
     registry.register("user32.dll", "IsDlgButtonChecked", stub_zero2 as StubFn, 2);

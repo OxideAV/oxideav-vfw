@@ -338,17 +338,32 @@ impl<'a> ChunkWalker<'a> {
         }
         let kind: [u8; 4] = remaining[0..4].try_into().unwrap();
         let size = u32::from_le_bytes(remaining[4..8].try_into().unwrap()) as usize;
-        if 8 + size > remaining.len() {
-            // Truncated chunk — bail at end of stream rather
-            // than hard error. This matches real-world AVI
-            // tolerance against partial trailing data.
-            return Ok(None);
-        }
-        let payload = &remaining[8..8 + size];
+        // Round 15 — `crashtest.avi` (a truncated 5 MiB head
+        // of a 20 MiB AVI; commonly produced by capture-card
+        // crash dumps) declares `LIST movi size=20353990`
+        // larger than the bytes we actually have, so the
+        // round-8 walker's strict `8 + size > remaining.len()`
+        // check would skip the chunk entirely + bail out at
+        // "no LIST movi". Real AVI parsers accept this case
+        // by clamping the chunk's payload to the bytes that
+        // remain and then walking the (necessarily truncated)
+        // chunk body for as long as it parses cleanly. We
+        // surface a truncation by clamping `size` to what's
+        // available, so the inner walker can still find the
+        // first few sample chunks.
+        let avail = remaining.len() - 8;
+        let clamped = size.min(avail);
+        let payload = &remaining[8..8 + clamped];
         let payload_file_off = self.base_file_off + self.pos + 8;
         // Advance past header + payload + RIFF padding (chunks
-        // align to 2-byte boundaries).
-        let advance = 8 + size + (size & 1);
+        // align to 2-byte boundaries). When clamped, advance to
+        // the end of the buffer so the next iteration returns
+        // `Ok(None)`.
+        let advance = if clamped < size {
+            remaining.len()
+        } else {
+            8 + size + (size & 1)
+        };
         self.pos = self
             .pos
             .checked_add(advance)

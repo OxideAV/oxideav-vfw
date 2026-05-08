@@ -53,6 +53,10 @@ pub fn register(registry: &mut Registry) {
         stub_heap_realloc as StubFn,
         4,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsize
+    // Round 15 — IR41_32.AX uses HeapSize to query the live size
+    // of an allocation it returned from HeapAlloc / HeapReAlloc.
+    registry.register("kernel32.dll", "HeapSize", stub_heap_size as StubFn, 3);
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localalloc
     registry.register("kernel32.dll", "LocalAlloc", stub_local_alloc as StubFn, 2);
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localfree
@@ -717,6 +721,31 @@ fn stub_heap_realloc(
         .map_err(|t| trap_to_win32("HeapReAlloc", t))?;
     state.heap.insert(new_addr, buf);
     Ok(new_addr)
+}
+
+/// `SIZE_T HeapSize(HANDLE, DWORD dwFlags, LPCVOID lpMem)` —
+/// MSDN "Heap functions / HeapSize": returns the size, in bytes,
+/// of the memory block pointed to by `lpMem`, or `(SIZE_T)-1`
+/// (`0xFFFF_FFFF` on a 32-bit guest) on failure. Round 15 —
+/// `IR41_32.AX` queries the live block size after a `HeapAlloc`
+/// to size a follow-up copy.
+fn stub_heap_size(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _h = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("HeapSize", t))?;
+    let _flags = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("HeapSize", t))?;
+    let addr = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("HeapSize", t))?;
+    if addr == 0 {
+        return Ok(0xFFFF_FFFF);
+    }
+    Ok(state
+        .heap
+        .get(&addr)
+        .map(|v| v.len() as u32)
+        .unwrap_or(0xFFFF_FFFF))
 }
 
 fn bump_alloc(state: &mut HostState, n: u32) -> Result<u32, Win32Error> {
