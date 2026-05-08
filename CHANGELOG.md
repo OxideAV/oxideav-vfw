@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.1...v0.0.2) - 2026-05-08
+
+### Fixed
+
+- update IV5 driver bundle URL path video/windows → codecs/windows
+
+### Other
+
+- Round 17 — corpus byte-scan + larger IV41 fixture + LIST rec walker
+- Round 16 — multi-frame IV41 sequence + OpenDML AVI 2.0 walker
+- Round 15 — IV41 (Indeo 4) decode through IR41_32.AX::DriverProc
+- Round 14 — multi-fixture IV50 decode + IR41_32.AX surface probe
+- Round 13 — MMX ISA + sequential P-frame decode through IR50_32.DLL
+- Round 12 — IR50 cat_attack first keyframe decodes to ICERR_OK + RGB24 pixels
+- Round 11 — DRV_LOAD + DRV_ENABLE plumbing for first ICOpen
+- Round 10 — 0x66-prefix honored across the integer ISA + x87 CW shadow
+- Round 9 — fix 0x66 (operand-size override) on MOV; IR50_32.DLL ICOpen passes
+- Merge branch 'master' into wip/round8
+- Round 7 — "Real IV31 keyframe decode through cubes.mov + MMX scaffold"
+- Round 6 — "ICDecompress* against Intel IR32_32.DLL"
+- Round 5 — "DllMain + ICOpen + ICGetInfo + ICClose against Intel IR32_32.DLL"
+- reverse-engineering aid as co-equal goal + Trace mode in CHANGELOG
+- Round 4 — "Close the 49 round-3 import gaps"
+- Round 3 — "Real-codec smoke against Intel IR32_32.DLL"
+- switch fixture story to on-demand HTTPS fetch (no local DLLs)
+- Round 2 — "Decode one Cinepak frame" milestone
+- Round 1 — "Load + DllMain + clean exit" milestone
+
 ### Added
 
 - Round 17 Part A — **non-Indeo Win32 codec hunt + corpus
