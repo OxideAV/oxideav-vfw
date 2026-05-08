@@ -6,7 +6,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.0.3](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.2...v0.0.3) - 2026-05-08
+## [0.1.0](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.2...v0.0.3) - 2026-05-08
 
 ### Other
 
