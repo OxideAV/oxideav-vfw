@@ -265,28 +265,30 @@ pub fn extract_video_sample(avi_bytes: &[u8], n: u32) -> Result<FirstSample, Str
     // and OpenDML's `ix00` / `ix01` standard-index chunks
     // start with 'i' / 'x' so they're naturally rejected by
     // the stream-index test (no leading '0').
+    //
+    // Round 17 — `LIST rec ` recursion. Microsoft's AVI 1.0
+    // spec ("OpenDML AVI File Format Extensions" §1.4 + the
+    // original AVI RIFF spec) allows a `movi` body to contain
+    // `LIST rec ` blocks that group physically-adjacent sample
+    // chunks (typically one video sample + the audio samples
+    // covering its duration). Some encoders, including the
+    // Indeo 4 reference encoder used to produce
+    // `indeo41.avi`, ALWAYS wrap samples this way — so a
+    // walker that doesn't recurse into `LIST rec ` finds zero
+    // samples in those files. Treat `LIST rec ` as a
+    // transparent container: every sample chunk inside is
+    // surfaced at the same level as a flat-movi chunk.
     let mut seen: u32 = 0;
     for (movi_body, movi_file_off, _seg_idx) in &movi_bodies {
-        let mut w = ChunkWalker::new(movi_body, *movi_file_off);
-        while let Some(c) = w.next()? {
-            if !is_stream_chunk(c.kind, 0) {
-                continue;
-            }
-            let two_cc = [c.kind[2], c.kind[3]];
-            if &two_cc == b"wb" || &two_cc == b"pc" {
-                continue;
-            }
-            if seen == n {
-                return Ok(FirstSample {
-                    codec_fourcc,
-                    width: avih_w,
-                    height: avih_h,
-                    sample_offset: c.payload_file_off as u32,
-                    sample_size: c.payload.len() as u32,
-                    bytes: c.payload.to_vec(),
-                });
-            }
-            seen += 1;
+        if let Some(found) = find_stream0_video_sample(movi_body, *movi_file_off, n, &mut seen)? {
+            return Ok(FirstSample {
+                codec_fourcc,
+                width: avih_w,
+                height: avih_h,
+                sample_offset: found.payload_file_off as u32,
+                sample_size: found.payload.len() as u32,
+                bytes: found.payload.to_vec(),
+            });
         }
     }
     Err(format!(
@@ -295,6 +297,50 @@ pub fn extract_video_sample(avi_bytes: &[u8], n: u32) -> Result<FirstSample, Str
         movi_bodies.len(),
         seen,
     ))
+}
+
+/// Walk `body` (a `LIST movi` body OR a `LIST rec ` body) and
+/// look for the `n`-th stream-0 video sample. Recurses into
+/// `LIST rec ` blocks transparently. `seen` is mutated so the
+/// caller can track progress across multiple movi bodies.
+///
+/// Returns `Ok(Some(chunk))` when sample `n` is located; the
+/// chunk's `kind` / `payload` / `payload_file_off` fields are
+/// already correct. Returns `Ok(None)` when this body is
+/// fully walked without reaching sample `n` — the caller moves
+/// on to the next movi body. Errors propagate from the
+/// underlying [`ChunkWalker`].
+fn find_stream0_video_sample<'a>(
+    body: &'a [u8],
+    body_file_off: usize,
+    n: u32,
+    seen: &mut u32,
+) -> Result<Option<Chunk<'a>>, String> {
+    let mut w = ChunkWalker::new(body, body_file_off);
+    while let Some(c) = w.next()? {
+        // `LIST rec ` recursion — Microsoft AVI 1.0 reference
+        // §"Interleaved AVI files".
+        if c.kind == *b"LIST" && c.payload.len() >= 4 && &c.payload[0..4] == b"rec " {
+            if let Some(found) =
+                find_stream0_video_sample(&c.payload[4..], c.payload_file_off + 4, n, seen)?
+            {
+                return Ok(Some(found));
+            }
+            continue;
+        }
+        if !is_stream_chunk(c.kind, 0) {
+            continue;
+        }
+        let two_cc = [c.kind[2], c.kind[3]];
+        if &two_cc == b"wb" || &two_cc == b"pc" {
+            continue;
+        }
+        if *seen == n {
+            return Ok(Some(c));
+        }
+        *seen += 1;
+    }
+    Ok(None)
 }
 
 /// Round-16 diagnostic helper: report how many `RIFF AVI ` /
@@ -752,5 +798,88 @@ mod tests {
         // payload as if it were a sample chunk header.
         let s0 = extract_first_video_sample(&avi).expect("first sample");
         assert_eq!(s0.bytes, b"AAAA");
+    }
+
+    /// Round-17 — `LIST rec ` recursion. Build a minimal AVI
+    /// 1.0 file whose `LIST movi` body wraps the sample chunks
+    /// inside two `LIST rec ` blocks (the interleaved-AVI shape
+    /// from Microsoft's AVI 1.0 reference §"Interleaved AVI
+    /// files"). The walker must descend into each `LIST rec `
+    /// transparently, surfacing the inner sample chunks at the
+    /// same depth as flat-movi chunks.
+    fn make_interleaved_avi() -> Vec<u8> {
+        let mut bih = Vec::new();
+        bih.extend_from_slice(&40u32.to_le_bytes());
+        bih.extend_from_slice(&64i32.to_le_bytes());
+        bih.extend_from_slice(&48i32.to_le_bytes());
+        bih.extend_from_slice(&1u16.to_le_bytes());
+        bih.extend_from_slice(&24u16.to_le_bytes());
+        bih.extend_from_slice(b"RECx");
+        bih.extend_from_slice(&[0u8; 5 * 4]);
+
+        let mut strh = Vec::new();
+        strh.extend_from_slice(b"vids");
+        strh.extend_from_slice(b"RECx");
+        strh.extend_from_slice(&[0u8; 56 - 8]);
+
+        let mut strl = Vec::new();
+        strl.extend_from_slice(b"strl");
+        push_chunk(&mut strl, b"strh", &strh);
+        push_chunk(&mut strl, b"strf", &bih);
+
+        let mut avih = vec![0u8; 56];
+        avih[32..36].copy_from_slice(&64u32.to_le_bytes());
+        avih[36..40].copy_from_slice(&48u32.to_le_bytes());
+
+        let mut hdrl = Vec::new();
+        hdrl.extend_from_slice(b"hdrl");
+        push_chunk(&mut hdrl, b"avih", &avih);
+        push_chunk(&mut hdrl, b"LIST", &strl);
+
+        // Two `LIST rec ` blocks, each carrying one stream-0
+        // video sample plus a stream-1 audio chunk that the
+        // walker should skip.
+        let mut rec1 = Vec::new();
+        rec1.extend_from_slice(b"rec ");
+        push_chunk(&mut rec1, b"00dc", b"AAAA");
+        push_chunk(&mut rec1, b"01wb", b"audio1");
+
+        let mut rec2 = Vec::new();
+        rec2.extend_from_slice(b"rec ");
+        push_chunk(&mut rec2, b"00dc", b"BBBB");
+        push_chunk(&mut rec2, b"01wb", b"audio2");
+
+        let mut movi = Vec::new();
+        movi.extend_from_slice(b"movi");
+        push_chunk(&mut movi, b"LIST", &rec1);
+        push_chunk(&mut movi, b"LIST", &rec2);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(b"AVI ");
+        push_chunk(&mut body, b"LIST", &hdrl);
+        push_chunk(&mut body, b"LIST", &movi);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((body.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn interleaved_avi_walker_descends_list_rec() {
+        let avi = make_interleaved_avi();
+        let s0 = extract_video_sample(&avi, 0).expect("sample 0 from rec1");
+        assert_eq!(s0.bytes, b"AAAA");
+        assert_eq!(s0.codec_fourcc, u32::from_le_bytes(*b"RECx"));
+        let s1 = extract_video_sample(&avi, 1).expect("sample 1 from rec2");
+        assert_eq!(s1.bytes, b"BBBB");
+        // The walker must NOT surface `01wb` (audio) chunks as
+        // video samples — sample 2 should not exist.
+        let err = extract_video_sample(&avi, 2).unwrap_err();
+        assert!(
+            err.contains("fewer than 3"),
+            "expected 'fewer than 3' diagnostic; got: {err}",
+        );
     }
 }

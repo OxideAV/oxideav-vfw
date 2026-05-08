@@ -400,6 +400,25 @@ pub fn ic_close(
     )
 }
 
+/// Set of FourCCs that get the round-17 short-return fallback in
+/// [`ic_get_info`]. When a codec returns 0 bytes from
+/// `ICM_GETINFO` (typical of DirectShow filters that delegate to
+/// the Windows registry), and the open `HIC`'s `fcc_handler` is in
+/// this set, a synthetic ICINFO buffer is fabricated with the
+/// dwSize / fccType / fccHandler dwords and an fcc-derived
+/// `szName`. The set covers every Indeo FourCC the crate has
+/// ever loaded a binary for (round 5 IV31, round 14 IV32 alias,
+/// rounds 15+16 IV41, rounds 8..14 IV50). New entries are added
+/// only when a real codec binary lands in the corpus and surfaces
+/// the same n=0 shape — the fallback is a host-side cushion, not
+/// a registry replacement.
+fn is_known_short_return_fcc(fcc: u32) -> bool {
+    matches!(
+        &fcc.to_le_bytes(),
+        b"IV31" | b"iv31" | b"IV32" | b"iv32" | b"IV41" | b"iv41" | b"IV50" | b"iv50"
+    )
+}
+
 /// Synthesise an `ICINFO` record by calling
 /// `DriverProc(_, _, ICM_GETINFO, &scratch, cb)` and reading
 /// back what the codec wrote.
@@ -414,6 +433,14 @@ pub fn ic_close(
 /// see a non-empty descriptor. The fcc-derived fallback is purely
 /// the host-side "I have no registry" cushion, **not** a claim
 /// about what the codec returned.
+///
+/// Round 17 generalises the fallback to also fire when the codec
+/// returns **zero bytes** (DirectShow filters such as `IR41_32.AX`
+/// delegate `ICM_GETINFO` entirely to the host vfw32 registry +
+/// drop the call on the floor). For known-Indeo FourCCs, when the
+/// codec writes zero bytes, we synthesise a `cb`-sized buffer with
+/// the standard ICINFO header (dwSize / fccType / fccHandler) plus
+/// the fcc-derived szName WCHAR string.
 pub fn ic_get_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -449,6 +476,44 @@ pub fn ic_get_info(
         &[entry.driver_id, hic, ICM_GETINFO, scratch, cb],
     )?;
     let n = written.min(cb) as usize;
+
+    // Round-17 short-return generalisation: if the codec wrote
+    // zero bytes AND the fcc is a known-Indeo handler, fabricate
+    // a `cb`-sized ICINFO with the dwSize / fccType / fccHandler
+    // header dwords + fcc-derived szName. This matches what
+    // real `vfw32!ICGetInfo` would have done after consulting
+    // the Windows registry — the IR41 DirectShow filter relies
+    // on this code path because it ignores ICM_GETINFO entirely.
+    if n == 0 && is_known_short_return_fcc(entry.fcc_handler) {
+        // Surface a buffer the size the caller asked for, capped
+        // to the full ICINFO 568-byte shape so we don't write past
+        // any reasonable buffer.
+        let synth_len = (cb as usize).min(568);
+        let mut out = vec![0u8; synth_len];
+        // dwSize (offset 0, the structure size the caller supplied).
+        if synth_len >= 4 {
+            out[0..4].copy_from_slice(&cb.to_le_bytes());
+        }
+        // fccType (offset 4).
+        if synth_len >= 8 {
+            out[4..8].copy_from_slice(&entry.fcc_type.to_le_bytes());
+        }
+        // fccHandler (offset 8).
+        if synth_len >= 12 {
+            out[8..12].copy_from_slice(&entry.fcc_handler.to_le_bytes());
+        }
+        // szName (offset 24, 16 WCHARs / 32 bytes): fcc-derived
+        // ASCII as UTF-16LE — same shape as the post-call fallback
+        // a few lines below.
+        let fcc = entry.fcc_handler.to_le_bytes();
+        for (i, &c) in fcc.iter().enumerate() {
+            if 24 + i * 2 + 1 < synth_len {
+                out[24 + i * 2] = c;
+            }
+        }
+        return Ok(out);
+    }
+
     let mut out = vec![0u8; n];
     for (i, b) in out.iter_mut().enumerate() {
         *b = mmu
@@ -811,6 +876,76 @@ mod tests {
         // the first 16 bytes (all zero from arena_alloc).
         assert_eq!(bytes.len(), 16);
         assert!(bytes.iter().all(|b| *b == 0));
+    }
+
+    /// Round-17 unit gate for the short-return host-side szName
+    /// fallback. A canned DriverProc that returns 0 from
+    /// `ICM_GETINFO` (mirrors `IR41_32.AX`'s DirectShow-filter
+    /// "delegate to registry" behaviour) MUST get a synthesised
+    /// ICINFO with the standard header dwords and the fcc-derived
+    /// szName WCHAR string when the open `HIC`'s fcc_handler is a
+    /// known-Indeo FourCC.
+    #[test]
+    fn ic_get_info_short_return_synthesises_known_indeo_fcc() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        // DRV_OPEN must return non-zero to mint the HIC, but
+        // ICM_GETINFO must return 0 to trigger the fallback. The
+        // canned proc returns the same value for both — so we plant
+        // a non-zero return for DRV_OPEN, install the HIC, then
+        // re-plant 0 before driving ICGetInfo.
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let fcc_video = u32::from_le_bytes(*b"VIDC");
+        let fcc_iv41 = u32::from_le_bytes(*b"IV41");
+        let hic = ic_open(
+            &mut cpu, &mut mmu, &registry, &mut state, fcc_video, fcc_iv41, 1,
+        )
+        .unwrap();
+        assert_ne!(hic, 0);
+        // Now flip the canned return to 0 — emulates the
+        // DirectShow filter ignoring ICM_GETINFO.
+        install_canned_driver_proc(&mut mmu, dpv, 0);
+        let cb = 96u32;
+        let bytes = ic_get_info(&mut cpu, &mut mmu, &registry, &mut state, hic, cb).unwrap();
+        // Synthesised buffer: cb bytes (capped at 568, but cb=96 < 568).
+        assert_eq!(bytes.len(), cb as usize);
+        // dwSize echoes cb.
+        assert_eq!(&bytes[0..4], &cb.to_le_bytes());
+        // fccType / fccHandler propagated from the open HIC.
+        assert_eq!(&bytes[4..8], &fcc_video.to_le_bytes());
+        assert_eq!(&bytes[8..12], &fcc_iv41.to_le_bytes());
+        // szName at offset 24 carries 'I','V','4','1' as UTF-16LE
+        // ASCII (low-byte every other byte; high bytes stay 0).
+        assert_eq!(bytes[24], b'I');
+        assert_eq!(bytes[26], b'V');
+        assert_eq!(bytes[28], b'4');
+        assert_eq!(bytes[30], b'1');
+        assert_eq!(bytes[25], 0);
+        assert_eq!(bytes[27], 0);
+        assert_eq!(bytes[29], 0);
+        assert_eq!(bytes[31], 0);
+    }
+
+    /// Round-17 negative gate: the short-return fallback only
+    /// fires for known-Indeo FourCCs. An unknown fcc with a 0-byte
+    /// codec response must surface as the original 0-length output
+    /// vec — preserving the round-2 contract for canned tests like
+    /// `ic_get_info_reads_back_codec_buffer` (which uses fcc=0).
+    #[test]
+    fn ic_get_info_short_return_unknown_fcc_returns_empty() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let fcc_unknown = u32::from_le_bytes(*b"XXXX");
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, fcc_unknown, 1).unwrap();
+        // Flip canned to 0.
+        install_canned_driver_proc(&mut mmu, dpv, 0);
+        let bytes = ic_get_info(&mut cpu, &mut mmu, &registry, &mut state, hic, 64).unwrap();
+        // Codec wrote 0 bytes, fcc is not Indeo → no synthesis,
+        // empty output preserved (existing contract).
+        assert_eq!(bytes.len(), 0);
     }
 
     #[test]

@@ -8,6 +8,81 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 17 Part A — **non-Indeo Win32 codec hunt + corpus
+  byte-scan.** New `tests/round17_corpus_specgap.rs` probes
+  the `samples.oxideav.org/codecs/windows/` namespace for
+  every plausible non-Indeo VfW / DirectShow codec
+  binary the catalogue in `docs/winmf/windows-codecs.md`
+  enumerates (Cinepak `iccvid.dll`, MS Video 1
+  `msvidc32.dll`, MS RLE `msrle32.dll`, MS YUV `msyuv.dll`,
+  MS-MPEG-4 v3 `mpg4ds32.ax`, DivX `divx*.dll`, TSCC
+  `tsccvid.dll`, WMV `wmvcore.dll`, plus their plausible
+  per-FOURCC subdirectories): all 16 candidates return 404.
+  The corpus contains exclusively the Intel IV5PLAY
+  redistributable: `IR32_32.DLL` (Indeo 3, 199168 B),
+  `IR50_32.DLL` (Indeo 5, 739328 B), `IR41_32.AX` (Indeo 4,
+  848384 B). The same test byte-scans all three Indeo
+  binaries for `0F D0..FF` (MMX-arithmetic opcode block per
+  Intel SDM Vol. 2A Table A-3) and `0F A2` (CPUID per
+  Vol. 2B): IR32 has 146 / 0, IR50 has 2518 / 2, IR41 has
+  1094 / 2. The byte counts contradict the round-14
+  diagnostic claim of "zero MMX/CPUID bytes" (round 14
+  appears to have scanned a stale 184 KB binary; the live
+  fixture is 739 KB) — the binaries DO contain MMX-arithmetic
+  byte patterns and CPUID instructions, but the codec's
+  decode path through `DllMain → DRV_OPEN →
+  ICDecompressBegin → ICDecompress` never reaches them.
+  SPECGAP recorded: round-13's MMX module
+  (`src/emulator/isa_mmx.rs`, 1007 LOC, ~50 opcodes) remains
+  semantically validated by its 19 unit tests + 13 emulator
+  step tests, with no real-codec dispatch pathway available
+  in this corpus until a non-Indeo Win32 binary lands.
+- Round 17 Part B — **larger IV41 fixture
+  (`indeo41.avi`, 320×240, 13.4 MB).** New
+  `tests/round17_iv41_indeo41.rs` mirrors round 16's
+  8-frame ratchet on a fixture ~75 % bigger than
+  `crashtest.avi`. All 8 sequential frames return
+  `ICERR_OK` with > 25 % non-zero RGB24 output. Per-frame
+  `mmx_dispatch_count` and `cpuid_dispatch_count` come back
+  as 0/0 — the larger frame size doesn't surface MMX paths
+  the smaller fixture missed, confirming the round-17 Part A
+  finding that this codec's reachable decode path is
+  statically integer-only despite the binary containing
+  MMX-arithmetic byte patterns.
+- Round 17 Part C — **`LIST rec ` recursion in the AVI
+  walker.** Extended `tests/common/avi_extractor.rs`
+  (~30 LOC delta) so that `LIST movi` bodies wrapping
+  sample chunks inside `LIST rec ` blocks (the
+  interleaved-AVI shape from Microsoft's AVI 1.0 reference
+  §"Interleaved AVI files") are walked recursively.
+  Without this, `indeo41.avi` reports zero stream-0 samples
+  because every sample lives inside a `LIST rec ` block.
+  The new helper `find_stream0_video_sample` descends into
+  `LIST rec ` transparently, surfacing the inner sample
+  chunks at the same depth as flat-movi chunks. Validated
+  by a synthetic 2-rec AVI carrying mixed video/audio
+  inside `LIST rec ` blocks (`tests/common/avi_extractor.rs`
+  unit test `interleaved_avi_walker_descends_list_rec`)
+  and by the live `indeo41.avi` 320×240 fixture
+  driven through the round-17B IV41 pipeline.
+- Round 17 Part D — **generalised `ICGetInfo` short-return
+  szName fallback.** When a codec returns 0 bytes from
+  `ICM_GETINFO` AND the open `HIC`'s `fcc_handler` is a
+  known-Indeo FourCC (`IV31`/`IV32`/`IV41`/`IV50`), the
+  wrapper now synthesises a `cb`-sized ICINFO buffer with
+  the standard header dwords (`dwSize`, `fccType`,
+  `fccHandler`) and an fcc-derived szName WCHAR string —
+  same shape the post-call fallback already produced for
+  short-but-non-empty returns. This covers `IR41_32.AX`'s
+  DirectShow-filter "delegate to registry" pattern that
+  round 15 noted (the codec ignores `ICM_GETINFO` entirely
+  + relies on `vfw32!ICGetInfo` to consult the registry).
+  Driven from the round-17B IV41 test, which now asserts
+  the synthesised `szName` surfaces as `'I','V','4','1'`
+  at offsets 24/26/28/30. New `vfw32` unit tests
+  `ic_get_info_short_return_synthesises_known_indeo_fcc`
+  and `ic_get_info_short_return_unknown_fcc_returns_empty`
+  pin the contract.
 - Round 16 Part A: **multi-frame IV41 sequence through
   `IR41_32.AX`.** The new `tests/round16_iv41_multiframe.rs`
   mirrors round 13's 8-frame ratchet against

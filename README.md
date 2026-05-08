@@ -9,23 +9,31 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 16 — multi-frame IV41 + OpenDML AVI 2.0 walker landed.**
-Three real-codec end-to-end pipelines are now green, two of them
-across 8 sequential frames:
+**Round 17 — corpus byte-scan + larger IV41 fixture +
+`LIST rec ` walker.** Three real-codec end-to-end pipelines
+remain green; round 17 widens the IV41 test surface to a
+larger fixture and documents the MMX-codec SPECGAP:
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
-| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 | 15 / 16 | `ICERR_OK` (8/8 frames) |
+| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 | `ICERR_OK` (8/8 frames each) |
 
 Each fixture's first keyframe decodes to RGB24 with > 25 % non-zero
 pixels; round 13 ran 8 sequential `cat_attack.avi` IV50 frames
-through a single shared `hic`, and round 16 ratchets the same
-discipline onto the IV41 path. The test-side AVI extractor now
-recognises chained `RIFF AVIX` segments (OpenDML / AVI 2.0) so
-fixtures with `indx` super-indexes + `ix##` standard-index chunks
-walk cleanly. The full design contract lives in
+through a single shared `hic`, round 16 ratcheted the same
+discipline onto the IV41 path, and round 17 widens IV41 to a
+larger 320×240 fixture (`indeo41.avi`). The round-13 MMX
+module remains correct-semantics scaffolding waiting for a
+non-Indeo Win32 codec — round 17's
+`tests/round17_corpus_specgap.rs` enumerates every plausible
+candidate (Cinepak, MS Video 1, MS RLE, MS-MPEG-4 v3, DivX,
+TSCC, WMV) and confirms all 16 candidate URLs return 404
+from `samples.oxideav.org/codecs/windows/`. The test-side
+AVI extractor now recognises chained `RIFF AVIX` segments
+(OpenDML / AVI 2.0) AND `LIST rec ` containers (interleaved
+AVI 1.0). The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:
