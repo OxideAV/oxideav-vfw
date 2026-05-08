@@ -33,6 +33,7 @@ pub mod mov_extractor;
 
 /// Canonical HTTPS prefix for the Intel IV5 driver bundle.
 /// Each filename listed in `tests/README.md` is appended verbatim.
+#[allow(dead_code)]
 const BASE_URL: &str = "https://samples.oxideav.org/codecs/windows/IV5PLAY";
 
 /// Canonical HTTPS prefix for the FFmpeg samples corpus,
@@ -55,6 +56,7 @@ const FFMPEG_BASE_URL: &str = "https://samples.oxideav.org/ffmpeg/V-codecs";
 /// 5. HTTPS fetch from `BASE_URL/<NAME>`.
 ///
 /// On HTTPS success, step 4's cache is populated (unless `CI=true`).
+#[allow(dead_code)]
 pub fn fetch_or_load(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     // 1. Explicit user override.
     if let Some(dir) = env::var_os("OXIDEAV_VFW_FIXTURE_DIR") {

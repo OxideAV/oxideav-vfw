@@ -1980,6 +1980,40 @@ impl Cpu {
                 }
                 r
             }
+            2 => {
+                // RCL — rotate through carry. Per Intel SDM
+                // Vol. 2A "RCL/RCR" the 32-bit count is masked
+                // to 5 bits before the rotate; the carry-out
+                // is the high bit pre-rotate, the carry-in
+                // becomes the new bit 0.
+                let mut v = val;
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 0x8000_0000) != 0;
+                    v = (v << 1) | (cf as u32);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v
+            }
+            3 => {
+                // RCR — rotate through carry, right.
+                let mut v = val;
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 1) != 0;
+                    v = (v >> 1) | ((cf as u32) << 31);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v
+            }
             other => {
                 return Err(Trap::UndefinedOpcode {
                     eip: self.regs.eip,
@@ -2061,6 +2095,36 @@ impl Cpu {
                     self.regs.flags.cf = (r & 0x8000) != 0;
                 }
                 r
+            }
+            2 => {
+                // 16-bit RCL through carry.
+                let mut v = u32::from(val);
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 0x8000) != 0;
+                    v = ((v << 1) & 0xFFFF) | (cf as u32);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v as u16
+            }
+            3 => {
+                // 16-bit RCR through carry.
+                let mut v = u32::from(val);
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 1) != 0;
+                    v = (v >> 1) | ((cf as u32) << 15);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v as u16
             }
             other => {
                 return Err(Trap::UndefinedOpcode {
@@ -2393,6 +2457,39 @@ impl Cpu {
                     self.regs.flags.cf = (r & 0x80) != 0;
                 }
                 r
+            }
+            2 => {
+                // 8-bit RCL through carry. Per Intel SDM the
+                // 9-bit ring (8 data + carry) rotates `count`
+                // positions; count is masked to 5 bits, then
+                // taken modulo 9.
+                let mut v = u32::from(val);
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 0x80) != 0;
+                    v = ((v << 1) & 0xFF) | (cf as u32);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v as u8
+            }
+            3 => {
+                // 8-bit RCR through carry.
+                let mut v = u32::from(val);
+                let mut cf = self.regs.flags.cf;
+                let c = count & 0x1F;
+                for _ in 0..c {
+                    let new_cf = (v & 1) != 0;
+                    v = (v >> 1) | ((cf as u32) << 7);
+                    cf = new_cf;
+                }
+                if count != 0 {
+                    self.regs.flags.cf = cf;
+                }
+                v as u8
             }
             other => {
                 return Err(Trap::UndefinedOpcode {

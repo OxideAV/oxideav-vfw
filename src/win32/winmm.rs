@@ -38,6 +38,17 @@ pub fn register(registry: &mut Registry) {
     // `timeGetTime` as a higher-resolution wall-clock source than
     // `GetTickCount`. Both return DWORD milliseconds.
     registry.register("winmm.dll", "timeGetTime", stub_time_get_time as StubFn, 0);
+
+    // Round 20 (mpg4c32.dll): the MSMPEG4 v3 codec calls
+    // `GetDriverModuleHandle` to find its own HMODULE. We
+    // return the primary module base (set by `Sandbox::load`).
+    // https://learn.microsoft.com/en-us/windows/win32/api/mmiscapi/nf-mmiscapi-getdrivermodulehandle
+    registry.register(
+        "winmm.dll",
+        "GetDriverModuleHandle",
+        stub_get_driver_module_handle as StubFn,
+        1,
+    );
 }
 
 /// `LRESULT DefDriverProc(DWORD_PTR dwDriverIdentifier, HDRVR
@@ -78,6 +89,25 @@ fn stub_time_get_time(
 ) -> Result<u32, Win32Error> {
     state.tick = state.tick.wrapping_add(1);
     Ok(state.tick)
+}
+
+/// `HMODULE GetDriverModuleHandle(HDRVR hdrvr)`. Returns the
+/// HMODULE of the DLL that registered the driver `hdrvr`.
+/// Real installable drivers store this in an internal table
+/// keyed by HDRVR; our sandbox only ever has one codec loaded
+/// at a time, so we return [`HostState::primary_module_base`].
+/// Codecs use the value as the `hInstance` argument to
+/// `LoadResource` / `FindResource` for self-relative resource
+/// access — the codec's resources live in the same module.
+fn stub_get_driver_module_handle(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hdrvr = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("GetDriverModuleHandle", t))?;
+    Ok(state.primary_module_base)
 }
 
 #[cfg(test)]

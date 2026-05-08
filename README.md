@@ -9,60 +9,66 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 19 — Lead A: trace-coverage analysis identifies the
-EFLAGS.ID-bit gap as the rounds-12..17 zero-MMX-dispatch root
-cause.** Three real-codec end-to-end pipelines stay green; round
-19 lands an instruction-EIP-tracking instrument plus four
-correctness fixes the codec's CPUID-detection block depends on:
+**Round 20 — MMX kernels light up + MSMPEG4 v3 PE-load
+unblocked.** Two parallel sub-goals landed: (A) the round-19
+`[ebp-8]` MMX-enable gate is identified as the
+`HKLM\HARDWARE\DESCRIPTION\System\FloatingPointProcessor`
+registry probe — `RegOpenKeyExA` now synthesises ERROR_SUCCESS
+for that path, the AND-gate closes, and IV50 / IV41 decode
+pipelines start dispatching MMX kernels at scale (1.5M–5M MMX
+instructions per frame); (B) the 13 missing `mpg4c32.dll`
+imports per Milestone 3.1 (kernel32 CreateEventA / CreateThread
+/ SetEvent + msvcrt operator-new / operator-delete /
+_adjust_fdiv / _except_handler3 / _initterm / malloc / free +
+user32 GetScrollPos / SetScrollPos / SetScrollRange + winmm
+GetDriverModuleHandle) land alongside a `data_imports`
+registry channel that handles `_adjust_fdiv` (a *data* symbol,
+not a function — the codec dereferences the IAT slot value).
+`Sandbox::load("mpg4c32.dll", …)` now returns Ok and the PE
+entry point runs through `_initterm` to completion.
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
-| Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
-| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 | `ICERR_OK` (8/8 frames each) |
-| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) / `mpg4ds32.ax` (DShow) | TBD — winxp + wmpcdcs8-2001 binaries staged | 20 (planned) | PE-load blocked on 13 / 6 / 22 imports; see milestone 3.1 |
-| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD — same import set as `mpg4ds32.ax` | 20 (planned) | PE-load blocked on 6 imports |
+| Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 / 20 | `ICERR_OK` (8/8 frames; **MMX kernels active**) |
+| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 / 20 | `ICERR_OK` (8/8 frames each; **MMX kernels active**) |
+| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 20 | PE-load + entry point ✓; ICOpen('MP43') reaches DriverProc but rejects FOURCC pending DllMain rework |
+| WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD — same import set as `mpg4ds32.ax` | 21 (planned) | PE-load blocked on 6 imports |
 
-Round 19's `tests/round19_mmx_dispatch_analysis.rs` byte-scans
-each Indeo binary's executable section for `0F D0..FF` (MMX
-arithmetic) and `0F A2` (CPUID), drives the standard 8-frame
-decode pipeline with `Cpu::enable_visited_eip_tracking()` on,
-and computes the set-difference. Pre-round-19, IR41 reached
-0 / 2 CPUID sites and 0 / 1032 MMX-arith sites; the codec's
-`pushfd / xor 0x200000 / popfd / pushfd` ID-bit toggle
-test concluded "no CPUID supported" because our `Flags::pack`
-returned a constant value over the modelled bits (bit 21
-absent). Post-round-19 (with `Flags::id` modelled, RDTSC
-implemented, CPUID family bumped to 6 model 3 Pentium II so
-the codec's `cmp ebx, 0x600` family discriminator picks the
-post-PPro path), CPUID reaches 2 / 2 on both IR41 and IR50
-and the global MMX feature mask `[0x1c4a9a54] = 0x800000`
-gets written. **MMX-byte reachability is still 0**, however:
-the codec's "use MMX kernels" decision flag `[0x1c4a9a38]`
-also requires `[ebp-8] != 0` (a caller-provided per-
-instance enable we have not yet localised). Round 20 will
-trace the write to identify the gating source. Full byte-
-trace + commit narrative in `CHANGELOG.md`.
+Round 20 sub-goal A localised the MMX gate to a registry
+probe: the codec calls
+`RegOpenKeyExA(HKLM, "HARDWARE\DESCRIPTION\System\FloatingPointProcessor", …)`
+and only sets `[ebp-8] = 1` (which propagates into
+`[0x1c4a9a38] = 1` "use MMX kernels") if the call returns
+ERROR_SUCCESS. We synthesise the FloatingPointProcessor key
+as present (every Win9x/NT machine had it). After the unblock
+the IV50 IR50 8-frame `indeo5.avi` decode reports
+**11.5M MMX dispatches** total (1.5M/frame) and the IV41
+8-frame pipeline reaches 138/1032 (13%) of the codec's MMX
+opcode bytes. RCL/RCR instruction forms (group-2 reg=2/3 in
+`C0/C1/D0/D1/D2/D3`) needed implementation in the integer
+ISA — they were unreached pre-round-20.
 
-Round 13's MMX module (1007 LOC, ~50 opcodes) remains
-correct-semantics-pending-real-codec-validation; round 19
-does not change that, but it produces the first concrete
-fix-list for round 20 to act on.
+Round 20 sub-goal B closes the 13 PE-load blockers for
+`mpg4c32.dll` (kernel32 CreateEventA / CreateThread / SetEvent
++ msvcrt new / delete / _adjust_fdiv / _except_handler3 /
+_initterm / malloc / free + user32 GetScrollPos /
+SetScrollPos / SetScrollRange + winmm GetDriverModuleHandle).
+A new `Registry::register_data` channel handles
+`_adjust_fdiv`, which is a 4-byte data symbol the codec reads
+through `mov reg, [iat]; mov reg, [reg]` — putting a thunk
+there fails on the second deref. We pre-allocate a 4 KiB R/W
+region at `0x70100000` and patch the IAT slot to point inside
+it (initial value 0 = "no Pentium-FDIV fix-up needed").
+`Sandbox::call_dll_main` now falls back to the PE
+`AddressOfEntryPoint` when no `DllMain` named export is
+present (mpg4c32 ships only `DriverProc`). With this in
+place, mpg4c32's CRT entry runs through `malloc` + `_initterm`
+to completion. ICOpen('MP43') reaches DriverProc and
+dispatches DRV_OPEN; round 21 picks up where the codec
+rejects the FOURCC.
 
-Round 20 has **two parallel sub-goals**: (a) trace the write
-to `[0x1c4a9a38]` `[ebp-8]` Indeo MMX-enable gate so the
-existing `IR41_32.AX` / `IR50_32.DLL` pipelines start
-exercising MMX kernels, and (b) close the MSMPEG4 v3
-PE-load blockers (13 imports for `mpg4c32.dll`, 6 each for
-`mpg4ds32.ax` + `wmvds32.ax`) so `Sandbox::load()` succeeds
-on the codec the project has otherwise been unable to
-decode. The two sub-goals touch disjoint binaries and
-disjoint emulator surfaces, so they can be batched into a
-single round. Concrete import lists per binary live in
-`docs/winmf/winmf-emulator.md` Milestone 3.1. The round-17 SPECGAP
-recorded in `tests/round17_corpus_specgap.rs` (no non-Indeo
-Win32 codec available on `samples.oxideav.org/codecs/windows/`)
-is unchanged. The full design contract lives in
+The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

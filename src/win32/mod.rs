@@ -27,6 +27,7 @@ use crate::emulator::{Cpu, Mmu};
 pub mod advapi32;
 pub mod gdi32;
 pub mod kernel32;
+pub mod msvcrt;
 pub mod ole32;
 pub mod user32;
 pub mod vfw32;
@@ -328,7 +329,41 @@ pub struct Registry {
     by_thunk: BTreeMap<u32, StubEntry>,
     by_name: BTreeMap<(String, String), u32>,
     next_slot: u32,
+    /// Per-(dll, name) **data imports**. Some CRT symbols are
+    /// imported by name but are read as data (e.g.
+    /// `msvcrt!_adjust_fdiv`, an `int` flag the FDIV-erratum
+    /// fix-up code consults). The PE loader treats their IAT
+    /// slots as `mov ecx, [iat]; mov edx, [ecx]` — the IAT
+    /// slot is the address OF a 4-byte int, not a function
+    /// pointer. We pre-allocate a small read/write region for
+    /// these and patch the IAT slot to its address. The
+    /// `(value)` is whatever the symbol is documented to hold;
+    /// 0 is the safe default.
+    data_imports: BTreeMap<(String, String), DataImport>,
+    /// Bump cursor in the data-import slot region (assigned
+    /// addresses live in `[DATA_IMPORT_BASE, DATA_IMPORT_BASE +
+    /// DATA_IMPORT_SIZE)`).
+    next_data_slot: u32,
 }
+
+/// One data-import slot, addressed via [`Registry::resolve`].
+#[derive(Clone, Copy, Debug)]
+pub struct DataImport {
+    /// Guest address of the 4-byte slot. The PE loader patches
+    /// the IAT entry with this value.
+    pub addr: u32,
+    /// Initial value to seed into `[addr]` at first slot
+    /// allocation. Subsequent registrations of the same name
+    /// keep the prior value.
+    pub initial: u32,
+}
+
+/// Region reserved for data-import slots — see [`DataImport`].
+/// 4 KiB is plenty: the entire CRT data-import set is fewer
+/// than 16 dwords across all codecs we expect to load.
+pub const DATA_IMPORT_BASE: u32 = 0x7010_0000;
+const DATA_IMPORT_SIZE: u32 = 0x0000_1000;
+const DATA_IMPORT_END: u32 = DATA_IMPORT_BASE + DATA_IMPORT_SIZE;
 
 impl Registry {
     pub fn new() -> Self {
@@ -336,7 +371,48 @@ impl Registry {
             by_thunk: BTreeMap::new(),
             by_name: BTreeMap::new(),
             next_slot: 0,
+            data_imports: BTreeMap::new(),
+            next_data_slot: DATA_IMPORT_BASE,
         }
+    }
+
+    /// Register a data import — a 4-byte symbol the codec
+    /// reads via `mov reg, [iat]; mov reg, [reg]`. Returns
+    /// the guest address that the IAT slot should point at.
+    /// Subsequent calls with the same `(dll, name)` return the
+    /// previously assigned slot.
+    pub fn register_data(&mut self, dll: &str, name: &str, initial: u32) -> u32 {
+        let key = (dll.to_ascii_lowercase(), name.to_string());
+        if let Some(d) = self.data_imports.get(&key) {
+            return d.addr;
+        }
+        let addr = self.next_data_slot;
+        let next = addr.saturating_add(4);
+        if next > DATA_IMPORT_END {
+            // Caller asked to register more data imports than
+            // we reserved space for. Return 0 — the loader
+            // handles "unresolved" by falling back to a thunk
+            // that will trap loudly.
+            return 0;
+        }
+        self.next_data_slot = next;
+        self.data_imports.insert(key, DataImport { addr, initial });
+        // Also expose it through the by-name resolver so the
+        // PE loader's ordinary lookup picks it up. The
+        // returned address is in the data region (not a thunk
+        // — `is_thunk(addr)` will correctly return false).
+        self.by_name
+            .insert((dll.to_ascii_lowercase(), name.to_string()), addr);
+        addr
+    }
+
+    /// Iterate the registered data imports. The PE loader uses
+    /// this to seed each slot's `initial` value into MMU memory
+    /// after the data-import region has been mapped.
+    pub fn data_imports(&self) -> impl Iterator<Item = (&String, &String, &DataImport)> {
+        self.data_imports
+            .iter()
+            .map(|((dll, name), d)| (dll, name, d))
     }
 
     /// Register a stub. Returns the synthetic thunk address that
@@ -423,9 +499,16 @@ impl Registry {
         self.by_name.len() - before
     }
 
-    /// Register every Round-1+4+8 stub family in one call:
-    /// kernel32, gdi32, user32, winmm, advapi32, ole32. Returns
-    /// the total number registered.
+    /// Register every msvcrt stub. Returns the number registered.
+    pub fn register_msvcrt(&mut self) -> usize {
+        let before = self.by_name.len();
+        msvcrt::register(self);
+        self.by_name.len() - before
+    }
+
+    /// Register every Round-1+4+8+20 stub family in one call:
+    /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt.
+    /// Returns the total number registered.
     pub fn register_all(&mut self) -> usize {
         self.register_kernel32()
             + self.register_gdi32()
@@ -433,6 +516,7 @@ impl Registry {
             + self.register_winmm()
             + self.register_advapi32()
             + self.register_ole32()
+            + self.register_msvcrt()
     }
 }
 

@@ -129,6 +129,21 @@ pub fn register(registry: &mut Registry) {
     // wvsprintfA: like wsprintfA but takes a `va_list*` instead
     // of being variadic. cdecl. We bottom-out at zero.
     registry.register("user32.dll", "wvsprintfA", stub_zero0 as StubFn, 0);
+
+    // ---- Round-20 additions (mpg4c32.dll PE-load surface) ---------
+    //
+    // The MSMPEG4 v3 codec carries a property-page UI vestige
+    // that imports three scroll-bar APIs at the IAT level.
+    // None of them is reached by the decode path; they exist
+    // only so the IAT slot resolves at PE-load time. Each
+    // returns the canonical "zero-state" reply per MSDN.
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getscrollpos
+    registry.register("user32.dll", "GetScrollPos", stub_zero2 as StubFn, 2);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setscrollpos
+    registry.register("user32.dll", "SetScrollPos", stub_zero4 as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setscrollrange
+    registry.register("user32.dll", "SetScrollRange", stub_zero5 as StubFn, 5);
 }
 
 // ---- Generic fail-soft stubs reused across many user32 entries -----

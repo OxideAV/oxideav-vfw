@@ -13,6 +13,7 @@ use crate::emulator::{mmu::Perm, Cpu, Mmu};
 use crate::pe::{Image, Loader};
 use crate::win32::{
     call_guest, run_until_sentinel as run_until_sentinel_free, vfw32, HostState, Registry,
+    DATA_IMPORT_BASE,
 };
 
 /// `DllMain` reason code: process is loading the DLL.
@@ -28,6 +29,11 @@ const HEAP_ARENA_END: u32 = 0x7000_0000;
 /// `GetCommandLineA` / `GetEnvironmentStrings` etc.
 const CONST_ARENA_START: u32 = 0x7000_0000;
 const CONST_ARENA_END: u32 = 0x7010_0000;
+
+/// Data-import slot region — see [`crate::win32::DATA_IMPORT_BASE`].
+/// Holds 4-byte values backing CRT data imports like
+/// `msvcrt!_adjust_fdiv`. 4 KiB is plenty.
+const DATA_IMPORT_REGION_SIZE: u32 = 0x0000_1000;
 
 /// Default guest stack region — plenty of room above the heap.
 const STACK_BOTTOM: u32 = 0x9000_0000;
@@ -80,6 +86,11 @@ impl Sandbox {
             CONST_ARENA_END - CONST_ARENA_START,
             Perm::R | Perm::W,
         );
+        // Data-import slot region (R+W) — holds the 4-byte
+        // values backing CRT data imports like
+        // `msvcrt!_adjust_fdiv`. Seeded with each registered
+        // import's `initial` value.
+        mmu.map(DATA_IMPORT_BASE, DATA_IMPORT_REGION_SIZE, Perm::R | Perm::W);
         // Stack (R+W)
         mmu.map(STACK_BOTTOM, STACK_SIZE, Perm::R | Perm::W);
         // TEB / FS-segment data (R+W). Initialise FS:[0] = -1
@@ -99,6 +110,11 @@ impl Sandbox {
 
         let mut registry = Registry::new();
         registry.register_all();
+        // Seed data-import slot values into the mapped region.
+        for (_dll, _name, d) in registry.data_imports() {
+            mmu.write_initializer(d.addr, &d.initial.to_le_bytes())
+                .expect("seed data import");
+        }
 
         let host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END);
@@ -131,10 +147,35 @@ impl Sandbox {
     /// `lpvReserved` first, then `fdwReason`, then `hModule`,
     /// then the return-address sentinel. The callee's `RET 12`
     /// (or equivalent) cleans the args.
+    ///
+    /// Resolution: prefer the `DllMain` named export (Indeo
+    /// codecs); fall back to the PE `AddressOfEntryPoint`
+    /// (mpg4c32.dll and other CRT-startup-driven DLLs that
+    /// don't export `DllMain` by name). Both expose the same
+    /// stdcall (HINSTANCE, DWORD, LPVOID) ABI.
     pub fn call_dll_main(&mut self, image: &Image, reason: u32) -> Result<u32, crate::Error> {
         let h_module = image.image_base;
         let lpv_reserved = 0u32;
-        self.call_export(image, "DllMain", &[h_module, reason, lpv_reserved])
+        let target = image.export("DllMain").unwrap_or(image.entry_point);
+        if target == 0 {
+            return Err(crate::Error::Win32(
+                crate::win32::Win32Error::InvalidArgument {
+                    stub: "call_dll_main",
+                    reason: format!(
+                        "no DllMain export and no PE entry point in {:?}",
+                        image.name
+                    ),
+                },
+            ));
+        }
+        call_guest(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            target,
+            &[h_module, reason, lpv_reserved],
+        )
     }
 
     /// Generic stdcall guest-call helper. Resolves `name` against

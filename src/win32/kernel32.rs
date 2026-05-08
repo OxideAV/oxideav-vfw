@@ -620,6 +620,57 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-lstrlena
     registry.register("kernel32.dll", "lstrlenA", stub_lstrlen_a as StubFn, 1);
+
+    // ---- Round-20 additions (mpg4c32.dll DllMain reach) -----------
+    //
+    // Per `docs/winmf/winmf-emulator.md` §"Milestone 3.1". The
+    // MSMPEG4 v3 codec adds a thread-creation surface its
+    // C++ runtime touches at static-init time; because our
+    // sandbox is single-threaded, `CreateThread` is implemented
+    // synchronously (call the start address, return a fake
+    // HANDLE).
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventa
+    registry.register(
+        "kernel32.dll",
+        "CreateEventA",
+        stub_create_event_a as StubFn,
+        4,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createthread
+    registry.register(
+        "kernel32.dll",
+        "CreateThread",
+        stub_create_thread as StubFn,
+        6,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
+    registry.register("kernel32.dll", "SetEvent", stub_set_event as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
+    // Single-threaded sandbox — no-op TRUE. Pre-emptively
+    // registered (mpg4ds32.ax / msadds32.ax both import it).
+    registry.register(
+        "kernel32.dll",
+        "SetThreadPriority",
+        stub_set_thread_priority as StubFn,
+        2,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-resumethread
+    registry.register(
+        "kernel32.dll",
+        "ResumeThread",
+        stub_resume_thread as StubFn,
+        1,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-muldiv
+    registry.register("kernel32.dll", "MulDiv", stub_muldiv as StubFn, 3);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprofileinta
+    registry.register(
+        "kernel32.dll",
+        "GetProfileIntA",
+        stub_get_profile_int_a as StubFn,
+        3,
+    );
 }
 
 // ----- Heap ----------------------------------------------------------
@@ -2524,6 +2575,157 @@ fn stub_lstrlen_a(
         }
     }
     Ok(n)
+}
+
+// ====================================================================
+// Round-20 stubs — `mpg4c32.dll` PE-load surface (Milestone 3.1).
+// ====================================================================
+
+/// `HANDLE CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes,
+/// BOOL bManualReset, BOOL bInitialState, LPCSTR lpName)`. The
+/// codec only uses the returned HANDLE as an opaque key for
+/// `SetEvent` / `WaitForSingleObject`. We return a non-zero
+/// pseudo-handle (`0xCAFE_E001` + a tick-driven offset) so
+/// every distinct call site sees a fresh value.
+fn stub_create_event_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let _manual = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let _init = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    let _name = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateEventA", t))?;
+    state.tick = state.tick.wrapping_add(1);
+    Ok(0xCAFE_E000u32.wrapping_add(state.tick))
+}
+
+/// `HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes,
+/// SIZE_T dwStackSize, LPTHREAD_START_ROUTINE lpStartAddress,
+/// LPVOID lpParameter, DWORD dwCreationFlags,
+/// LPDWORD lpThreadId)`.
+///
+/// Single-threaded sandbox semantics: invoke the start routine
+/// synchronously (stdcall, one parameter) using
+/// [`crate::win32::call_guest`], then return a non-zero
+/// pseudo-HANDLE. If the caller passed `lpThreadId`, write a
+/// pseudo-thread-id (the same numeric value as the handle).
+///
+/// `dwCreationFlags & CREATE_SUSPENDED (0x4)` is honoured by
+/// returning *without* running the start address; a paired
+/// `ResumeThread` does nothing in our model. This mirrors the
+/// MSDN contract closely enough for codec init, which only
+/// uses the suspend bit to set thread priority before letting
+/// the thread run.
+fn stub_create_thread(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    registry: &Registry,
+) -> Result<u32, Win32Error> {
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    let _attrs = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("CreateThread", t))?;
+    let _stack = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("CreateThread", t))?;
+    let start = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("CreateThread", t))?;
+    let param = arg_dword(cpu, mmu, 3).map_err(|t| trap_to_win32("CreateThread", t))?;
+    let flags = arg_dword(cpu, mmu, 4).map_err(|t| trap_to_win32("CreateThread", t))?;
+    let p_tid = arg_dword(cpu, mmu, 5).map_err(|t| trap_to_win32("CreateThread", t))?;
+
+    state.tick = state.tick.wrapping_add(1);
+    let handle = 0xCAFE_C000u32.wrapping_add(state.tick);
+    if p_tid != 0 {
+        mmu.store32(p_tid, handle)
+            .map_err(|t| trap_to_win32("CreateThread", t))?;
+    }
+    if start != 0 && (flags & CREATE_SUSPENDED) == 0 {
+        // stdcall: one DWORD argument. The thread proc returns
+        // its exit code in eax; we discard it.
+        let _ = crate::win32::call_guest(cpu, mmu, registry, state, start, &[param]);
+    }
+    Ok(handle)
+}
+
+/// `BOOL SetEvent(HANDLE)`. Single-threaded sandbox: the event
+/// is "signaled" but no one is waiting on it. Return TRUE.
+fn stub_set_event(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL SetThreadPriority(HANDLE, int)`. Single-threaded
+/// sandbox: priority changes have no effect, return TRUE.
+fn stub_set_thread_priority(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `DWORD ResumeThread(HANDLE)`. Single-threaded sandbox: thread
+/// is already "running" (we ran it synchronously inside
+/// `CreateThread`), so resume returns the previous suspend count
+/// 0. Real `ResumeThread` returns `(DWORD)-1` on failure but
+/// codecs don't check.
+fn stub_resume_thread(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(0)
+}
+
+/// `int MulDiv(int nNumber, int nNumerator, int nDenominator)`.
+/// Returns `(i64)nNumber * nNumerator / nDenominator` rounded
+/// to nearest, half away from zero. Returns -1 on
+/// `nDenominator == 0` or i32 overflow.
+fn stub_muldiv(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let a = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("MulDiv", t))? as i32;
+    let b = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("MulDiv", t))? as i32;
+    let c = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("MulDiv", t))? as i32;
+    if c == 0 {
+        return Ok((-1i32) as u32);
+    }
+    let prod = (a as i64).wrapping_mul(b as i64);
+    let cb = c as i64;
+    // Half-away-from-zero rounding: add cb/2 (with sign of
+    // prod * sign of c) before the divide.
+    let sign_match = (prod < 0) == (cb < 0);
+    let half = cb.wrapping_abs() / 2;
+    let adj = if sign_match { half } else { -half };
+    let result = prod.wrapping_add(adj) / cb;
+    if result > i32::MAX as i64 || result < i32::MIN as i64 {
+        return Ok((-1i32) as u32);
+    }
+    Ok((result as i32) as u32)
+}
+
+/// `UINT GetProfileIntA(LPCSTR lpAppName, LPCSTR lpKeyName,
+/// INT nDefault)`. We have no `win.ini` to consult, so always
+/// return the caller's default. (Pre-XP API; modern codecs
+/// only use it for legacy compatibility settings.)
+fn stub_get_profile_int_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _app = arg_dword(cpu, mmu, 0).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
+    let _key = arg_dword(cpu, mmu, 1).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
+    let default = arg_dword(cpu, mmu, 2).map_err(|t| trap_to_win32("GetProfileIntA", t))?;
+    Ok(default)
 }
 
 #[cfg(test)]

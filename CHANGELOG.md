@@ -8,6 +8,75 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 20 — **MMX kernels dispatch + MSMPEG4 v3 PE-load
+  unblock**, two parallel sub-goals.
+  - **Sub-goal A — `[ebp-8]` MMX-enable gate localised to a
+    registry probe.** Round 19 left the codec's "use MMX
+    kernels" decision flag at `[0x1c4a9a38] = 0` because
+    `[ebp-8]` was never written. Round 20 disassembled
+    `IR41_32.AX` file_off 0x319a0..0x31b50 and identified
+    that `[ebp-8]` is set to 1 iff
+    `RegOpenKeyExA(HKLM, "HARDWARE\DESCRIPTION\System\FloatingPointProcessor",
+    0, KEY_READ, &hKey)` returns ERROR_SUCCESS. Real Win9x
+    /NT machines unconditionally have that key. The
+    advapi32 stub now returns ERROR_SUCCESS for the
+    `FloatingPointProcessor` path (`key_exists_synthetically()`).
+    After the fix, the codec's `[0x1c4a9a38]` reaches 1 and
+    MMX kernels run end-to-end:
+    * `indeo5.avi` 320×240 IV50: 1.5M MMX dispatches/frame ×
+      8 frames = **11.5M total**.
+    * `Educ_Movie_DeadlyForce.avi` 240×180 IV50: 5.99M.
+    * `miss_congeniality_cryptedindeo5.avi` 640×352 IV50:
+      **42.1M**.
+    * `indeo41.avi` 320×240 IV41: 138/1032 MMX-byte VAs reach
+      decoder execution (vs 0 pre-round-20). 8/8 frames OK.
+  - **Group-2 RCL/RCR (reg=2/3) implemented** in `C0/C1/D0/D1
+    /D2/D3` r/m8 and r/m32 forms. The codec uses RCL on the
+    MMX path; round-19 trapped on `0xD1 0xD1` (`RCL ECX, 1`)
+    as soon as the use_mmx flag was set.
+  - **Sub-goal B — 13 mpg4c32.dll PE-load stubs.**
+    Per `docs/winmf/winmf-emulator.md` §"Milestone 3.1":
+    * `kernel32!{CreateEventA, CreateThread, SetEvent,
+      SetThreadPriority, ResumeThread, MulDiv,
+      GetProfileIntA}` — synchronous-thread + priority +
+      classic-Win32-utility surface.
+    * `msvcrt.dll` — new module (`src/win32/msvcrt.rs`):
+      `??2@YAPAXI@Z` (operator new),
+      `??3@YAXPAX@Z` (operator delete), `_except_handler3`,
+      `_initterm`, `_purecall`, `malloc`, `free`. All cdecl.
+      `_initterm` re-enters the run loop via `call_guest`
+      to invoke each non-null fn-ptr in the table.
+    * `user32!{GetScrollPos, SetScrollPos, SetScrollRange}`
+      — fail-soft zero-return (UI vestige, not reached on
+      decode path).
+    * `winmm!GetDriverModuleHandle` — returns
+      `host.primary_module_base`.
+  - **`Registry::register_data` data-import channel.**
+    `msvcrt!_adjust_fdiv` is a 4-byte data symbol, not a
+    function. The codec dereferences the IAT slot value
+    (`mov reg, [iat]; mov reg, [reg]`) — putting a thunk
+    there crashes on the second deref. We pre-reserve a
+    4 KiB R/W region at `0x70100000` for data imports;
+    `Sandbox::new` seeds each slot with its registered
+    `initial` value; the loader's IAT-resolve sees the
+    data slot as the registered "thunk" address and patches
+    accordingly.
+  - **`Sandbox::call_dll_main` falls back to PE
+    `AddressOfEntryPoint`** when no `DllMain` named export
+    is present. mpg4c32 only exports `DriverProc`; its
+    DLL_PROCESS_ATTACH path is the PE entry (typical CRT
+    `_DllMainCRTStartup`).
+  - Test suite: `tests/round20_mpg4c32_load.rs` (3 tests
+    asserting imports inventory empty, `Sandbox::load`
+    succeeds, and DRV_LOAD → ICOpen reaches DriverProc).
+    The mpg4c32.dll bytes are read from
+    `docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/`;
+    tests skip with a stderr note when the docs subtree
+    isn't pulled.
+  - Test count delta: +5 (from 290 → 297). All round-19
+    instruments + every prior real-codec pipeline stay
+    green.
+
 - Round 19 — **Lead A: trace-coverage analysis identifies the
   EFLAGS.ID-bit gap as the root cause of zero-MMX-dispatch in
   rounds 12..17.** The crate's MMX module
