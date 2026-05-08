@@ -156,24 +156,51 @@ fn mp43_keyframe_decompress_through_real_codec() {
     };
     let q = sb.ic_decompress_query(hic, &input, Some(&output));
     eprintln!("round21: ICDecompressQuery → {q:?}");
-    let begin = sb.ic_decompress_begin(hic, &input, &output);
-    eprintln!("round21: ICDecompressBegin → {begin:?}");
-    if begin.is_err() {
-        eprintln!("round21: bailing on ICDecompressBegin trap");
-        return;
-    }
+    assert_eq!(
+        q.unwrap(),
+        0,
+        "round21: ICDecompressQuery should return ICERR_OK"
+    );
+    let begin = sb
+        .ic_decompress_begin(hic, &input, &output)
+        .expect("round22: ICDecompressBegin must not trap");
+    eprintln!("round22: ICDecompressBegin → {begin:#x}");
+    assert_eq!(
+        begin, 0,
+        "round22: ICDecompressBegin should return ICERR_OK (= 0). \
+         Round 21 left this returning -100 (ICERR_INTERNAL); round \
+         22 unblocked it via the v3 wrapper-handshake plant + \
+         FSIN/FCOS/FRNDINT/FSCALE/FPREM x87 sub-forms."
+    );
     let cap = output.size_image;
     let result = sb.ic_decompress(hic, 0, &input, &sample.bytes, &output, cap);
     match result {
         Ok((rc, out)) => {
             eprintln!(
-                "round21: ICDecompress rc={rc:#x}, output {} bytes (first 32: {:02x?})",
+                "round22: ICDecompress rc={rc:#x}, output {} bytes (first 32: {:02x?})",
                 out.len(),
                 &out[..32.min(out.len())]
             );
+            assert_eq!(
+                rc, 0,
+                "round22: ICDecompress should return ICERR_OK on the first keyframe"
+            );
+            assert_eq!(out.len() as u32, cap);
+            // Round-22 reach goal: confirm the codec wrote
+            // SOMETHING into the output buffer (vs. early-exiting
+            // with a zero-fill from `arena_alloc`). Bit-perfect
+            // YUV / RGB-24 cross-checking against an
+            // ffmpeg-reference is deferred — round 22's milestone
+            // is "the codec actually executes its keyframe-decode
+            // body".
+            let any_nonzero = out.iter().take(1024).any(|&b| b != 0);
+            assert!(
+                any_nonzero,
+                "round22: ICDecompress wrote 0 non-zero bytes — output buffer untouched"
+            );
         }
-        Err(e) => eprintln!(
-            "round21: ICDecompress trapped: {e}; eip={:#010x}",
+        Err(e) => panic!(
+            "round22: ICDecompress trapped: {e}; eip={:#010x}",
             sb.cpu.regs.eip
         ),
     }

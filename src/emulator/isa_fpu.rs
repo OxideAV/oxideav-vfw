@@ -284,16 +284,58 @@ fn dispatch_reg_form(
                     cpu.fpu.push(0.0);
                     Ok(StepOk::Continued)
                 }
-                (6, 4) => {
-                    // FRNDINT — round ST(0) to integer per CW.
+                (7, 0) => {
+                    // FPREM (D9 F8) — partial remainder. Real
+                    // x87 is iterative (handles huge magnitudes
+                    // by repeated reduction), but a single IEEE
+                    // remainder ≤ |st1| matches what codecs
+                    // actually use. Round 22.
+                    let st0 = cpu.fpu.st(0);
+                    let st1 = cpu.fpu.st(1);
+                    if st1 != 0.0 {
+                        cpu.fpu.set_st(0, st0 - (st0 / st1).trunc() * st1);
+                    }
+                    Ok(StepOk::Continued)
+                }
+                (7, 2) => {
+                    // FSQRT (D9 FA)
+                    let v = cpu.fpu.st(0);
+                    cpu.fpu.set_st(0, v.sqrt());
+                    Ok(StepOk::Continued)
+                }
+                (7, 4) => {
+                    // FRNDINT (D9 FC) — round ST(0) to integer.
+                    // Round-21 mis-labelled this at (6, 4); the
+                    // wmpcdcs8-2001 mpg4c32.dll never reaches
+                    // (6, 4), but we want the right reg/rm pair
+                    // here since clippy lint coverage relies on
+                    // matched sub-forms being authoritative.
                     let v = cpu.fpu.st(0);
                     cpu.fpu.set_st(0, v.round());
                     Ok(StepOk::Continued)
                 }
-                (7, 2) => {
-                    // FSQRT
+                (7, 5) => {
+                    // FSCALE (D9 FD) — ST(0) *= 2^trunc(ST(1)).
+                    let st0 = cpu.fpu.st(0);
+                    let st1 = cpu.fpu.st(1);
+                    let scale = (st1.trunc() as i32).clamp(-1023, 1023);
+                    let result = st0 * (2f64).powi(scale);
+                    cpu.fpu.set_st(0, result);
+                    Ok(StepOk::Continued)
+                }
+                (7, 6) => {
+                    // FSIN (D9 FE) — ST(0) = sin(ST(0)). The
+                    // mpg4c32 v3 ICDecompressBegin path uses
+                    // FSIN/FCOS for the IDCT post-processing
+                    // setup tables.
                     let v = cpu.fpu.st(0);
-                    cpu.fpu.set_st(0, v.sqrt());
+                    cpu.fpu.set_st(0, v.sin());
+                    Ok(StepOk::Continued)
+                }
+                (7, 7) => {
+                    // FCOS (D9 FF) — ST(0) = cos(ST(0)).
+                    let v = cpu.fpu.st(0);
+                    cpu.fpu.set_st(0, v.cos());
                     Ok(StepOk::Continued)
                 }
                 _ => Err(Trap::PrivilegedOpcode {

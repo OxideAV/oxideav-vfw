@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 22 — **MSMPEG4 v3 ICDecompressBegin + first keyframe
+  decode unblock**. Round 21 closed two DRV_OPEN gates and the
+  codec advanced through `ICOpen` / `ICDecompressQuery`, but
+  `ICDecompressBegin` still returned `ICERR_INTERNAL` (`-100`).
+  - **Sub-goal A — root-cause the v3-only ICDecompressBegin
+    gate.** Static disasm + a research test
+    (`tests/round22_decomp_begin_trace.rs`) traced the failure
+    to `mpg4c32!DriverProc+0x14e2` at `0x1c2034dc..0x1c2034f0`:
+    when DRV_OPEN tagged the per-instance state with
+    `[esi+0x18]=3` (i.e. `MP43`), the begin path probes
+    `state[+0xb4..+0xc8]` for a 20-byte `{ DWORD == 1, 16-byte
+    GUID }` record. The 16-byte GUID at `mpg4c32!.text:0x1128`
+    decodes as `b4c66e30-0180-11d3-bbc6-006008320064` —
+    a private wrapper handshake (DirectShow / DMO codec
+    factory) that real WMP populates before invoking the
+    codec. No public ICM_* message writes those fields.
+    `vfw32::ic_decompress_begin` now plants the wrapper's
+    contribution directly at `[driver_id + 0xb4..0xc8]` for
+    instances DRV_OPEN tagged as v3 (gated on `fcc_handler ∈
+    { MP43, mp43, MP42, mp42, MPG4, mpg4 }` + a runtime
+    `[+0x18] == 3` re-check). After the fix:
+    `ICDecompressBegin → ICERR_OK`,
+    `ICDecompress(keyframe, BI_RGB 24bpp) → ICERR_OK`, output
+    buffer populated (76032 bytes for the 176×144 fixture).
+  - **Sub-goal B — five new x87 D9 reg-form sub-forms** in
+    `src/emulator/isa_fpu.rs`: FSIN (`D9 FE`), FCOS (`D9 FF`),
+    FPREM (`D9 F8`), FSCALE (`D9 FD`), and a re-located
+    FRNDINT (`D9 FC` → `(reg=7, rm=4)`; round 21 had it at the
+    wrong `(6, 4)` slot). The MSMPEG4 v3 begin path uses
+    FSIN/FCOS to populate the IDCT trig tables; without these
+    the trace trapped immediately after the GUID gate cleared.
+- Round 22 sentinel tests:
+  * `tests/round22_decomp_begin_trace.rs` — research instrument;
+    drives `ICDecompressBegin` with `Cpu::trace_ring(256)` +
+    `Cpu::visited_eips()` enabled, dumps the EIP path + which
+    fragment of `mpg4c32!DriverProc+0x14e2` was reached.
+  * `tests/round21_mp43_decompress.rs` — sub-test
+    `mp43_keyframe_decompress_through_real_codec` now asserts
+    `ICDecompressBegin` returns 0 and `ICDecompress` returns 0
+    (was descriptive-only in round 21).
+
 - Round 21 — **x87 FPU executor + MSMPEG4 v3 DRV_OPEN unblock**.
   Round 20 left mpg4c32's `ICOpen('VIDC','MP43')` returning
   hic=0 because the abbreviated CRT-startup DllMain bailed at

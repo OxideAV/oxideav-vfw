@@ -636,6 +636,23 @@ pub fn ic_decompress_begin(
             stub: "ICDecompressBegin",
             reason: format!("unknown HIC {hic}"),
         })?;
+    // Round 22 — preempt the MSMPEG4 v3 (`mpg4c32!DriverProc`)
+    // private "is this codec instance bound to the v3 wrapper?"
+    // gate. The gate fires only when `state[+0x18] == 3` (set by
+    // DRV_OPEN for fccHandler `MP43`/`mp43`); it dereferences a
+    // 20-byte `{ DWORD == 1, 16-byte GUID }` record at
+    // `state[+0xb4..+0xc8]` and bails with `ICERR_INTERNAL`
+    // (`-100`) if the GUID does not match
+    // `b4c66e30-0180-11d3-bbc6-006008320064`. No public Win32
+    // ICM_* message populates these fields — they are written by
+    // a private wrapper layer (DirectShow / DMO codec factory)
+    // that real WMP/Media Foundation hosts the codec inside. We
+    // synthesise the wrapper's contribution directly into guest
+    // memory before the begin call. See
+    // `tests/round22_decomp_begin_trace.rs` for the disasm-of-
+    // record. Indeo / Cinepak codecs do not gate this way, so
+    // the round-12 / round-15 paths remain a no-op.
+    msmpeg4_v3_preinit(mmu, state, &entry)?;
     let in_addr = state.arena_alloc(BIH_SIZE)?;
     host_bih_to_guest(mmu, input, in_addr)?;
     let out_addr = state.arena_alloc(BIH_SIZE)?;
@@ -654,6 +671,61 @@ pub fn ic_decompress_begin(
             out_addr,
         ],
     )
+}
+
+/// 16-byte GUID at `mpg4c32.dll!.text:0x1c201128`, decoded from
+/// the on-disk byte sequence
+/// `30 6e c6 b4 80 01 d3 11 bb c6 00 60 08 32 00 64`. Stored as
+/// big-endian-by-field per Microsoft's `GUID` layout
+/// (DWORD, WORD, WORD, BYTE[8]) so the byte stream is what
+/// `rep cmpsb` matches against. Used by [`msmpeg4_v3_preinit`]
+/// to satisfy mpg4c32's v3-only ICDecompressBegin gate.
+const MSMPEG4_V3_PRIVATE_GUID: [u8; 16] = [
+    0x30, 0x6e, 0xc6, 0xb4, 0x80, 0x01, 0xd3, 0x11, 0xbb, 0xc6, 0x00, 0x60, 0x08, 0x32, 0x00, 0x64,
+];
+
+/// Plant the MSMPEG4 v3 private-wrapper handshake at
+/// `state[+0xb4..+0xc8]` for instances that DRV_OPEN tagged as
+/// v3 (i.e. `state[+0x18] == 3`). A no-op for any other codec
+/// or non-v3 MSMPEG4 instance. Idempotent — safe to call from
+/// every entry into the begin / decompress wrappers.
+fn msmpeg4_v3_preinit(
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    entry: &HicEntry,
+) -> Result<(), Win32Error> {
+    // Only mpg4c32 (and the binary-equivalent winxp build of
+    // the same codec) tags state[+0x18]; on Indeo / Cinepak the
+    // offset holds something unrelated. Gate on fcc_handler
+    // first to keep the host-side behaviour predictable.
+    let h = entry.fcc_handler.to_le_bytes();
+    let is_msmpeg4 = matches!(
+        &h,
+        b"MP43" | b"mp43" | b"MP42" | b"mp42" | b"MPG4" | b"mpg4"
+    );
+    if !is_msmpeg4 {
+        return Ok(());
+    }
+    let trap = |t: crate::emulator::Trap| Win32Error::InvalidArgument {
+        stub: "ICDecompressBegin/msmpeg4_v3_preinit",
+        reason: format!("{t}"),
+    };
+    // Verify the codec marked the instance as v3. Reading
+    // [driver_id + 0x18] is safe: DRV_OPEN allocated 0xc8 bytes
+    // via `malloc`, so the entire [+0..+0xc8] range is within
+    // the codec's own arena.
+    let v3_tag = mmu.load32(entry.driver_id + 0x18).map_err(trap)?;
+    if v3_tag != 3 {
+        return Ok(());
+    }
+    // Plant `{1u32, GUID}` at [driver_id + 0xb4]. The check at
+    // mpg4c32!DriverProc+0x14e2 walks [driver_id+0xb4] for a
+    // refcount-style sentinel (== 1), then `rep cmpsb` 16 bytes
+    // from [driver_id+0xb8] against the GUID below.
+    mmu.store32(entry.driver_id + 0xb4, 1).map_err(trap)?;
+    mmu.write(entry.driver_id + 0xb8, &MSMPEG4_V3_PRIVATE_GUID)
+        .map_err(trap)?;
+    Ok(())
 }
 
 /// End-of-stream cleanup. Returns the codec's `LRESULT`.

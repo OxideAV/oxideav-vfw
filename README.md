@@ -9,41 +9,38 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 21 — x87 FPU executor + MSMPEG4 v3 DRV_OPEN
-unblock.** The abbreviated CRT-startup DllMain in mpg4c32
-walks `_initterm`'s static-ctor table; the second entry
-issues `FLD QWORD [const]` + `FSTP QWORD [global]` to copy
-a constant double into a global, but round 20's emulator
-treated every x87 escape as `UndefinedOpcode`. Round 21
-implements an eight-deep f64 FPU (~700 LOC in
-`src/emulator/isa_fpu.rs`) covering FLD/FST/FSTP for m32 /
-m64 / m80 / i16 / i32 / i64, FADD/FSUB/FMUL/FDIV across all
-operand widths, FXCH/FCHS/FABS/FSQRT/FRNDINT, the FCOM /
-FUCOM family with C0..C3 condition-code bookkeeping,
-FNSTSW AX, and FLDCW/FNSTCW/FLDENV/FNSTENV. With the FPU
-lit up, mpg4c32's CRT entry now runs **85** instructions
-(was 45) to DllMain returning **`1`** (was `0`); the
-codec's stored DllMain pointer is populated; and a real
-`kernel32!DisableThreadLibraryCalls` call surfaces. A
-parallel fix in `vfw32::ic_open` lower-cases the ICOPEN
-fccType / fccHandler before calling DriverProc — the
-Microsoft codec literally checks `cmp dword [ebx+4],
-'vidc'` (lowercase, per `vfw.h ICTYPE_VIDEO`); Indeo
-predecessors ignored the field so callers passed `b"VIDC"`
-verbatim. After both fixes, **`ICOpen('VIDC','MP43')`
-returns `hic = 0x1`** and DriverProc dispatches
-DRV_LOAD/DRV_ENABLE/DRV_OPEN end-to-end. ICDecompressBegin
-is the next-blocker (returns `ICERR_INTERNAL`). Sub-goal B
-adds three msvcrt stubs (`_onexit`, `__dllonexit`,
-`sprintf`) which closes the PE-load gate for `mpg4ds32.ax`
-+ `wmvds32.ax` (DirectShow filters).
+**Round 22 — MSMPEG4 v3 ICDecompressBegin + first keyframe
+decode unblock.** Round 21 left ICDecompressBegin returning
+`ICERR_INTERNAL` (`-100`). Static disasm of
+`mpg4c32!DriverProc+0x14e2` traced the failure to a private
+v3-only handshake: when DRV_OPEN tags `[esi+0x18]=3` for
+fccHandler `MP43`, the begin path checks for a 20-byte
+`{ DWORD == 1, GUID b4c66e30-0180-11d3-bbc6-006008320064 }`
+record at `state[+0xb4..+0xc8]` — fields that no public
+ICM_* message writes; they're populated by the wrapping
+DirectShow / DMO codec factory layer real WMP hosts the
+codec inside. `vfw32::ic_decompress_begin` now plants the
+wrapper's contribution directly. Five new x87 D9 reg-form
+sub-forms (FSIN, FCOS, FPREM, FSCALE, and FRNDINT relocated
+to the correct `(7, 4)` slot) unlock the IDCT trig-table
+init the begin path runs after the GUID gate clears. After
+the round-22 fixes:
+
+* **`ICDecompressBegin → ICERR_OK`** (was `-100`)
+* **`ICDecompress(keyframe, BI_RGB 24bpp) → ICERR_OK`**
+  with a 76032-byte populated output buffer (176×144×3
+  for the test fixture).
+
+Bit-perfect cross-checking against an ffmpeg reference is
+deferred — the round-22 milestone is "the codec actually
+executes its keyframe-decode body and writes pixels".
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 / 20 | `ICERR_OK` (8/8 frames; **MMX kernels active**) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 / 20 | `ICERR_OK` (8/8 frames each; **MMX kernels active**) |
-| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 21 | DRV_LOAD/DRV_ENABLE/DRV_OPEN ✓; ICOpen('MP43') returns hic=1; ICDecompressBegin returns `ICERR_INTERNAL` (next-blocker) |
+| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 22 | `ICERR_OK` (first keyframe; bit-perfect cross-check deferred) |
 | WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD | 21 | PE-load ✓ (`mpg4ds32.ax` + `wmvds32.ax` DS filters); DriverProc unexplored |
 
 Round 20 sub-goal A localised the MMX gate to a registry
