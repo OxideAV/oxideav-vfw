@@ -1,42 +1,45 @@
-//! Round 7 — MMX scaffolding regression tests.
+//! Round 7 / round 13 — MMX dispatch + semantics regression
+//! tests.
 //!
-//! The round-7 dispatch surface for the MMX opcode space
-//! (`0F 60..6F`, `0F 70..7F`, `0F D0..FF`) routes every
-//! recognised opcode to a structured-trap variant
-//! ([`oxideav_vfw::emulator::Trap::UnimplementedMmx`]) instead
-//! of the generic [`oxideav_vfw::emulator::Trap::UndefinedOpcode`].
+//! Round 7 routed every MMX opcode to a structured-trap variant
+//! (`Trap::UnimplementedMmx`) so the trap log read as a clean
+//! to-do list. Round 13 implements the semantics — the MMX
+//! opcodes now run as real instructions on `Cpu::mmx[0..7]`.
 //!
-//! These tests assert:
+//! These tests assert the executed effect of a representative
+//! sample of the MMX subset round 13 implements:
 //!
-//! * The MMX register file `mm0..mm7` exists on `Cpu` and is
-//!   zero-initialised.
-//! * Each of a representative sample of MMX opcodes (one per
-//!   block) traps as `UnimplementedMmx` carrying:
-//!   - the full 2-byte opcode value `0x0Fxx`
-//!   - the EIP of the leading `0F` byte
-//!   - a non-empty mnemonic hint string.
-//! * A non-MMX `0F` opcode (`0F C8 BSWAP eax`) still works, so
-//!   the routing change did not regress integer ISA coverage.
+//! * `MOVD mm, r32` — load a 32-bit GPR into the low lane.
+//! * `MOVQ mm, mm` — copy a 64-bit MMX register.
+//! * `PXOR mm, mm` — bitwise xor (zero-self idiom).
+//! * `PADDB mm, mm` — packed byte add (wrapping per lane).
+//! * `EMMS` — clear MMX state.
+//! * Group-14 `PSLLQ mm, imm8` — shift the whole register by
+//!   imm8.
+//! * `PCMPGTB mm, mm` — signed-byte greater-than mask.
 //!
 //! Reference: Intel® 64 and IA-32 Architectures Software
-//! Developer's Manual, Volume 2, Appendix A Table A-3
-//! ("Two-byte Opcode Map").
-//!
-//! Round 8 will land MMX semantics opcode-by-opcode by reading
-//! this trap log and implementing each named mnemonic in turn.
+//! Developer's Manual, Volume 2A/2B, per-instruction reference
+//! pages.
 
+use oxideav_vfw::emulator::isa_int::RET_SENTINEL;
 use oxideav_vfw::emulator::mmu::{Mmu, Perm};
 use oxideav_vfw::emulator::regs::Reg32;
-use oxideav_vfw::emulator::{Cpu, Trap};
+use oxideav_vfw::emulator::Cpu;
 
-/// Plant `bytes` at VA `0x1000` in a fresh MMU + zero CPU and
-/// return the pair. Code page is RWX so tests can patch easily.
-fn make_cpu_at_1000(bytes: &[u8]) -> (Cpu, Mmu) {
+/// Plant `bytes` at VA `0x1000` in a fresh MMU + map a small
+/// stack at `0x9000_0000` and push the RET_SENTINEL so a
+/// terminating `ret` at the end of the test program halts the
+/// run cleanly.
+fn make_cpu_with_stack(bytes: &[u8]) -> (Cpu, Mmu) {
     let mut mmu = Mmu::new();
     mmu.map(0x1000, 0x1000, Perm::R | Perm::W | Perm::X);
     mmu.write_initializer(0x1000, bytes).unwrap();
+    mmu.map(0x9000_0000, 0x10_000, Perm::R | Perm::W);
     let mut cpu = Cpu::new();
     cpu.regs.eip = 0x1000;
+    cpu.regs.set_esp(0x9000_F000);
+    cpu.push32(&mut mmu, RET_SENTINEL).unwrap();
     (cpu, mmu)
 }
 
@@ -53,7 +56,6 @@ fn mmx_register_file_is_writable() {
     let mut cpu = Cpu::new();
     cpu.mmx[3] = 0xDEAD_BEEF_F00D_FACE;
     assert_eq!(cpu.mmx[3], 0xDEAD_BEEF_F00D_FACE);
-    // Other lanes untouched.
     for (i, mm) in cpu.mmx.iter().enumerate() {
         if i == 3 {
             continue;
@@ -62,180 +64,80 @@ fn mmx_register_file_is_writable() {
     }
 }
 
-/// `0F 60 C0` — PUNPCKLBW mm0, mm0. ModR/M = 0xC0 (mod=3,
-/// reg=0, rm=0).
+/// `MOVD mm0, eax` (`0F 6E C0`) zero-extends `eax` into `mm0`.
 #[test]
-fn punpcklbw_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x60, 0xC0]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            eip,
-            opcode,
-            mnemonic_hint,
-        } => {
-            assert_eq!(eip, 0x1000);
-            assert_eq!(opcode, 0x0F60);
-            assert_eq!(mnemonic_hint, "PUNPCKLBW MMX");
-        }
-        other => panic!("expected Trap::UnimplementedMmx, got {other:?}"),
-    }
-    // EIP should advance past 0F + opcode + ModR/M = 3 bytes.
-    assert_eq!(cpu.regs.eip, 0x1003);
+fn movd_mm0_eax_loads_low_lane() {
+    // mov eax, 0xCAFEBABE  ; B8 BE BA FE CA
+    // movd mm0, eax        ; 0F 6E C0
+    // ret                  ; C3
+    let (mut cpu, mut mmu) =
+        make_cpu_with_stack(&[0xB8, 0xBE, 0xBA, 0xFE, 0xCA, 0x0F, 0x6E, 0xC0, 0xC3]);
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[0], 0xCAFE_BABE, "mm0 should hold zero-extended eax");
 }
 
-/// `0F 6E C0` — MOVD mm0, eax. ModR/M = 0xC0.
+/// `MOVQ mm1, mm0` (`0F 6F C8`) copies one register to another.
 #[test]
-fn movd_mmx_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x6E, 0xC0]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F6E);
-            assert_eq!(mnemonic_hint, "MOVD MMX");
-        }
-        other => panic!("expected Trap::UnimplementedMmx, got {other:?}"),
-    }
+fn movq_mm1_mm0_copies_register() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0x6F, 0xC8, 0xC3]);
+    cpu.mmx[0] = 0x1122_3344_5566_7788;
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[1], 0x1122_3344_5566_7788);
 }
 
-/// `0F 6F C8` — MOVQ mm1, mm0.
+/// `PXOR mm0, mm0` (`0F EF C0`) zeroes mm0 — the canonical
+/// MMX-register-init idiom.
 #[test]
-fn movq_mmx_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x6F, 0xC8]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F6F);
-            assert_eq!(mnemonic_hint, "MOVQ MMX");
-        }
-        other => panic!("expected Trap::UnimplementedMmx, got {other:?}"),
+fn pxor_self_zeroes_register() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0xEF, 0xC0, 0xC3]);
+    cpu.mmx[0] = 0xFFFF_FFFF_FFFF_FFFF;
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[0], 0);
+}
+
+/// `PADDB mm1, mm0` (`0F FC C8`) wraps per byte. With mm0 = 1s
+/// and mm1 = 0xFF...FF, each lane wraps 0xFF + 1 = 0x00.
+#[test]
+fn paddb_wraps_per_lane() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0xFC, 0xC8, 0xC3]);
+    cpu.mmx[0] = 0x0101_0101_0101_0101; // mm0 = all 0x01
+    cpu.mmx[1] = 0xFFFF_FFFF_FFFF_FFFF; // mm1 = all 0xFF
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[1], 0); // each byte wraps to 0
+}
+
+/// `EMMS` (`0F 77`) clears all eight MMX registers.
+#[test]
+fn emms_clears_mmx_state() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0x77, 0xC3]);
+    for i in 0..8 {
+        cpu.mmx[i] = 0xAAAA_BBBB_CCCC_DDDD;
+    }
+    cpu.run(&mut mmu).unwrap();
+    for (i, mm) in cpu.mmx.iter().enumerate() {
+        assert_eq!(*mm, 0, "mm{i} should be zeroed by EMMS");
     }
 }
 
-/// `0F 70 C0 02` — PSHUFW mm0, mm0, 2. ModR/M + imm8.
+/// Group-14 `PSLLQ mm0, 8` (`0F 73 F0 08`) shifts mm0 left by 8.
 #[test]
-fn pshufw_consumes_modrm_and_imm8() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x70, 0xC0, 0x02]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F70);
-            assert_eq!(mnemonic_hint, "PSHUFW MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
-    // 0F + 70 + ModR/M + imm8 = 4 bytes.
-    assert_eq!(cpu.regs.eip, 0x1004);
+fn psllq_imm_shifts_64_bits() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0x73, 0xF0, 0x08, 0xC3]);
+    cpu.mmx[0] = 0x0000_0000_0000_00FF;
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[0], 0x0000_0000_0000_FF00);
 }
 
-/// `0F 73 F0 03` — PSLLQ mm0, 3 (group-14, /6 in ModR/M).
+/// `PCMPGTB mm0, mm1` (`0F 64 C1`) — per-byte signed compare.
+/// With mm0 lanes = 1 (positive) and mm1 lanes = 0xFF (-1), each
+/// lane sets to 0xFF (true).
 #[test]
-fn pslq_imm_consumes_modrm_and_imm8() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x73, 0xF0, 0x03]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F73);
-            // mnemonic is the umbrella "group-14" string per
-            // dispatch_mmx contract.
-            assert!(
-                mnemonic_hint.contains("group-14"),
-                "expected group-14 hint, got {mnemonic_hint:?}"
-            );
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
-    assert_eq!(cpu.regs.eip, 0x1004);
-}
-
-/// `0F 77` — EMMS. No ModR/M, no imm8.
-#[test]
-fn emms_routes_to_structured_trap_with_no_modrm() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x77]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F77);
-            assert_eq!(mnemonic_hint, "EMMS");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
-    // EMMS has no ModR/M — only the 2 opcode bytes.
-    assert_eq!(cpu.regs.eip, 0x1002);
-}
-
-/// `0F EF C0` — PXOR mm0, mm0.
-#[test]
-fn pxor_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0xEF, 0xC0]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0FEF);
-            assert_eq!(mnemonic_hint, "PXOR MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
-}
-
-/// `0F FC C8` — PADDB mm1, mm0.
-#[test]
-fn paddb_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0xFC, 0xC8]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0FFC);
-            assert_eq!(mnemonic_hint, "PADDB MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
-}
-
-/// `0F FE D9` — PADDD mm3, mm1.
-#[test]
-fn paddd_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0xFE, 0xD9]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0FFE);
-            assert_eq!(mnemonic_hint, "PADDD MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
+fn pcmpgtb_signed_compare() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0x64, 0xC1, 0xC3]);
+    cpu.mmx[0] = 0x0101_0101_0101_0101;
+    cpu.mmx[1] = 0xFFFF_FFFF_FFFF_FFFF; // -1 in each lane
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[0], 0xFFFF_FFFF_FFFF_FFFF);
 }
 
 /// Regression: BSWAP `0F C8` is *not* MMX and must still
@@ -244,53 +146,51 @@ fn paddd_routes_to_structured_trap() {
 fn bswap_eax_still_works_after_mmx_routing() {
     // mov eax, 0x11223344 ; bswap eax ; ret
     let bytes = [0xB8, 0x44, 0x33, 0x22, 0x11, 0x0F, 0xC8, 0xC3];
-    let mut mmu = Mmu::new();
-    mmu.map(0x1000, 0x1000, Perm::R | Perm::W | Perm::X);
-    mmu.write_initializer(0x1000, &bytes).unwrap();
-    // Stack for ret.
-    mmu.map(0x9000_0000, 0x10_000, Perm::R | Perm::W);
-    let mut cpu = Cpu::new();
-    cpu.regs.eip = 0x1000;
-    cpu.regs.set_esp(0x9000_F000);
-    // Push the return sentinel.
-    cpu.push32(&mut mmu, oxideav_vfw::emulator::isa_int::RET_SENTINEL)
-        .unwrap();
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&bytes);
     cpu.run(&mut mmu).unwrap();
     assert_eq!(cpu.regs.get32(Reg32::Eax), 0x4433_2211);
 }
 
-/// `0F D1 C0` — PSRLW mm0, mm0.
+/// `MOVQ mm/m64, mm` (`0F 7F`) round-trips a register through
+/// memory: store mm0 to [eax], load it back into mm1.
 #[test]
-fn psrlw_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0xD1, 0xC0]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0FD1);
-            assert_eq!(mnemonic_hint, "PSRLW MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
+fn movq_to_memory_and_back_roundtrips() {
+    // Layout @ 0x1000:
+    //   mov eax, 0x9000_0100         ; B8 00 01 00 90
+    //   movq [eax], mm0              ; 0F 7F 00
+    //   movq mm1, [eax]              ; 0F 6F 08
+    //   ret                          ; C3
+    let bytes = [
+        0xB8, 0x00, 0x01, 0x00, 0x90, 0x0F, 0x7F, 0x00, 0x0F, 0x6F, 0x08, 0xC3,
+    ];
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&bytes);
+    cpu.mmx[0] = 0xAABB_CCDD_EEFF_0011;
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx[1], 0xAABB_CCDD_EEFF_0011);
+    // And the value should be at [0x9000_0100] in memory.
+    assert_eq!(mmu.load64(0x9000_0100).unwrap(), 0xAABB_CCDD_EEFF_0011);
 }
 
-/// `0F 64 C0` — PCMPGTB mm0, mm0.
+/// `MOVD r/m32, mm` (`0F 7E C0`) — store mm0 low 32 bits into eax.
 #[test]
-fn pcmpgtb_routes_to_structured_trap() {
-    let (mut cpu, mut mmu) = make_cpu_at_1000(&[0x0F, 0x64, 0xC0]);
-    let err = cpu.run(&mut mmu).unwrap_err();
-    match err {
-        Trap::UnimplementedMmx {
-            opcode,
-            mnemonic_hint,
-            ..
-        } => {
-            assert_eq!(opcode, 0x0F64);
-            assert_eq!(mnemonic_hint, "PCMPGTB MMX");
-        }
-        other => panic!("expected UnimplementedMmx, got {other:?}"),
-    }
+fn movd_stores_low_lane_into_gpr() {
+    let (mut cpu, mut mmu) = make_cpu_with_stack(&[0x0F, 0x7E, 0xC0, 0xC3]);
+    cpu.mmx[0] = 0xCAFE_BABE_DEAD_BEEF;
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_BEEF);
+}
+
+/// `mmx_dispatch_count` is the round-13 sentinel; verify it
+/// counts every MMX dispatch even when the instructions
+/// otherwise pass.
+#[test]
+fn mmx_dispatch_count_increments_per_opcode() {
+    // pxor mm0, mm0  (0F EF C0)
+    // movq mm1, mm0  (0F 6F C8)
+    // emms           (0F 77)
+    // ret            (C3)
+    let (mut cpu, mut mmu) =
+        make_cpu_with_stack(&[0x0F, 0xEF, 0xC0, 0x0F, 0x6F, 0xC8, 0x0F, 0x77, 0xC3]);
+    cpu.run(&mut mmu).unwrap();
+    assert_eq!(cpu.mmx_dispatch_count, 3);
 }

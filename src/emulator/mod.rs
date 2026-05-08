@@ -16,6 +16,7 @@
 
 pub mod decode;
 pub mod isa_int;
+pub mod isa_mmx;
 pub mod mmu;
 pub mod regs;
 

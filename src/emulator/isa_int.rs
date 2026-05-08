@@ -98,10 +98,16 @@ pub struct Cpu {
     /// alias in a later round.
     ///
     /// Round 7 lands the register file + structured-trap
-    /// dispatch surface but does NOT implement any actual MMX
-    /// semantics. Touching `mm0..mm7` always traps as
-    /// [`Trap::UnimplementedMmx`].
+    /// dispatch surface; round 13 implements MMX semantics
+    /// (`super::isa_mmx::dispatch`) so reads / writes to
+    /// `mm0..mm7` no longer trap for the implemented subset.
     pub mmx: [u64; 8],
+    /// Count of MMX (`0F 60..6F | 70..7F | D0..FF`) instructions
+    /// successfully dispatched. Round-13 sentinel — lets a test
+    /// confirm MMX semantics actually ran rather than the codec
+    /// happening to take an integer-only path. Incremented in
+    /// [`super::isa_mmx::dispatch`].
+    pub mmx_dispatch_count: u64,
     /// Ring buffer of recently-executed instruction starts (eip
     /// before opcode fetch). Capacity 64. Used by trace mode
     /// (round 9) to surface a "last N opcodes" log when a trap
@@ -149,6 +155,7 @@ impl Cpu {
             gs_base: 0,
             fpu_cw: 0x037F,
             mmx: [0u64; 8],
+            mmx_dispatch_count: 0,
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
         }
@@ -190,7 +197,7 @@ impl Cpu {
     /// Translate an effective address according to the current
     /// segment-override prefix. Called by every memory-touching
     /// helper. Returns the final linear address.
-    fn seg_translate(&self, ea: u32) -> u32 {
+    pub(super) fn seg_translate(&self, ea: u32) -> u32 {
         match self.seg_override {
             Some(Seg::Fs) => ea.wrapping_add(self.fs_base),
             Some(Seg::Gs) => ea.wrapping_add(self.gs_base),
@@ -1360,53 +1367,14 @@ impl Cpu {
             //               EMMS, MOVD/MOVQ.
             //   0F D0..FF : PADD*/PSUB*/PMUL*/PMADD/PCMPEQ/PSL*/
             //               PSR*/PAND/POR/PXOR/PADDS*/PSUBS*.
-            0x60..=0x6F | 0x70..=0x7F | 0xD0..=0xFF => self.dispatch_mmx(op2, entry_eip, mmu),
+            0x60..=0x6F | 0x70..=0x7F | 0xD0..=0xFF => {
+                super::isa_mmx::dispatch(self, mmu, op2, entry_eip)
+            }
             other => Err(Trap::UndefinedOpcode {
                 eip: entry_eip,
                 opcode: 0x0F00 | u32::from(other),
             }),
         }
-    }
-
-    /// MMX opcode dispatch (round 7 scaffold).
-    ///
-    /// All implemented MMX opcodes consume their ModR/M (and any
-    /// imm8) so that EIP advances past the entire instruction
-    /// even when we trap. This makes the trap log a faithful
-    /// "next instruction the codec wants" report rather than a
-    /// landmine for the round-8 implementer.
-    ///
-    /// Reference: Intel® 64 and IA-32 Architectures Software
-    /// Developer's Manual, Volume 2, Appendix A (Opcode Maps),
-    /// Tables A-2 (one-byte) + A-3 (two-byte).
-    fn dispatch_mmx(&mut self, op2: u8, entry_eip: u32, mmu: &mut Mmu) -> Result<StepOk, Trap> {
-        // Most MMX instructions take a ModR/M byte. We consume it
-        // (and any displacement / imm8) before trapping so that
-        // EIP moves past the instruction, even when the MMX
-        // semantics are not yet implemented. This lets a tracing
-        // run keep walking past unimplemented MMX bodies.
-        let mnemonic_hint = mmx_mnemonic(op2);
-        let needs_modrm = mmx_consumes_modrm(op2);
-        let imm8_after = mmx_has_imm8(op2);
-
-        if needs_modrm {
-            let mr = self.fetch_modrm(mmu)?;
-            let bytes = self.peek_after_modrm(mmu, 16)?;
-            // We don't actually use the operand — but resolving it
-            // also tells us how many displacement bytes follow.
-            let (_op, consumed) = resolve_modrm32(mr, &bytes, &self.regs)?;
-            self.regs.eip = self.regs.eip.wrapping_add(consumed as u32);
-        }
-        if imm8_after {
-            // Advance past the trailing imm8 (PSHUFW, group-12/13/14
-            // shift-by-immediate).
-            self.regs.eip = self.regs.eip.wrapping_add(1);
-        }
-        Err(Trap::UnimplementedMmx {
-            eip: entry_eip,
-            opcode: 0x0F00 | u32::from(op2),
-            mnemonic_hint,
-        })
     }
 
     /// CPUID — return a fixed Pentium-class response. Per design
@@ -1423,13 +1391,20 @@ impl Cpu {
                 self.regs.set32(Reg32::Ecx, u32::from_le_bytes(*b"ntel"));
             }
             1 => {
-                // Pentium model (family 5, model 2, stepping 0).
-                self.regs.set32(Reg32::Eax, (5 << 8) | (2 << 4));
+                // Pentium MMX model (family 5, model 4, stepping 0)
+                // — bumped from round-1's plain Pentium so codecs
+                // gated on CPUID.MMX (bit 23 of EDX) take their
+                // MMX-accelerated path. Round 13 implements the MMX
+                // semantics those paths actually use; reporting
+                // MMX is what wires them up.
+                self.regs.set32(Reg32::Eax, (5 << 8) | (4 << 4));
                 self.regs.set32(Reg32::Ebx, 0);
                 self.regs.set32(Reg32::Ecx, 0);
-                // Feature bits: FPU(0)+TSC(4)+CX8(8) only. No MMX,
-                // no SSE, no SSE2 — round-1 surface.
-                self.regs.set32(Reg32::Edx, (1 << 0) | (1 << 4) | (1 << 8));
+                // Feature bits: FPU(0)+TSC(4)+CX8(8)+MMX(23). Still
+                // no SSE / SSE2 (the codec's SSE2 paths would need
+                // a 16-byte SIMD register file we don't have yet).
+                self.regs
+                    .set32(Reg32::Edx, (1 << 0) | (1 << 4) | (1 << 8) | (1 << 23));
             }
             _ => {
                 self.regs.set32(Reg32::Eax, 0);
@@ -1442,7 +1417,7 @@ impl Cpu {
 
     // ----- helpers ------------------------------------------------
 
-    fn fetch_imm8(&mut self, mmu: &Mmu) -> Result<u8, Trap> {
+    pub(super) fn fetch_imm8(&mut self, mmu: &Mmu) -> Result<u8, Trap> {
         let v = mmu.fetch_x8(self.regs.eip)?;
         self.regs.eip = self.regs.eip.wrapping_add(1);
         Ok(v)
@@ -1464,12 +1439,12 @@ impl Cpu {
         Ok(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 
-    fn fetch_modrm(&mut self, mmu: &Mmu) -> Result<ModRm, Trap> {
+    pub(super) fn fetch_modrm(&mut self, mmu: &Mmu) -> Result<ModRm, Trap> {
         let b = self.fetch_imm8(mmu)?;
         Ok(ModRm::decode(b))
     }
 
-    fn peek_after_modrm(&self, mmu: &Mmu, n: usize) -> Result<Vec<u8>, Trap> {
+    pub(super) fn peek_after_modrm(&self, mmu: &Mmu, n: usize) -> Result<Vec<u8>, Trap> {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             // We tolerate an unmapped/unreadable trailing byte
@@ -3207,23 +3182,11 @@ pub(crate) fn mmx_mnemonic(op2: u8) -> &'static str {
     }
 }
 
-/// Whether the named MMX opcode in `0F 60..7F` / `D0..FF` has a
-/// ModR/M byte. (All implemented MMX opcodes do; `0F 77 EMMS`
-/// is the lone exception.)
-fn mmx_consumes_modrm(op2: u8) -> bool {
-    !matches!(op2, 0x77)
-}
-
-/// Whether the named MMX opcode in `0F 60..7F` / `D0..FF` carries
-/// a trailing imm8 byte after the ModR/M.
-///
-/// The two cases in the round-7 surface:
-///
-/// * `0F 70` PSHUFW imm8.
-/// * `0F 71/72/73` group-12/13/14 shift-by-imm8.
-fn mmx_has_imm8(op2: u8) -> bool {
-    matches!(op2, 0x70..=0x73)
-}
+// Round-7 helpers `mmx_consumes_modrm` / `mmx_has_imm8` were
+// removed in round 13 once the structured-trap dispatcher was
+// replaced by the real MMX semantics in `super::isa_mmx`. The
+// per-opcode arms there know exactly what ModR/M / imm8 they
+// consume; no umbrella table is needed.
 
 #[cfg(test)]
 mod tests {

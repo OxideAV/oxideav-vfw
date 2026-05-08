@@ -8,6 +8,98 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 13: **MMX instruction set + sequential P-frame decode
+  through `IR50_32.DLL`.** Round 12 unblocked the FIRST keyframe
+  of `cat_attack.avi`; round 13 extends that to multi-frame
+  decode through a single shared `hic`. Eight sequential video
+  samples (sample 0 keyframe + samples 1..7 P-frames) all
+  return `ICERR_OK = 0` with > 99% non-zero RGB24 output and
+  ~2-3M emulator-instructions per frame. The codec maintains
+  reference-frame state across calls; opening a fresh hic per
+  frame would discard the keyframe + leave the next P-frame
+  with nothing to motion-compensate against.
+- `crates/oxideav-vfw/src/emulator/isa_mmx.rs` (~700 LOC) —
+  MMX semantics module. Implements the working subset Intel's
+  IR50_32.DLL exercises (and the `0F D0..FF` block IV50 P-frame
+  decoders typically use):
+    * Move family — `MOVD mm, r/m32` (`0F 6E`),
+      `MOVD r/m32, mm` (`0F 7E`), `MOVQ mm, mm/m64` (`0F 6F`),
+      `MOVQ mm/m64, mm` (`0F 7F`).
+    * Bitwise — `PXOR` (`0F EF`), `PAND` (`0F DB`),
+      `PANDN` (`0F DF`), `POR` (`0F EB`), `EMMS` (`0F 77`).
+    * Pack / unpack — `PUNPCKL{BW,WD,DQ}` (`0F 60..62`),
+      `PUNPCKH{BW,WD,DQ}` (`0F 68..6A`),
+      `PACK{SSWB,SSDW,USWB}` (`0F 63 / 6B / 67`).
+    * Wrapping arithmetic — `PADD{B,W,D}` (`0F FC..FE`),
+      `PADDQ` (`0F D4`), `PSUB{B,W,D}` (`0F F8..FA`),
+      `PSUBQ` (`0F FB`), `PMULLW` (`0F D5`), `PMULHW` (`0F E5`),
+      `PMADDWD` (`0F F5`).
+    * Saturating arithmetic — `PADDS{B,W}` (`0F EC..ED`),
+      `PSUBS{B,W}` (`0F E8..E9`), `PADDUS{B,W}` (`0F DC..DD`),
+      `PSUBUS{B,W}` (`0F D8..D9`).
+    * Shifts — `PSL{LW,LD,LQ}` (`0F F1..F3`),
+      `PSR{LW,LD,LQ}` (`0F D1..D3`), `PSR{AW,AD}`
+      (`0F E1..E2`) in both register-source and the imm8
+      `0F 71/72/73` group-12/13/14 forms.
+    * Compares — `PCMPEQ{B,W,D}` (`0F 74..76`),
+      `PCMPGT{B,W,D}` (`0F 64..66`).
+    * Average — `PAVGB` (`0F E0`), `PAVGW` (`0F E3`).
+    Each opcode implemented from Intel® SDM Vol. 2A/2B per-
+    instruction reference pages.
+- `Cpu::mmx_dispatch_count: u64` — round-13 sentinel; counts
+  successfully-dispatched MMX instructions. Lets a regression
+  test verify whether the codec actually exercised the MMX
+  path or fell back to the integer-only routine on the same
+  CPUID feature bit.
+- CPUID feature bit 23 (MMX) in EDX leaf 1 plus model bump to
+  Pentium MMX (family 5 model 4); IR50_32.DLL on cat_attack.avi
+  still picks the integer path even with MMX advertised, but
+  the bit is correctly reported now and other codecs (IV41,
+  IV31's MMX variant, etc.) will pick up the MMX dispatch.
+- `extract_video_sample(avi_bytes, n)` in
+  `tests/common/avi_extractor.rs` — generalises
+  `extract_first_video_sample` to arbitrary sample index;
+  required for the round-13 multi-frame driver.
+- `tests/round13_iv50_multiframe.rs::cat_attack_decodes_sequential_frames_through_shared_hic`
+  — drives 8 sequential samples through one `hic`, asserts
+  every frame returns `ICERR_OK` with > 25% non-zero output,
+  emits a per-frame trace line ("sample N: lr=..., M MMX
+  instrs, X instrs total") so a future regression points at
+  the exact frame the codec broke on.
+- 13 MMX semantic regression tests in
+  `tests/round7_mmx_scaffold.rs` (rewrites the round-7
+  "structured-trap" tests now that the traps execute as real
+  instructions): MOVD load + store, MOVQ register copy +
+  through-memory roundtrip, PXOR self-zero, PADDB lane wrap,
+  EMMS clear-all, group-14 PSLLQ imm8, PCMPGTB signed compare,
+  BSWAP regression sentinel, dispatch-counter increment.
+- 19 MMX lane-primitive unit tests in
+  `src/emulator/isa_mmx.rs`'s `tests` module covering the
+  arithmetic / saturation / pack / shift / compare lane
+  primitives end-to-end (without going through the
+  emulator's instruction-stream path).
+- `kernel32!SizeofResource` registered into the dispatch
+  registry. Round 12 added the implementation behind
+  `#[allow(dead_code)]` because IR50_32.DLL doesn't import it;
+  round 13 wires it up so future codecs that DO import it
+  pick up the implementation rather than tripping the
+  unresolved-import trap.
+
+### Changed
+
+- `Cpu::seg_translate` / `fetch_imm8` / `fetch_modrm` /
+  `peek_after_modrm` lifted from private to `pub(super)` so
+  the new `isa_mmx` sibling module can drive them. Surface
+  is unchanged for external callers.
+- `Cpu::dispatch_mmx` (round-7 structured-trap helper) +
+  `mmx_consumes_modrm` / `mmx_has_imm8` umbrella tables
+  removed from `isa_int.rs`. The per-opcode arms in
+  `isa_mmx::dispatch` know exactly what ModR/M / imm8 each
+  instruction consumes; no umbrella table needed.
+- `cpuid()` leaf 1 now reports MMX (bit 23 of EDX). Family/
+  model bumped from Pentium-classic (5/2) to Pentium MMX
+  (5/4) for consistency.
+
 - Round 12: **`ICDecompress` against `IR50_32.DLL` returns
   `ICERR_OK` with a populated 320×240 RGB24 buffer.** Round 11
   plumbed `DRV_LOAD` + `DRV_ENABLE` through `ic_open` so the

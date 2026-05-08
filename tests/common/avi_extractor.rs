@@ -56,6 +56,18 @@ pub struct FirstSample {
 /// stream, return the first compressed-video chunk inside
 /// `LIST movi`.
 pub fn extract_first_video_sample(avi_bytes: &[u8]) -> Result<FirstSample, String> {
+    extract_video_sample(avi_bytes, 0)
+}
+
+/// Extract sample `n` (0-indexed) of the first video stream
+/// inside `LIST movi`. Round 13 needs samples 1..N (P-frames
+/// referencing the keyframe) so the decode driver can be re-run
+/// through the same `hic` for sequential decoding.
+///
+/// Audio / palette chunks are skipped per the same convention as
+/// `extract_first_video_sample`. Errors if the stream has fewer
+/// than `n+1` video samples.
+pub fn extract_video_sample(avi_bytes: &[u8], n: u32) -> Result<FirstSample, String> {
     // Top-level RIFF chunk: 'RIFF' + 4-byte size + 4-byte form
     // type ('AVI ') + body.
     if avi_bytes.len() < 12 {
@@ -143,6 +155,7 @@ pub fn extract_first_video_sample(avi_bytes: &[u8]) -> Result<FirstSample, Strin
     // We accept anything that is NOT a known audio / palette tag
     // for stream 0, so this walker is robust across encoders.
     let mut w = ChunkWalker::new(movi, movi_file_off);
+    let mut seen: u32 = 0;
     while let Some(c) = w.next()? {
         if !is_stream_chunk(c.kind, 0) {
             continue;
@@ -154,16 +167,23 @@ pub fn extract_first_video_sample(avi_bytes: &[u8]) -> Result<FirstSample, Strin
         if &two_cc == b"wb" || &two_cc == b"pc" {
             continue;
         }
-        return Ok(FirstSample {
-            codec_fourcc,
-            width: avih_w,
-            height: avih_h,
-            sample_offset: c.payload_file_off as u32,
-            sample_size: c.payload.len() as u32,
-            bytes: c.payload.to_vec(),
-        });
+        if seen == n {
+            return Ok(FirstSample {
+                codec_fourcc,
+                width: avih_w,
+                height: avih_h,
+                sample_offset: c.payload_file_off as u32,
+                sample_size: c.payload.len() as u32,
+                bytes: c.payload.to_vec(),
+            });
+        }
+        seen += 1;
     }
-    Err("no stream-0 video chunk found in LIST movi".into())
+    Err(format!(
+        "stream 0 has fewer than {} video samples in LIST movi (saw {})",
+        n + 1,
+        seen
+    ))
 }
 
 /// Stream chunk FourCC predicate. The first two bytes are the

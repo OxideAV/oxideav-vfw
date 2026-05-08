@@ -487,6 +487,18 @@ pub fn register(registry: &mut Registry) {
         stub_lock_resource as StubFn,
         1,
     );
+    // https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-sizeofresource
+    // Round 13 — round 12 added the impl with `#[allow(dead_code)]`
+    // because IR50_32.DLL doesn't import it. Now wired into the
+    // dispatch registry so future codecs that DO import it pick
+    // up a real implementation rather than tripping the
+    // unresolved-import trap.
+    registry.register(
+        "kernel32.dll",
+        "SizeofResource",
+        stub_sizeof_resource as StubFn,
+        2,
+    );
     // https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile
     registry.register(
         "kernel32.dll",
@@ -2193,9 +2205,9 @@ fn stub_lock_resource(
 /// `DWORD SizeofResource(HMODULE, HRSRC)`. Round 12 — the
 /// `HRSRC` is the `IMAGE_RESOURCE_DATA_ENTRY` VA from
 /// `FindResourceA`; second dword is `Size`. We're asked to
-/// return the byte count. Not currently imported by IR50_32 but
-/// included for round-13 codec compatibility.
-#[allow(dead_code)]
+/// return the byte count. Round 13 wires it into the dispatch
+/// registry; IR50_32 doesn't import it, but other codecs (and
+/// future round-14+ targets) will.
 fn stub_sizeof_resource(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
