@@ -36,6 +36,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 18 — **`trace` Cargo feature for the
+  reverse-engineering instrumentation surface (task #625
+  resolved).** New `trace` feature (default OFF) plus a
+  `trace-exec` sub-feature gates the JSONL probe tape
+  documented in `docs/winmf/winmf-emulator.md` §"Trace mode".
+  With the feature off, every `#[cfg(feature = "trace")]`
+  call site compiles to nothing — compatibility-only consumers
+  pay zero hot-path cost. With the feature on, four event
+  flavours land on a sink configured via
+  `OXIDEAV_VFW_TRACE_FILE=<path|2>` env var or
+  programmatically through [`Sandbox::set_trace_sink`]:
+  * `kind=win32_call` — every `dispatch_stub` invocation
+    captures `(dll, name, args, ret, eip)` from the guest
+    stack at call time + return value.
+  * `kind=mem_write` / `kind=mem_read` — programmable
+    watchpoints via [`Sandbox::watch(addr, size, mode)`]
+    where `mode = WatchMode::{Write,Read,Both}`. Linear-scan
+    inside MMU `load{8,16,32,64}` / `store{8,16,32,64}`;
+    overlapping watchpoints fire independently.
+  * `kind=exec` — per-instruction trace gated on the
+    `trace-exec` sub-feature AND
+    `Sandbox::set_exec_trace(true)`; carries first-byte
+    SDM-style mnemonic hint + 8-register snapshot.
+  * `kind=trap` — emitted unconditionally when `trace` is on
+    and the run loop bubbles up a `Trap` / `Win32Error` /
+    `PeError`. The most informative event when something
+    goes wrong.
+  Sink is wrapped in `RefCell<Option<Box<dyn Write + Send>>>`
+  on the [`crate::trace::TraceState`] struct owned by the
+  [`Mmu`], so the immutable-borrow MMU load paths can still
+  emit through the same code path as the mutable-borrow
+  store paths. JSONL schema mirrors the `oxideav-magicyuv`
+  / `oxideav-tta` `--features trace` emitters; `jq`-line
+  greppable. Estimated ~1–2 KLOC budget per the design doc;
+  shipped at ~470 LOC src + 130 LOC test (round-18 trace
+  module + MMU/dispatch hooks + `tests/round18_trace_feature.rs`,
+  4 new integration tests). Round-2 work tracked: GDB
+  Remote Serial Protocol server (gdbstub-based) wraps these
+  primitives for interactive driving.
 - Round 17 Part A — **non-Indeo Win32 codec hunt + corpus
   byte-scan.** New `tests/round17_corpus_specgap.rs` probes
   the `samples.oxideav.org/codecs/windows/` namespace for

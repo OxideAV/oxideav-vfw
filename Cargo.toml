@@ -15,6 +15,19 @@ categories = ["multimedia::encoding", "multimedia::video", "emulators"]
 [features]
 default = ["registry"]
 registry = ["dep:oxideav-core"]
+# Trace mode — adds reverse-engineering instrumentation surface
+# (Win32 stub calls, memory watchpoints, traps) that emits JSONL
+# events to a sink configured via the `OXIDEAV_VFW_TRACE_FILE`
+# environment variable or [`Sandbox::set_trace_sink`]. Off by
+# default; compatibility-only consumers do not pay for the
+# probe-site branches. See docs/winmf/winmf-emulator.md
+# §"Trace mode" for the design contract.
+trace = []
+# Sub-feature — enables per-instruction execution trace inside
+# the `trace` mode. Imposes ~3× extra overhead on top of `trace`,
+# so it gates separately. Has no effect unless `trace` is also
+# enabled.
+trace-exec = ["trace"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }

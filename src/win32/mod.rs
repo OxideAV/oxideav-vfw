@@ -498,12 +498,37 @@ pub fn dispatch_stub(
             name: format!("@{:#010x}", addr),
         })?
         .clone();
+    // Trace probe (gated): capture the call-site EIP (= the
+    // saved return address pushed by the guest CALL — the
+    // instruction right after the CALL, not the thunk address)
+    // and the first few stdcall args off the guest stack BEFORE
+    // running the stub, since the stub mutates the stack.
+    #[cfg(feature = "trace")]
+    let trace_args: Option<(u32, Vec<u32>)> = if mmu.trace.has_sink() {
+        let call_site_eip = mmu.load32(cpu.regs.esp()).unwrap_or(0);
+        let mut args = Vec::with_capacity(entry.arg_dwords as usize);
+        for i in 0..entry.arg_dwords {
+            let a = arg_dword(cpu, mmu, i).unwrap_or(0);
+            args.push(a);
+        }
+        Some((call_site_eip, args))
+    } else {
+        None
+    };
     // Run the host-side stub.
     let ret = (entry.func)(cpu, mmu, state, registry)?;
     if state.trace_stubs {
         state
             .stub_trace
             .push(format!("{}!{} → {:#010x}", entry.dll, entry.name, ret));
+    }
+    // Emit the trace event with the captured args + the actual
+    // return value. Done before stack unwind so the EIP we log
+    // is the call site, not the post-return PC.
+    #[cfg(feature = "trace")]
+    if let Some((call_site_eip, args)) = trace_args {
+        mmu.trace
+            .ev_win32_call(&entry.dll, &entry.name, &args, ret, call_site_eip);
     }
     // stdcall: pop return address, advance esp by arg_dwords*4,
     // set eax to the return value.
@@ -544,14 +569,71 @@ pub fn run_until_sentinel(
             return Ok(());
         }
         if registry.is_thunk(cpu.regs.eip) {
-            dispatch_stub(cpu, mmu, registry, state)?;
-            continue;
+            match dispatch_stub(cpu, mmu, registry, state) {
+                Ok(()) => continue,
+                Err(e) => {
+                    #[cfg(feature = "trace")]
+                    emit_trap_event(cpu, mmu, &e);
+                    return Err(e);
+                }
+            }
         }
-        match cpu.step(mmu)? {
-            StepOk::Continued => continue,
-            StepOk::Halted => return Ok(()),
+        match cpu.step(mmu) {
+            Ok(StepOk::Continued) => continue,
+            Ok(StepOk::Halted) => return Ok(()),
+            Err(t) => {
+                let e: crate::Error = t.into();
+                #[cfg(feature = "trace")]
+                emit_trap_event(cpu, mmu, &e);
+                return Err(e);
+            }
         }
     }
+}
+
+/// Trace-feature-gated: format the trap variant + register
+/// snapshot and push one `kind=trap` JSONL event.
+#[cfg(feature = "trace")]
+fn emit_trap_event(cpu: &Cpu, mmu: &Mmu, err: &crate::Error) {
+    use crate::emulator::regs::Reg32;
+    let (label, eip, opcode) = match err {
+        crate::Error::Trap(t) => match t {
+            crate::emulator::Trap::MemoryFault { addr } => ("MemoryFault", *addr, None::<u32>),
+            crate::emulator::Trap::ReadProtectFault { addr } => ("ReadProtectFault", *addr, None),
+            crate::emulator::Trap::WriteProtectFault { addr } => ("WriteProtectFault", *addr, None),
+            crate::emulator::Trap::ExecuteProtectFault { addr } => {
+                ("ExecuteProtectFault", *addr, None)
+            }
+            crate::emulator::Trap::UndefinedOpcode { eip, opcode } => {
+                ("UndefinedOpcode", *eip, Some(*opcode))
+            }
+            crate::emulator::Trap::PrivilegedOpcode { eip, .. } => ("PrivilegedOpcode", *eip, None),
+            crate::emulator::Trap::DivideByZero { eip } => ("DivideByZero", *eip, None),
+            crate::emulator::Trap::UnresolvedImport { .. } => {
+                ("UnresolvedImport", cpu.regs.eip, None)
+            }
+            crate::emulator::Trap::InstructionLimitExceeded { eip, .. } => {
+                ("InstructionLimitExceeded", *eip, None)
+            }
+            crate::emulator::Trap::UnimplementedMmx { eip, opcode, .. } => {
+                ("UnimplementedMmx", *eip, Some(*opcode))
+            }
+        },
+        crate::Error::PeLoader(_) => ("PeLoader", cpu.regs.eip, None),
+        crate::Error::Win32(_) => ("Win32", cpu.regs.eip, None),
+        crate::Error::NotImplemented => ("NotImplemented", cpu.regs.eip, None),
+    };
+    let regs = [
+        ("eax", cpu.regs.get32(Reg32::Eax)),
+        ("ecx", cpu.regs.get32(Reg32::Ecx)),
+        ("edx", cpu.regs.get32(Reg32::Edx)),
+        ("ebx", cpu.regs.get32(Reg32::Ebx)),
+        ("esp", cpu.regs.esp()),
+        ("ebp", cpu.regs.get32(Reg32::Ebp)),
+        ("esi", cpu.regs.get32(Reg32::Esi)),
+        ("edi", cpu.regs.get32(Reg32::Edi)),
+    ];
+    mmu.trace.ev_trap(label, eip, opcode, &regs);
 }
 
 /// Push args right-to-left, push the synthetic `RET_SENTINEL`,

@@ -92,6 +92,13 @@ impl Page {
 /// upper bound.
 pub struct Mmu {
     pages: Vec<Option<Page>>,
+    /// Reverse-engineering trace surface (gated on the `trace`
+    /// Cargo feature). When the feature is on but no sink is
+    /// configured, watchpoint scanning still happens but emits
+    /// drop. See [`crate::trace::TraceState`] +
+    /// `docs/winmf/winmf-emulator.md` §"Trace mode".
+    #[cfg(feature = "trace")]
+    pub trace: crate::trace::TraceState,
 }
 
 impl Default for Mmu {
@@ -107,7 +114,11 @@ impl Mmu {
         // 8 MiB of None markers, not 4 GiB of zero pages.
         let mut pages = Vec::with_capacity(NUM_PAGES);
         pages.resize_with(NUM_PAGES, || None);
-        Mmu { pages }
+        Mmu {
+            pages,
+            #[cfg(feature = "trace")]
+            trace: crate::trace::TraceState::new(),
+        }
     }
 
     /// Map a contiguous range of pages with the given permissions.
@@ -293,14 +304,20 @@ impl Mmu {
 
     /// Read a byte from emulator memory.
     pub fn load8(&self, addr: u32) -> Result<u8, Trap> {
-        self.fetch_byte(addr)
+        let v = self.fetch_byte(addr)?;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_read(addr, 1, u64::from(v));
+        Ok(v)
     }
 
     /// Read a 16-bit little-endian word from emulator memory.
     pub fn load16(&self, addr: u32) -> Result<u16, Trap> {
         let b0 = self.fetch_byte(addr)?;
         let b1 = self.fetch_byte(addr.wrapping_add(1))?;
-        Ok(u16::from_le_bytes([b0, b1]))
+        let v = u16::from_le_bytes([b0, b1]);
+        #[cfg(feature = "trace")]
+        self.maybe_emit_read(addr, 2, u64::from(v));
+        Ok(v)
     }
 
     /// Read a 32-bit little-endian dword.
@@ -309,19 +326,30 @@ impl Mmu {
         let b1 = self.fetch_byte(addr.wrapping_add(1))?;
         let b2 = self.fetch_byte(addr.wrapping_add(2))?;
         let b3 = self.fetch_byte(addr.wrapping_add(3))?;
-        Ok(u32::from_le_bytes([b0, b1, b2, b3]))
+        let v = u32::from_le_bytes([b0, b1, b2, b3]);
+        #[cfg(feature = "trace")]
+        self.maybe_emit_read(addr, 4, u64::from(v));
+        Ok(v)
     }
 
     /// Read a 64-bit little-endian qword.
     pub fn load64(&self, addr: u32) -> Result<u64, Trap> {
-        let lo = u64::from(self.load32(addr)?);
-        let hi = u64::from(self.load32(addr.wrapping_add(4))?);
-        Ok((hi << 32) | lo)
+        // Skip recursive trace emission from the inner load32
+        // calls to avoid double events; emit a single 8-byte one.
+        let lo = u64::from(self.load32_untraced(addr)?);
+        let hi = u64::from(self.load32_untraced(addr.wrapping_add(4))?);
+        let v = (hi << 32) | lo;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_read(addr, 8, v);
+        Ok(v)
     }
 
     /// Store a byte. Requires `W` permission.
     pub fn store8(&mut self, addr: u32, value: u8) -> Result<(), Trap> {
-        self.put_byte(addr, value)
+        self.put_byte(addr, value)?;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_write(addr, 1, u64::from(value));
+        Ok(())
     }
 
     /// Store a 16-bit little-endian word.
@@ -329,6 +357,8 @@ impl Mmu {
         let bytes = value.to_le_bytes();
         self.put_byte(addr, bytes[0])?;
         self.put_byte(addr.wrapping_add(1), bytes[1])?;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_write(addr, 2, u64::from(value));
         Ok(())
     }
 
@@ -339,14 +369,70 @@ impl Mmu {
         self.put_byte(addr.wrapping_add(1), bytes[1])?;
         self.put_byte(addr.wrapping_add(2), bytes[2])?;
         self.put_byte(addr.wrapping_add(3), bytes[3])?;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_write(addr, 4, u64::from(value));
         Ok(())
     }
 
     /// Store a 64-bit little-endian qword.
     pub fn store64(&mut self, addr: u32, value: u64) -> Result<(), Trap> {
-        self.store32(addr, value as u32)?;
-        self.store32(addr.wrapping_add(4), (value >> 32) as u32)?;
+        // Bypass per-half trace events to keep one event per call.
+        self.store32_untraced(addr, value as u32)?;
+        self.store32_untraced(addr.wrapping_add(4), (value >> 32) as u32)?;
+        #[cfg(feature = "trace")]
+        self.maybe_emit_write(addr, 8, value);
         Ok(())
+    }
+
+    #[cfg(feature = "trace")]
+    fn load32_untraced(&self, addr: u32) -> Result<u32, Trap> {
+        let b0 = self.fetch_byte(addr)?;
+        let b1 = self.fetch_byte(addr.wrapping_add(1))?;
+        let b2 = self.fetch_byte(addr.wrapping_add(2))?;
+        let b3 = self.fetch_byte(addr.wrapping_add(3))?;
+        Ok(u32::from_le_bytes([b0, b1, b2, b3]))
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn load32_untraced(&self, addr: u32) -> Result<u32, Trap> {
+        self.load32(addr)
+    }
+
+    #[cfg(feature = "trace")]
+    fn store32_untraced(&mut self, addr: u32, value: u32) -> Result<(), Trap> {
+        let bytes = value.to_le_bytes();
+        self.put_byte(addr, bytes[0])?;
+        self.put_byte(addr.wrapping_add(1), bytes[1])?;
+        self.put_byte(addr.wrapping_add(2), bytes[2])?;
+        self.put_byte(addr.wrapping_add(3), bytes[3])?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn store32_untraced(&mut self, addr: u32, value: u32) -> Result<(), Trap> {
+        self.store32(addr, value)
+    }
+
+    /// Trace-feature-gated probe: emit a `mem_read` event if any
+    /// active watchpoint covers `[addr, addr+size)` in read mode.
+    /// Takes `&self` via the [`crate::trace::TraceState`]'s
+    /// `RefCell<sink>` interior mutability.
+    #[cfg(feature = "trace")]
+    fn maybe_emit_read(&self, addr: u32, size: u32, value: u64) {
+        if self.trace.matched_for_read(addr, size).is_some() {
+            self.trace
+                .ev_mem_read(addr, size, value, self.trace.last_eip);
+        }
+    }
+
+    /// Trace-feature-gated probe: emit a `mem_write` event if any
+    /// active watchpoint covers `[addr, addr+size)` in write mode.
+    #[cfg(feature = "trace")]
+    fn maybe_emit_write(&self, addr: u32, size: u32, value: u64) {
+        if self.trace.matched_for_write(addr, size).is_some() {
+            self.trace
+                .ev_mem_write(addr, size, value, self.trace.last_eip);
+        }
     }
 
     /// Internal: store a byte without consulting permission bits.

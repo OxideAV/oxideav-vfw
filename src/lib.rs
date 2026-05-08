@@ -163,6 +163,23 @@
 //!   instead of the generic `UndefinedOpcode`. Round 8 reads
 //!   the trap log to land MMX semantics opcode-by-opcode.
 //!
+//! **Round 18 — `trace` Cargo feature.** Resolves the planned
+//! "trace mode" milestone documented in
+//! `docs/winmf/winmf-emulator.md` §"Trace mode". A new feature
+//! gate `trace` (off by default) adds `#[cfg]`'d probe sites at
+//! the four natural choke points: every `dispatch_stub` call
+//! (`kind=win32_call`), every guest memory access overlapping
+//! a registered watchpoint (`kind=mem_write` / `kind=mem_read`),
+//! every trap that bubbles out of the run loop (`kind=trap`),
+//! and — under the `trace-exec` sub-feature plus
+//! [`Sandbox::set_exec_trace(true)`] — every executed
+//! instruction (`kind=exec`). Output is JSONL on a sink
+//! configured via `OXIDEAV_VFW_TRACE_FILE=<path|2>` or
+//! [`Sandbox::set_trace_sink`]. With the feature off, every
+//! probe compiles away; release builds are bit-identical to
+//! the round-17 baseline. Companion CLI is
+//! `oxideav-tracevfw`.
+//!
 //! Modern codecs (H.264 / HEVC / AV1 / Opus / AAC / …) are decoded
 //! natively elsewhere in the workspace; this crate exists for
 //! **rare/legacy** codecs the project would otherwise permanently
@@ -177,9 +194,13 @@
 pub mod emulator;
 pub mod pe;
 pub mod runtime;
+#[cfg(feature = "trace")]
+pub mod trace;
 pub mod win32;
 
 pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
+#[cfg(feature = "trace")]
+pub use trace::{TraceState, WatchMode, Watchpoint};
 pub use win32::vfw32::Bih;
 
 /// Sibling registration entry point. Currently a no-op — the

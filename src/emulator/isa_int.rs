@@ -291,6 +291,50 @@ impl Cpu {
 
         let entry_eip = self.regs.eip;
 
+        // Trace-feature-gated: shadow the entry EIP into the
+        // MMU's trace state so memory probes that fire during
+        // this instruction's execution carry the correct
+        // call-site address. Cheap (a single u32 store).
+        #[cfg(feature = "trace")]
+        {
+            mmu.trace.set_eip(entry_eip);
+        }
+        // Trace-exec sub-feature: emit a per-instruction event
+        // when the runtime has flipped exec-trace on.
+        #[cfg(feature = "trace-exec")]
+        if mmu.trace.exec_on && mmu.trace.has_sink() {
+            // Snapshot the next 1..=8 instruction bytes as best
+            // effort — we don't decode here, the executor will
+            // decode below. Empty bytes if even the first byte
+            // is unfetchable (the executor will trap that
+            // separately).
+            let mut bytes = Vec::with_capacity(8);
+            for i in 0..8u32 {
+                match mmu.fetch_x8(entry_eip.wrapping_add(i)) {
+                    Ok(b) => bytes.push(b),
+                    Err(_) => break,
+                }
+            }
+            let mnemonic = match bytes.first() {
+                Some(b) => exec_mnemonic_hint(*b),
+                None => "<unfetchable>",
+            };
+            // Snapshot the integer register file at instruction
+            // entry. This matches the design-doc example which
+            // includes the CPU state at the point of execution.
+            let regs = [
+                ("eax", self.regs.get32(Reg32::Eax)),
+                ("ecx", self.regs.get32(Reg32::Ecx)),
+                ("edx", self.regs.get32(Reg32::Edx)),
+                ("ebx", self.regs.get32(Reg32::Ebx)),
+                ("esp", self.regs.esp()),
+                ("ebp", self.regs.get32(Reg32::Ebp)),
+                ("esi", self.regs.get32(Reg32::Esi)),
+                ("edi", self.regs.get32(Reg32::Edi)),
+            ];
+            mmu.trace.ev_exec(entry_eip, &bytes, mnemonic, &regs);
+        }
+
         // Push entry_eip into the trace ring if enabled.
         if self.trace_ring_cap > 0 {
             if self.trace_ring.len() == self.trace_ring_cap {
@@ -3197,6 +3241,68 @@ pub(crate) fn mmx_mnemonic(op2: u8) -> &'static str {
 // replaced by the real MMX semantics in `super::isa_mmx`. The
 // per-opcode arms there know exactly what ModR/M / imm8 they
 // consume; no umbrella table is needed.
+
+/// Coarse first-byte mnemonic hint for the `trace-exec` event.
+/// Not a full disassembler; just enough to make the JSONL
+/// readable when `jq`-grepping for "what kind of instruction
+/// fired?". Intel SDM Vol. 2A Table A-2 is the reference.
+#[cfg(feature = "trace-exec")]
+pub(crate) fn exec_mnemonic_hint(b: u8) -> &'static str {
+    match b {
+        0x00..=0x05 => "ADD",
+        0x08..=0x0D => "OR",
+        0x0F => "0F-prefix",
+        0x10..=0x15 => "ADC",
+        0x18..=0x1D => "SBB",
+        0x20..=0x25 => "AND",
+        0x28..=0x2D => "SUB",
+        0x30..=0x35 => "XOR",
+        0x38..=0x3D => "CMP",
+        0x40..=0x47 => "INC r32",
+        0x48..=0x4F => "DEC r32",
+        0x50..=0x57 => "PUSH r32",
+        0x58..=0x5F => "POP r32",
+        0x68 | 0x6A => "PUSH imm",
+        0x69 | 0x6B => "IMUL imm",
+        0x70..=0x7F => "Jcc imm8",
+        0x80..=0x83 => "ALU r/m, imm",
+        0x84..=0x85 => "TEST r/m, r",
+        0x86..=0x87 => "XCHG r/m, r",
+        0x88..=0x8B => "MOV r/m, r",
+        0x8D => "LEA",
+        0x8F => "POP r/m",
+        0x90 => "NOP",
+        0x9C => "PUSHF",
+        0x9D => "POPF",
+        0xA0..=0xA3 => "MOV moffs",
+        0xA4..=0xA7 => "MOVS/CMPS",
+        0xA8..=0xA9 => "TEST imm",
+        0xAA..=0xAF => "STOS/LODS/SCAS",
+        0xB0..=0xB7 => "MOV r8, imm8",
+        0xB8..=0xBF => "MOV r32, imm32",
+        0xC0..=0xC1 => "shift r/m, imm8",
+        0xC2..=0xC3 => "RET",
+        0xC6..=0xC7 => "MOV r/m, imm",
+        0xC8 => "ENTER",
+        0xC9 => "LEAVE",
+        0xCC => "INT3",
+        0xD0..=0xD3 => "shift r/m, 1/cl",
+        0xD9 => "x87 FPU",
+        0xE8 => "CALL rel32",
+        0xE9 => "JMP rel32",
+        0xEB => "JMP rel8",
+        0xF4 => "HLT",
+        0xF5 => "CMC",
+        0xF6..=0xF7 => "group3 r/m",
+        0xFA => "CLI",
+        0xFB => "STI",
+        0xFC => "CLD",
+        0xFD => "STD",
+        0xFE => "group4 r/m8",
+        0xFF => "group5 r/m32",
+        _ => "?",
+    }
+}
 
 #[cfg(test)]
 mod tests {

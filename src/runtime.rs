@@ -285,6 +285,42 @@ impl Sandbox {
         )
     }
 
+    // ---- Trace-mode programmatic API (gated on the `trace`
+    // ---- Cargo feature). Documented in
+    // ---- `docs/winmf/winmf-emulator.md` §"Trace mode".
+
+    /// Install a memory watchpoint covering `[addr, addr+size)`.
+    /// Any guest access whose address range intersects the
+    /// watchpoint emits a `kind=mem_write` (or `mem_read`) JSONL
+    /// event to the configured sink. Multiple watchpoints may
+    /// overlap; each fires independently.
+    #[cfg(feature = "trace")]
+    pub fn watch(&mut self, addr: u32, size: u32, mode: crate::trace::WatchMode) {
+        self.mmu.trace.watch(addr, size, mode);
+    }
+
+    /// Remove watchpoints whose `(addr, size)` exactly matches.
+    /// Mode is ignored for the match.
+    #[cfg(feature = "trace")]
+    pub fn unwatch(&mut self, addr: u32, size: u32) {
+        self.mmu.trace.unwatch(addr, size);
+    }
+
+    /// Toggle per-instruction execution trace at runtime. Has no
+    /// effect unless the crate was built with the `trace-exec`
+    /// sub-feature.
+    #[cfg(feature = "trace")]
+    pub fn set_exec_trace(&mut self, on: bool) {
+        self.mmu.trace.exec_on = on;
+    }
+
+    /// Override the trace JSONL sink at runtime. Defaults to
+    /// honouring `OXIDEAV_VFW_TRACE_FILE`.
+    #[cfg(feature = "trace")]
+    pub fn set_trace_sink(&mut self, sink: Box<dyn std::io::Write + Send>) {
+        self.mmu.trace.set_sink(sink);
+    }
+
     /// `ICDecompress` — decode one frame.
     #[allow(clippy::too_many_arguments)]
     pub fn ic_decompress(
