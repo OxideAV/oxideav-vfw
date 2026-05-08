@@ -9,18 +9,23 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 15 — IV41 (Indeo 4) decode through `IR41_32.AX::DriverProc`
-landed.** Three real-codec end-to-end pipelines are now green:
+**Round 16 — multi-frame IV41 + OpenDML AVI 2.0 walker landed.**
+Three real-codec end-to-end pipelines are now green, two of them
+across 8 sequential frames:
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 | `ICERR_OK` (8/8 frames) |
-| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 | 15 | `ICERR_OK` |
+| Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 | 15 / 16 | `ICERR_OK` (8/8 frames) |
 
 Each fixture's first keyframe decodes to RGB24 with > 25 % non-zero
-pixels; round 13 also runs P-frames 1..7 of `cat_attack.avi`
-through a single shared `hic`. The full design contract lives in
+pixels; round 13 ran 8 sequential `cat_attack.avi` IV50 frames
+through a single shared `hic`, and round 16 ratchets the same
+discipline onto the IV41 path. The test-side AVI extractor now
+recognises chained `RIFF AVIX` segments (OpenDML / AVI 2.0) so
+fixtures with `indx` super-indexes + `ix##` standard-index chunks
+walk cleanly. The full design contract lives in
 [`OxideAV/docs/winmf/winmf-emulator.md`](https://github.com/OxideAV/docs/blob/master/winmf/winmf-emulator.md).
 
 This round delivers:

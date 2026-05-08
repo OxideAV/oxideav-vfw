@@ -8,6 +8,75 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 16 Part A: **multi-frame IV41 sequence through
+  `IR41_32.AX`.** The new `tests/round16_iv41_multiframe.rs`
+  mirrors round 13's 8-frame ratchet against
+  `cat_attack.avi` / IR50, applied here to the IV41 path.
+  `crashtest.avi` (240×180 yuv410p, ~966 frames) is driven
+  for the first 8 sequential samples through one shared
+  `hic`: keyframe (sample 0) plus 7 P-frames (samples 1..7,
+  each carrying `ICDECOMPRESS_NOTKEYFRAME` per the round-13
+  convention). All 8 samples return `ICERR_OK` with > 25 %
+  non-zero RGB24 output, confirming the codec's
+  reference-frame state is correctly maintained across
+  emulator-driven `ICDecompress` calls. Per-frame
+  `mmx_dispatch_count` and `cpuid_dispatch_count` come back
+  as 0/0 — the IR41 binary is statically integer-only on
+  this decode path, mirroring round 14's IR50 finding. The
+  round-13 MMX module (1007 LOC, ~50 opcodes) remains
+  unexercised by real codec input.
+- Round 16 Part B: **OpenDML AVI 2.0 walker.** Extended
+  `tests/common/avi_extractor.rs` (~120 LOC delta) to
+  recognise chained `RIFF AVIX` segments and surface their
+  `LIST movi` sample chunks through the existing
+  `extract_video_sample(n)` API. Implementation:
+  `walk_riff_segments` enumerates every top-level RIFF in
+  file order (rejecting non-`AVI ` first segments per the
+  spec but accepting any `AVIX`/`AVI ` follower), the
+  walker collects every `LIST movi` body across every
+  segment, then iterates them in order counting stream-0
+  video chunks. The OpenDML `indx` super-index in `strl`
+  and per-segment `ix##` standard indexes in `movi` are
+  transparently skipped by the existing stream-index
+  predicate (their leading bytes are non-numeric). New
+  exported helper `riff_segment_inventory` lets tests
+  assert the number + form-types of RIFF segments without
+  exposing private state. Validated against (a) a synthetic
+  2-segment AVI (`AVI ` + chained `AVIX` carrying 3 samples
+  total, including a stray `ix00` in segment 1's movi), and
+  (b) the real `sv2-d.avi` IV50 fixture (single-RIFF AVI
+  2.0 with `indx` in `strl` + `ix00`/`ix01` in `movi`):
+  sample 0 = 7872-byte IV50 chunk, sample 1 = 2916 bytes.
+- Round 16 Part C — **MMX-using IV50 build probe (SPECGAP).**
+  Probed `samples.oxideav.org/codecs/windows/` for alternate
+  Indeo 5 redistributables (`indeo5xa`, `indeo5ds`,
+  `INDEO5XA`, `INDEO5DS`, `IV5XA`, `IV5DS`, `Indeo5`,
+  `indeo5`, `IV5` — both as zip and as directory with
+  `IR50_32.DLL`). All returned 404 from the corpus mirror.
+  Reading `sv2-d.txt` confirms `indeo5xa` + `indeo5ds` are
+  unix/xanim codec names, not Windows DLL builds; the
+  IV5PLAY redistributable is the only published Windows
+  Indeo 5 binary in our corpus and remains statically
+  integer-only (round 14 finding). The round-13 MMX module
+  stays a correct-semantics scaffold awaiting a future
+  Cinepak / MS Video 1 / IV41-MMX-build binary that hits
+  the `0F D0..FF` opcode block.
+
+### Changed
+
+- `tests/common/avi_extractor.rs::ChunkWalker` is now reached
+  via `walk_riff_segments` rather than directly from
+  `extract_video_sample`, refactor needed to support
+  AVI 2.0 chained RIFF segments. The clamping behaviour
+  (oversize `cksize` declarations clamp to bytes-available;
+  `clamped_size < 4` falls through to an empty body slice
+  rather than panicking on a slice index inversion) is
+  preserved end-to-end. The round-14 `indeo5.avi` fixture
+  (which declares a RIFF size 4 bytes shorter than the
+  underlying file and pads to a 2 KiB boundary with zeros)
+  now exits cleanly: the post-RIFF zero-bytes are detected
+  as padding and stop the segment walk.
+
 - Round 15: **IV41 (Indeo 4) decode through `IR41_32.AX`'s
   `DriverProc` export.** Round 14 Part B's surface probe
   established that `IR41_32.AX` is a dual-shape binary
