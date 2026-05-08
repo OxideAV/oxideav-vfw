@@ -9,6 +9,21 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 26 — `user32!CreateWindowExA` cascade stubs land + IPin
+ReceiveConnection probed.** Synthetic-HWND registry
+(`HWND_BASE = 0xCAFE_0000` + monotonic counter) plus
+`CreateWindowExA` / `UpdateWindow` / `IsWindow` / `GetMessageA` /
+`DispatchMessageA` / `TranslateMessage` / `PeekMessageA` /
+`PostQuitMessage` stubs; `DestroyWindow` / `MoveWindow` patched
+to return TRUE per MSDN. Stretch: `IPin::ReceiveConnection` on
+the MPG4DS32 input pin with an MP43 / `VIDEOINFOHEADER` media
+type executes cleanly — returns `E_POINTER` (0x80004003) on a
+NULL `pConnector` and `0x80040208` (VFW_E-class — likely needs
+IFilterGraph hookup) when the pin's own pointer is passed.
+Round 27 wires IFilterGraph + IMemAllocator + IMediaSample stubs
+to drive the connection to `S_OK` and exercise `IPin::Receive`.
+**Total: 408 tests.**
+
 **Round 25 — DirectShow IBaseFilter scaffolding lands. All five
 stages reached on `MPG4DS32.AX`** (`IID_ICLASSFACTORY` returned,
 IBaseFilter spawned, Stop/Pause/Run all `S_OK`, IPin enumerated,

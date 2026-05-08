@@ -93,7 +93,17 @@ pub fn register(registry: &mut Registry) {
     registry.register("user32.dll", "CheckRadioButton", stub_zero4 as StubFn, 4);
     registry.register("user32.dll", "CreateDialogParamA", stub_zero5 as StubFn, 5);
     registry.register("user32.dll", "DefWindowProcA", stub_zero4 as StubFn, 4);
-    registry.register("user32.dll", "DestroyWindow", stub_zero1 as StubFn, 1);
+    // Round 26 — DestroyWindow returns TRUE per MSDN, drops the
+    // synthetic HWND from `host.hwnd_registry`. (Round-8 had it
+    // returning 0 ≡ FALSE, which is the documented "function
+    // failed" answer; benign for codecs that call it once during
+    // teardown but wrong for real headless apps.)
+    registry.register(
+        "user32.dll",
+        "DestroyWindow",
+        stub_destroy_window as StubFn,
+        1,
+    );
     registry.register("user32.dll", "EnableWindow", stub_zero2 as StubFn, 2);
     registry.register(
         "user32.dll",
@@ -116,7 +126,11 @@ pub fn register(registry: &mut Registry) {
     registry.register("user32.dll", "IsRectEmpty", stub_is_rect_empty as StubFn, 1);
     registry.register("user32.dll", "LoadStringW", stub_zero4 as StubFn, 4);
     registry.register("user32.dll", "MapWindowPoints", stub_zero4 as StubFn, 4);
-    registry.register("user32.dll", "MoveWindow", stub_zero6 as StubFn, 6);
+    // Round 26 — MoveWindow returns TRUE (per MSDN: TRUE on
+    // success). The codec only calls this against a synthetic
+    // HWND we previously handed out via CreateWindowExA, and the
+    // contract is "always succeeds" for headless windows.
+    registry.register("user32.dll", "MoveWindow", stub_one6 as StubFn, 6);
     registry.register("user32.dll", "OffsetRect", stub_offset_rect as StubFn, 3);
     registry.register("user32.dll", "SendMessageA", stub_zero4 as StubFn, 4);
     registry.register("user32.dll", "SetDlgItemInt", stub_zero4 as StubFn, 4);
@@ -124,6 +138,12 @@ pub fn register(registry: &mut Registry) {
     registry.register("user32.dll", "SetWindowLongA", stub_zero3 as StubFn, 3);
     registry.register("user32.dll", "SetWindowPos", stub_zero7 as StubFn, 7);
     registry.register("user32.dll", "SetWindowTextA", stub_zero2 as StubFn, 2);
+    // Round 26 — ShowWindow's documented return value is the
+    // window's PRIOR visibility (BOOL: TRUE if it was visible,
+    // FALSE if hidden). For a freshly-minted synthetic HWND the
+    // prior state is "hidden", so 0 is the canonical reply. We
+    // keep the existing `stub_zero2` mapping but rename the
+    // intent in code-comments (round 26 audit).
     registry.register("user32.dll", "ShowWindow", stub_zero2 as StubFn, 2);
     registry.register("user32.dll", "WinHelpA", stub_zero4 as StubFn, 4);
     // wvsprintfA: like wsprintfA but takes a `va_list*` instead
@@ -172,6 +192,65 @@ pub fn register(registry: &mut Registry) {
         stub_unregister_class_a as StubFn,
         2,
     );
+
+    // ---- Round-26 additions: CreateWindowExA cascade --------------
+    //
+    // DirectShow filters and several legacy MS codecs expect a
+    // hidden private window during init. We hand out synthetic
+    // `HWND_BASE + n` values from `host.hwnd_registry`; each
+    // companion stub (`Update`, `Destroy`, `IsWindow`, …) is
+    // fail-soft TRUE so the codec falls through to its headless
+    // path. None of these HWNDs back a real window — the codec
+    // only inspects them to confirm "non-NULL" and to call
+    // friend-API methods that we likewise stub.
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createwindowexa
+    // HWND CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName,
+    //   LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int W,
+    //   int H, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance,
+    //   LPVOID lpParam)  — 12 dwords.
+    registry.register(
+        "user32.dll",
+        "CreateWindowExA",
+        stub_create_window_ex_a as StubFn,
+        12,
+    );
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-updatewindow
+    // BOOL UpdateWindow(HWND hWnd) — 1 arg.  Returns TRUE.
+    registry.register("user32.dll", "UpdateWindow", stub_one1 as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow
+    // BOOL IsWindow(HWND hWnd) — 1 arg.  Looks the HWND up in
+    // `host.hwnd_registry`: TRUE iff we minted it.
+    registry.register("user32.dll", "IsWindow", stub_is_window as StubFn, 1);
+    // ---- Message-pump cascade ---------------------------------
+    //
+    // Codecs that own a window typically also drive a message
+    // loop: GetMessageA / DispatchMessageA / TranslateMessage,
+    // optionally PeekMessageA. Returning "no message available"
+    // across the board ends the loop without dispatching
+    // anything, which is the desired behaviour for headless
+    // decode.
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmessagea
+    // BOOL GetMessageA(LPMSG, HWND, UINT, UINT) — 4 args.
+    // Returns 0 (WM_QUIT semantics: caller exits its message
+    // loop). We zero-fill the MSG struct so the caller's later
+    // reads of msg.message / msg.wParam / msg.lParam see 0.
+    registry.register("user32.dll", "GetMessageA", stub_get_message_a as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dispatchmessagea
+    // LRESULT DispatchMessageA(const MSG *lpMsg) — 1 arg.
+    registry.register("user32.dll", "DispatchMessageA", stub_zero1 as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-translatemessage
+    // BOOL TranslateMessage(const MSG *lpMsg) — 1 arg.
+    registry.register("user32.dll", "TranslateMessage", stub_zero1 as StubFn, 1);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-peekmessagea
+    // BOOL PeekMessageA(LPMSG, HWND, UINT, UINT, UINT) — 5 args.
+    // Returns 0 (no message present) without modifying *lpMsg.
+    registry.register("user32.dll", "PeekMessageA", stub_zero5 as StubFn, 5);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postquitmessage
+    // void PostQuitMessage(int nExitCode) — 1 arg, no return.
+    // No-op stub (eax = 0) — the message loop is already gone.
+    registry.register("user32.dll", "PostQuitMessage", stub_zero1 as StubFn, 1);
 }
 
 /// `ATOM RegisterClassExA(const WNDCLASSEXA *lpwcx)` — return a
@@ -258,7 +337,7 @@ fn stub_zero5(
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
-fn stub_zero6(
+fn stub_zero7(
     _: &mut Cpu,
     _: &mut Mmu,
     _: &mut HostState,
@@ -266,12 +345,91 @@ fn stub_zero6(
 ) -> Result<u32, Win32Error> {
     Ok(0)
 }
-fn stub_zero7(
-    _: &mut Cpu,
-    _: &mut Mmu,
-    _: &mut HostState,
-    _: &Registry,
+
+// ---- "Always TRUE" fail-soft stubs -----------------------------------
+//
+// Round 26 — used by `UpdateWindow` / `MoveWindow` etc., which
+// must report success (TRUE = 1) for the codec to proceed past
+// the call.
+
+fn stub_one1(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+fn stub_one6(_: &mut Cpu, _: &mut Mmu, _: &mut HostState, _: &Registry) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+// ---- Round-26 CreateWindowExA cascade --------------------------------
+
+/// Base address of the synthetic-HWND range. `0xCAFE_0000` is
+/// well above any plausible IAT thunk or PE image base + section
+/// VA, so an HWND value in this range is unmistakably ours and
+/// not a stale guest pointer.
+pub const HWND_BASE: u32 = 0xCAFE_0000;
+
+/// `HWND CreateWindowExA(...)`. Mints the next synthetic HWND
+/// from `host.hwnd_registry` and returns it.
+fn stub_create_window_ex_a(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let hwnd = HWND_BASE.wrapping_add(state.next_hwnd_index);
+    state.next_hwnd_index = state.next_hwnd_index.wrapping_add(1);
+    state.hwnd_registry.insert(hwnd);
+    Ok(hwnd)
+}
+
+/// `BOOL DestroyWindow(HWND)`. Drops the HWND from
+/// `host.hwnd_registry` and returns TRUE per MSDN.
+fn stub_destroy_window(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let hwnd = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("DestroyWindow", t))?;
+    state.hwnd_registry.remove(&hwnd);
+    Ok(1)
+}
+
+/// `BOOL IsWindow(HWND)`. TRUE iff `host.hwnd_registry` has the
+/// HWND. Returns FALSE for a NULL HWND or any HWND we did not
+/// mint (mirroring real Windows on a stale handle).
+fn stub_is_window(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("IsWindow", t))?;
+    Ok(if hwnd != 0 && state.hwnd_registry.contains(&hwnd) {
+        1
+    } else {
+        0
+    })
+}
+
+/// `BOOL GetMessageA(LPMSG lpMsg, HWND, UINT, UINT)`. Returns 0
+/// (WM_QUIT semantics: the message loop terminates). Zero-fills
+/// the 28-byte MSG struct (HWND/message/wParam/lParam/time/pt.x/pt.y).
+fn stub_get_message_a(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let lp =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("GetMessageA", t))?;
+    if lp != 0 {
+        for i in 0..28u32 {
+            mmu.store8(lp + i, 0)
+                .map_err(|t| crate::win32::trap_to_win32_local("GetMessageA", t))?;
+        }
+    }
     Ok(0)
 }
 

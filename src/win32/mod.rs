@@ -183,6 +183,16 @@ pub struct HostState {
     /// `gdi32!CreateCompatibleDC` / `user32!GetDC`. `None` until
     /// the first DC is allocated, then a populated set.
     pub gdi_hdcs: Option<std::collections::BTreeSet<u32>>,
+    /// Round 26 — synthetic `HWND` registry. `CreateWindowExA`
+    /// hands out `HWND_BASE + n` values; `IsWindow` consults this
+    /// set; `DestroyWindow` removes from it. None of these HWNDs
+    /// back a real window — DirectShow / VfW codecs only need the
+    /// `HWND` value to feel non-NULL so they fall through to
+    /// their headless code path.
+    pub hwnd_registry: std::collections::BTreeSet<u32>,
+    /// Counter for the next synthetic HWND allocation. Starts at
+    /// 0; first HWND handed out is `HWND_BASE + 0`.
+    pub next_hwnd_index: u32,
     /// When `true`, [`dispatch_stub`] appends one line per Win32
     /// call to [`stub_trace`]. Off by default; round-8 tests flip
     /// it on while triaging which stub returns a bad value.
@@ -249,6 +259,8 @@ impl HostState {
             command_line_ptr: 0,
             environment_strings_ptr: 0,
             gdi_hdcs: None,
+            hwnd_registry: std::collections::BTreeSet::new(),
+            next_hwnd_index: 0,
             trace_stubs: false,
             stub_trace: Vec::new(),
             loaded_drivers: std::collections::BTreeSet::new(),

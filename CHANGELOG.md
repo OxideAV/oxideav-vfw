@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 26 — **`user32!CreateWindowExA` cascade stubs +
+  IPin::ReceiveConnection probe.** Two sub-goals:
+  - **A. user32 cascade stubs.** Many DirectShow filters and
+    legacy MS codecs call `user32!CreateWindowExA` during init
+    expecting a non-NULL `HWND`. Round 26 hands out synthetic
+    `HWND_BASE + n` values (`HWND_BASE = 0xCAFE_0000`) from a
+    new `host.hwnd_registry: BTreeSet<u32>` plus
+    `host.next_hwnd_index: u32` counter; companion stubs are
+    fail-soft so the codec falls through to its headless path.
+    Stubs added: `CreateWindowExA` (12 args → synthetic HWND),
+    `UpdateWindow` (1 → TRUE), `IsWindow` (1 → TRUE iff in
+    registry), `GetMessageA` (4 → 0 / WM_QUIT, zero-fills MSG),
+    `DispatchMessageA` (1 → 0), `TranslateMessage` (1 → 0),
+    `PeekMessageA` (5 → 0), `PostQuitMessage` (1 → 0). Patched:
+    `DestroyWindow` (1 → TRUE, drops from registry — was 0),
+    `MoveWindow` (6 → TRUE — was 0). Neither MPG4DS32 nor
+    WMVDS32 imports `CreateWindowExA` directly (only msadds32
+    does, and that's deliberately not driven through DLL_PROCESS_ATTACH);
+    the cascade is staged here so future rounds loading
+    wmvds32 / wmv8ds32 / msscds32 through the COM ABI find a
+    complete user32 surface ready.
+  - **B. IPin::ReceiveConnection probe.** Round-25 reached
+    `IBaseFilter::Run = S_OK` and walked
+    `IBaseFilter::EnumPins → IEnumPins::Next` to retrieve an
+    input pin at `0x6000025C`. Round 26 stages an
+    `AM_MEDIA_TYPE` (72 bytes) describing
+    `MEDIATYPE_Video / MEDIASUBTYPE_MP43 / FORMAT_VideoInfo`
+    with a `VIDEOINFOHEADER` (88 bytes) carrying a
+    `BITMAPINFOHEADER` for 320x240 MP43, then drives
+    `IPin::ReceiveConnection(pConnector, pmt)` (slot 4) on the
+    input pin. With `pConnector = NULL` the codec returns
+    `E_POINTER` (0x80004003); with `pConnector = pin` it
+    returns `0x80040208` (VFW_E-class — likely needs the filter
+    state-machine / IFilterGraph hookup). Logged for round 27;
+    not asserted as success. The input pin connection negotiation
+    is the round-27 goal.
+  - **C. Test surface.**
+    `tests/round26_user32_cascade_and_pin_receive.rs` — 5 new
+    tests: cascade-registration check, synthetic-HWND lifecycle
+    (CreateWindowExA → IsWindow → DestroyWindow → IsWindow),
+    HWND counter increment, message-pump zero-fills MSG +
+    returns 0, and the IPin::ReceiveConnection probe.
+  - 13 new tests overall (8 carry over from
+    `tests/common/avi_extractor` because the test crate
+    re-imports the helper module). Total: 408 passing tests.
 - Round 25 — **DirectShow IBaseFilter scaffolding (Stages 1-5
   all landed against MPG4DS32.AX).** Round 24 closed with the
   verdict that `WMVDS32.AX` and `MPG4DS32.AX` lack a
