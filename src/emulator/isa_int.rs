@@ -108,6 +108,14 @@ pub struct Cpu {
     /// happening to take an integer-only path. Incremented in
     /// [`super::isa_mmx::dispatch`].
     pub mmx_dispatch_count: u64,
+    /// Count of `CPUID` (`0F A2`) instructions executed. Round-14
+    /// sentinel — when a codec's MMX path stays unreachable
+    /// despite our reporting `CPUID.MMX = 1`, this counter lets
+    /// the test confirm whether the codec is even querying CPUID
+    /// (and therefore whether the gating is via CPUID at all,
+    /// versus a static build-time choice or a different feature
+    /// bit like SSE). Incremented in `cpuid()`.
+    pub cpuid_dispatch_count: u64,
     /// Ring buffer of recently-executed instruction starts (eip
     /// before opcode fetch). Capacity 64. Used by trace mode
     /// (round 9) to surface a "last N opcodes" log when a trap
@@ -156,6 +164,7 @@ impl Cpu {
             fpu_cw: 0x037F,
             mmx: [0u64; 8],
             mmx_dispatch_count: 0,
+            cpuid_dispatch_count: 0,
             trace_ring: Vec::new(),
             trace_ring_cap: 0,
         }
@@ -1381,6 +1390,7 @@ impl Cpu {
     /// doc §"Instruction set" Phase 1: vendor "GenuineIntel", no
     /// SSE, no AMD extensions.
     fn cpuid(&mut self) {
+        self.cpuid_dispatch_count = self.cpuid_dispatch_count.wrapping_add(1);
         let leaf = self.regs.get32(Reg32::Eax);
         match leaf {
             0 => {

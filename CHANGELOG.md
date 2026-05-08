@@ -8,6 +8,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 14 Part A: **multi-fixture IV50 decode + structural MMX
+  finding.** New `tests/round14_iv50_force_mmx.rs` (~370 LOC)
+  drives three additional IV50 fixtures from the FFmpeg samples
+  corpus through the round-13 sequential pipeline:
+  `indeo5.avi` (320×240), `Educ_Movie_DeadlyForce.avi` (240×180),
+  and `miss_congeniality_cryptedindeo5_sbcaudio.avi` (640×352).
+  All three decode 8/8 frames with `ICERR_OK` and full non-zero
+  RGB24 output, confirming the round-13 multi-frame pipeline is
+  portable across encoders + content + 4× the macroblock count.
+  Critically, the round-14 trace records **0 MMX dispatches and
+  0 CPUID dispatches** across every fixture — corroborated by a
+  direct byte scan of `IR50_32.DLL` (zero `0F A2` CPUID
+  occurrences, zero `0F D0..FF` MMX-arithmetic occurrences in
+  the entire 184 KB binary). The IR50_32.DLL shipped in IV5PLAY
+  is statically integer-only; the round-13 MMX module cannot be
+  validated against this binary, and round 15+ needs either a
+  different IV50 build (`indeo5xa` / `indeo5ds` per the corpus's
+  `sv2-d.txt`) or a different MMX-using codec to exercise the
+  MMX semantics.
+- Round 14 Part B: **`IR41_32.AX` surface probe.** New
+  `tests/round14_iv41_surface_probe.rs` (~140 LOC) parses the
+  Indeo 4 redistributable's PE32 headers + export + import
+  tables (the file is 848 KB / 7 sections / image-base
+  `0x1c40_0000`) without attempting to load or execute it.
+  Records the file's COM-server entry surface
+  (`DllGetClassObject`, `DllCanUnloadNow`, `DllRegisterServer`,
+  `DllUnregisterServer`) AND its VfW driver entry
+  (`DriverProc` — IR41_32.AX is a *dual-shape* binary that ships
+  both the DirectShow filter ABI and the legacy VfW driver ABI).
+  This is a major round-15 unblock: we can drive IV41 decode
+  through the existing round-13 IC* pipeline, with no DirectShow
+  scaffolding required. The probe enumerates 146 imports across
+  6 system DLLs (advapi32: 11 / gdi32: 6 / kernel32: 85 /
+  ole32: 7 / user32: 35 / winmm: 2) — round-15 dispatch budget
+  for the Win32 stub coverage diff against round-13's existing
+  registry.
+- `Cpu::cpuid_dispatch_count: u64` — round-14 instrument
+  alongside the round-13 `mmx_dispatch_count`. Lets a test
+  distinguish between "codec queried CPUID and chose the
+  integer path" (count > 0, MMX = 0) vs. "codec was built
+  integer-only and never queried CPUID" (both 0). For
+  `IR50_32.DLL` the answer is the latter.
+
 - Round 13: **MMX instruction set + sequential P-frame decode
   through `IR50_32.DLL`.** Round 12 unblocked the FIRST keyframe
   of `cat_attack.avi`; round 13 extends that to multi-frame
