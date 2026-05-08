@@ -9,6 +9,37 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 23 — MSMPEG4 v3 ffmpeg-oracle keyframe cross-check +
+I+P 2-frame decode.** Round 22 landed the first MP43 keyframe
+decode but only checked "any non-zero output". Round 23
+raises the bar:
+
+* **A — ffmpeg-oracle PSNR cross-check.** A new
+  `tests/round23_mp43_pframe_and_oracle.rs::mp43_keyframe_matches_ffmpeg_oracle_psnr`
+  spawns `ffmpeg -frames:v 1 -pix_fmt bgr24 -f rawvideo -` as
+  a black-box validator and compares mpg4c32's BGR24 output
+  against ffmpeg's. Today's run reports **PSNR 42.90 dB** on
+  the solid-blue 176×144 keyframe — well above the 30 dB
+  pass floor. Drift is YUV→BGR matrix difference (mpg4c32
+  output `ff 02 04`, ffmpeg swscale `ff 01 01`); no
+  structural decode mismatch. Skipped gracefully when ffmpeg
+  is not on `PATH`.
+* **B — sequential I + P decode.** The
+  `i-frame-then-p-frame-176x144` fixture (a `-vtag DIV3`
+  2-frame I+P encode whose elementary bitstream is plain
+  MSMPEG4 v3) decodes through both frames: `ICERR_OK` on
+  both, I-frame writes 67 639 / 76 032 non-zero bytes,
+  P-frame writes 67 698 / 76 032 — mpg4c32 maintains its
+  reference-frame state across calls. The 97-byte P-frame
+  consumes 1.13 M emulator instructions (vs. 13 M for the
+  keyframe).
+* **C — state-field audit.** The round-22 wrapper-handshake
+  plant at `[+0xb4..+0xc8]` survives `ICDecompressBegin`
+  intact; the disasm-flagged copy target at
+  `[+0x15b0..+0x15c4]` stays zero throughout BEGIN +
+  keyframe DECOMPRESS — the relocation path does not fire
+  under the current plant.
+
 **Round 22 — MSMPEG4 v3 ICDecompressBegin + first keyframe
 decode unblock.** Round 21 left ICDecompressBegin returning
 `ICERR_INTERNAL` (`-100`). Static disasm of
@@ -23,24 +54,14 @@ codec inside. `vfw32::ic_decompress_begin` now plants the
 wrapper's contribution directly. Five new x87 D9 reg-form
 sub-forms (FSIN, FCOS, FPREM, FSCALE, and FRNDINT relocated
 to the correct `(7, 4)` slot) unlock the IDCT trig-table
-init the begin path runs after the GUID gate clears. After
-the round-22 fixes:
-
-* **`ICDecompressBegin → ICERR_OK`** (was `-100`)
-* **`ICDecompress(keyframe, BI_RGB 24bpp) → ICERR_OK`**
-  with a 76032-byte populated output buffer (176×144×3
-  for the test fixture).
-
-Bit-perfect cross-checking against an ffmpeg reference is
-deferred — the round-22 milestone is "the codec actually
-executes its keyframe-decode body and writes pixels".
+init the begin path runs after the GUID gate clears.
 
 | Codec | DLL | Test fixture | Round | `ICDecompress` |
 |-------|-----|--------------|-------|----------------|
 | Indeo 3 (IV31) | `IR32_32.DLL` | `cubes.mov` 160×120 | 7 | `ICERR_OK` |
 | Indeo 5 (IV50) | `IR50_32.DLL` | `cat_attack.avi` 320×240 (+3 more in r14) | 12 / 13 / 14 / 20 | `ICERR_OK` (8/8 frames; **MMX kernels active**) |
 | Indeo 4 (IV41) | `IR41_32.AX` | `crashtest.avi` 240×180 + `indeo41.avi` 320×240 | 15 / 16 / 17 / 20 | `ICERR_OK` (8/8 frames each; **MMX kernels active**) |
-| MSMPEG4 v3 (DIV3) | `mpg4c32.dll` (VfW) | wmpcdcs8-2001 reference binary | 22 | `ICERR_OK` (first keyframe; bit-perfect cross-check deferred) |
+| MSMPEG4 v3 (DIV3/MP43) | `mpg4c32.dll` (VfW) | `fourcc-MP43` keyframe + `i-frame-then-p-frame` I+P | 22 / 23 | `ICERR_OK` (I+P 2/2 frames; **PSNR 42.9 dB vs ffmpeg oracle**) |
 | WMV1/2 (WMV1/WMV2) | `wmvds32.ax` | TBD | 21 | PE-load ✓ (`mpg4ds32.ax` + `wmvds32.ax` DS filters); DriverProc unexplored |
 
 Round 20 sub-goal A localised the MMX gate to a registry

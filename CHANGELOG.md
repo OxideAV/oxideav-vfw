@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 23 — **MSMPEG4 v3 ffmpeg-oracle keyframe cross-check +
+  I+P 2-frame decode**. Round 22 decoded the MP43 keyframe and
+  asserted "any non-zero output". Round 23 raises the bar:
+  - **Sub-goal A — bit-exact / PSNR oracle.** New test
+    `tests/round23_mp43_pframe_and_oracle.rs::mp43_keyframe_matches_ffmpeg_oracle_psnr`
+    spawns `ffmpeg -i fourcc-MP43/input.avi -frames:v 1
+    -pix_fmt bgr24 -f rawvideo -` as a black-box validator and
+    compares mpg4c32's BGR24 output against ffmpeg's. Bit-exact
+    when buffers match; otherwise computes PSNR and asserts
+    `>= 30 dB`. Today's run reports **PSNR 42.90 dB** on the
+    solid-blue 176×144 keyframe — a comfortable margin above the
+    floor. The drift is the YUV→BGR conversion-matrix difference
+    between mpg4c32's internal converter (output bytes
+    `ff 02 04`) and ffmpeg swscale (`ff 01 01`) — visually
+    indistinguishable, no structural decoder mismatch. Skipped
+    gracefully when ffmpeg is not on `PATH`.
+  - **Sub-goal B — sequential I + P decode.** New test
+    `tests/round23_mp43_pframe_and_oracle.rs::mp43_i_plus_p_two_frame_decode`
+    drives mpg4c32 through the
+    `i-frame-then-p-frame-176x144/input.avi` fixture (a
+    `-vtag DIV3` 2-frame I+P encode whose elementary bitstream
+    is plain MSMPEG4 v3, accepted by the codec when the host
+    side opens with `fccHandler='MP43'`). Both frames return
+    `ICERR_OK`; the I-frame writes 67 639 / 76 032 non-zero
+    bytes and the P-frame writes 67 698 / 76 032, confirming
+    mpg4c32 maintains its reference-frame state across calls.
+    The P-frame consumes 1.13 M emulator instructions (vs.
+    13 M for the keyframe), driven by the ~100-byte P-frame
+    bitstream in the fixture.
+  - **Sub-goal C — state-field audit.** New test
+    `mp43_state_field_audit` snapshots `[driver_id +
+    0xa0..0xc8]` and `[driver_id + 0x15b0..0x15c4]` before /
+    after `ICDecompressBegin` / `ICDecompress`, confirming the
+    round-22 wrapper-handshake plant lands intact in the field
+    range the BEGIN handler probes. Findings:
+    * `[+0xa4]` — codec writes `01 00 00 00` during BEGIN
+      (frame-state-ready sentinel).
+    * `[+0xb4..+0xc8]` — round-22 wrapper-handshake plant
+      survives BEGIN (sentinel `1u32` at `+0xb4`, GUID
+      `b4c66e30-0180-11d3-bbc6-006008320064` at `+0xb8..+0xc8`).
+    * `[+0x15b0..+0x15c4]` — round-22 disasm flagged this as
+      a copy target at `mpg4c32!DriverProc+0x2b41`. Round-23
+      audit shows it stays zero through both BEGIN and the
+      keyframe DECOMPRESS — the relocation path does NOT fire
+      under the current wrapper plant. No additional planting
+      required.
 - Round 22 — **MSMPEG4 v3 ICDecompressBegin + first keyframe
   decode unblock**. Round 21 closed two DRV_OPEN gates and the
   codec advanced through `ICOpen` / `ICDecompressQuery`, but
