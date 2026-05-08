@@ -13,8 +13,15 @@ keywords = ["multimedia", "vfw", "x86", "emulator", "oxideav"]
 categories = ["multimedia::encoding", "multimedia::video", "emulators"]
 
 [features]
-default = ["registry"]
+default = ["registry", "auto-discovery"]
 registry = ["dep:oxideav-core"]
+# Auto-discovery — at `register(&mut RuntimeContext)` time, walk
+# the discovery path (`OXIDEAV_VFW_CODEC_PATH` or the platform
+# default), probe each `*.dll` / `*.ax` for a VfW or DirectShow
+# entry point, and register one `Codec` per recognised FourCC.
+# Default-on; consumers building with `default-features = false`
+# get the manual `Sandbox` API without the FS scan.
+auto-discovery = ["registry", "dep:log", "dep:serde", "dep:serde_json"]
 # Trace mode — adds reverse-engineering instrumentation surface
 # (Win32 stub calls, memory watchpoints, traps) that emits JSONL
 # events to a sink configured via the `OXIDEAV_VFW_TRACE_FILE`
@@ -31,6 +38,9 @@ trace-exec = ["trace"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+log = { version = "0.4", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 # Used by tests/common/mod.rs to fetch codec DLL fixtures on

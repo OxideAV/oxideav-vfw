@@ -8,6 +8,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 28 — **codec auto-discovery at `register()` time.** New
+  `src/discovery/` module (~700 LOC) walks a configurable
+  discovery path, probes every `*.dll` / `*.ax`, and registers
+  one `oxideav_core::CodecInfo` per recognised FourCC into
+  `RuntimeContext::codecs`. Each registered entry sits at codec
+  priority 200 (after SW codecs at 100 and HW codecs at 10) and
+  uses codec id format `vfw_<lowercase-fourcc>_<dll-stem>` to
+  avoid collisions when multiple DLLs claim the same FourCC.
+  - **Discovery path resolution.** `OXIDEAV_VFW_CODEC_PATH`
+    overrides the platform default
+    (`$XDG_DATA_HOME/oxideav/codecs/` on UNIX,
+    `%LOCALAPPDATA%\oxideav\codecs\` on Windows). Empty
+    components in the override list are skipped silently; a
+    missing directory is not an error (cleanly registers zero
+    codecs).
+  - **Probe scope.** Each candidate DLL is loaded into a fresh
+    `Sandbox`, `DriverProc` is exercised first via
+    `ICOpen('VIDC', candidate)` against a static FourCC sweep
+    (`MP43 / MP42 / MPG4 / DIV3 / IV31 / IV41 / IV50 / CVID /
+    MJPG`); on miss we fall back to `DllGetClassObject` against
+    a small static CLSID list (today: `{82CCD3E0-…}` for
+    `MPG4DS32.AX`). FourCCs decoded via `IPin::EnumMediaTypes`
+    are deferred to round 29 — DirectShow registrations record
+    just the matching CLSID. Anything that doesn't match either
+    path is recorded as `Kind::Unsupported` so we don't re-probe.
+  - **Cache.** `$XDG_CACHE_HOME/oxideav/vfw-discovery.json`
+    (or `$HOME/.cache/oxideav/…` /
+    `%LOCALAPPDATA%\oxideav\Cache\…`), keyed by
+    `(absolute_path, mtime, size_bytes)`. Atomic writes via
+    tempfile + rename; corrupted JSON is treated as a clean
+    miss. Cache invalidates correctly on file mtime / size
+    change.
+  - **Decoder factory.** `DecoderFactory` is a bare `fn`;
+    per-codec context (DLL path / FourCC / CLSID) lives in a
+    process-wide `OnceLock<Mutex<HashMap>>` keyed by codec id.
+    The shared `make_decoder` looks up the matching
+    `DiscoveryRecord` at construction time. Per-frame decode
+    through the generic `Decoder` trait still leans on the
+    existing manual `Sandbox::ic_decompress` API and surfaces
+    `Error::Unsupported` for now; round 29 wires the full
+    receive_frame path. DirectShow codecs surface
+    `Error::Unsupported` with the CLSID in the message so the
+    caller knows which filter to drive manually.
+  - **New cargo feature `auto-discovery`** (default-on) gates
+    the entire FS scan + cache + `log` / `serde` dependency
+    tail. Consumers building with `default-features = false`
+    get the bare manual `Sandbox` API without the new
+    transitive deps.
+  - **New tests:** 5 integration tests in
+    `tests/round28_auto_discovery.rs` (nonexistent default
+    path is clean,
+    `OXIDEAV_VFW_CODEC_PATH=/dev/null:/tmp/nonexistent` is
+    clean, cache round-trip via `discover()`, cache
+    invalidation on mtime change, synthetic `build_minimal_dll`
+    classified as `Kind::Unsupported`); 19 unit tests across
+    `discovery::{cache, codec, paths, probe}` modules.
 - Round 27 — **IFilterGraph + IPin host stubs land; MPG4DS32
   `IPin::ReceiveConnection` reaches `S_OK`.**  Past round 26's
   `VFW_E_NO_TYPES` (`0x80040208`) gate.  Two sub-goals:

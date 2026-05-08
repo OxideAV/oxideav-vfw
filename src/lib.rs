@@ -192,6 +192,8 @@
 #![forbid(unsafe_code)]
 
 pub mod com;
+#[cfg(feature = "auto-discovery")]
+pub mod discovery;
 pub mod emulator;
 pub mod pe;
 pub mod runtime;
@@ -209,18 +211,30 @@ pub use runtime::{Sandbox, DLL_PROCESS_ATTACH};
 pub use trace::{TraceState, WatchMode, Watchpoint};
 pub use win32::vfw32::Bih;
 
-/// Sibling registration entry point. Currently a no-op — the
-/// `oxideav-core` `RuntimeContext` does not yet have a "register
-/// codec discovery for opaque guest DLLs" hook, and the codec-id
-/// story for VfW-loaded modules waits for the loader to clear
-/// the round-4 import-stub gap before any `CodecImplementation`
-/// can be advertised (one `vfw_<fcc>` entry per loaded DLL).
+/// Sibling registration entry point.
 ///
-/// Today this exists purely so `oxideav-meta` can wire the crate
-/// into the umbrella registration cascade without a special case.
+/// **With `auto-discovery` enabled (default):** walks the
+/// configured discovery path (`OXIDEAV_VFW_CODEC_PATH` or the
+/// platform-default codec dir), probes every `*.dll` / `*.ax`
+/// for VfW or DirectShow entry points, and registers one
+/// [`oxideav_core::CodecInfo`] per recognised FourCC into
+/// `ctx.codecs`. Every codec lands at priority 200 — VfW
+/// resolves only when no higher-priority crate already claims
+/// the tag. See [`crate::discovery`] for the full contract.
+///
+/// **Without `auto-discovery`:** no-op. Consumers building with
+/// `default-features = false` get the bare manual `Sandbox` API
+/// without the FS scan / cache / log-and-serde dependency tail.
+///
+/// Hard contract: never panics. A missing discovery directory
+/// (network-isolated CI, container without the user-data dir,
+/// fresh dev box) cleanly registers zero codecs.
 #[cfg(feature = "registry")]
 pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {
-    // Placeholder — see module-level doc for the milestone plan.
+    #[cfg(feature = "auto-discovery")]
+    {
+        let _registered = discovery::discover_and_register(_ctx);
+    }
 }
 
 #[cfg(feature = "registry")]
