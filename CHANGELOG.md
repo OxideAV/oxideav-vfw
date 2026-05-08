@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.2...v0.0.3) - 2026-05-08
+
+### Other
+
+- Round 18: trace Cargo feature for the RE instrumentation surface
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-vfw/compare/v0.0.1...v0.0.2) - 2026-05-08
 
 ### Fixed
