@@ -528,6 +528,41 @@ impl Sandbox {
         Ok(out)
     }
 
+    /// Round 27 — mint a host-side `IFilterGraph` stub so the
+    /// codec's `IBaseFilter::JoinFilterGraph(pGraph, pName)` call
+    /// has a non-NULL parent graph to record.  The returned guest
+    /// pointer's vtable function-pointer slots are synthetic
+    /// thunk addresses that route into the host stubs registered
+    /// by [`crate::com::host_iface::register`].
+    ///
+    /// `QueryInterface(IID_IUnknown | IID_IFilterGraph)` →
+    /// `S_OK + *ppv = obj`; every other IID returns
+    /// `E_NOINTERFACE`.  All eight `IFilterGraph` methods return
+    /// `E_NOTIMPL` — none are exercised on the
+    /// `JoinFilterGraph → ReceiveConnection` path the round-27
+    /// probe takes.
+    pub fn mint_host_filter_graph(&mut self) -> Result<u32, crate::Error> {
+        crate::com::mint_host_filter_graph(&mut self.host, &mut self.mmu, &self.registry)
+    }
+
+    /// Round 27 — mint a host-side `IPin` stub that pretends to
+    /// be an OUTPUT pin advertising `amt_addr` (a pointer to a
+    /// staged `AM_MEDIA_TYPE`).  Suitable as the `pConnector`
+    /// argument of `IPin::ReceiveConnection`.
+    ///
+    /// `QueryDirection` reports `PIN_OUTPUT`; `QueryAccept`
+    /// returns `S_OK`; `ConnectionMediaType` copies the staged
+    /// AMT; `EnumMediaTypes` vends an enumerator yielding the
+    /// staged AMT once.
+    pub fn mint_host_output_pin(&mut self, amt_addr: u32) -> Result<u32, crate::Error> {
+        crate::com::host_iface::mint_host_output_pin(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+            amt_addr,
+        )
+    }
+
     /// Drive `obj->AddRef()`.  Returns the codec-reported new
     /// refcount; the host's bookkeeping is updated automatically.
     pub fn com_add_ref(&mut self, obj: u32) -> Result<u32, crate::Error> {

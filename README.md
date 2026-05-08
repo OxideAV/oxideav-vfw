@@ -9,6 +9,29 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 27 — IFilterGraph + IPin host stubs land; MPG4DS32
+input-pin handshake reaches `S_OK`.** New `src/com/host_iface.rs`
+mints synthetic guest-side COM objects whose vtable function
+pointers are thunk addresses dispatched by Rust handlers — the
+codec sees an `IFilterGraph` host that fail-softs every method,
+and an `IPin` host that pretends to be an OUTPUT pin advertising
+the staged `AM_MEDIA_TYPE`.  Bound together by
+`IBaseFilter::JoinFilterGraph(host_graph, NULL)` (returns S_OK)
++ `IPin::ReceiveConnection(host_output_pin, MP43 VIDEOINFOHEADER)`
+returns **`S_OK = 0x00000000`** — round-26's `VFW_E_NO_TYPES`
+gate is past.  Subsequent calls return `VFW_E_ALREADY_CONNECTED`
+confirming the pin is bound.  `IMemInputPin` reachable via
+QI; `GetAllocator → VFW_E_xxx` (no allocator yet — sub-goal B
+next-round target).  Probe matrix: `MP43`/`mp43`/`MP4S`/`mp4s`/
+`MPG4`/`MP42`/`DIV3`/`DIVX`/`DX50` × `VIH1`/`VIH2` all return
+the same `VFW_E_NO_TYPES` from the codec's `CheckMediaType` when
+called against a self-loop pConnector — but `S_OK` once a
+HostIPin advertising `MP43+VIH1` provides the missing OUTPUT-side
+of the handshake.  WMVDS32 CLSID side-bonus: static analysis of
+`.rdata` finds 23 fourcc-base `MEDIASUBTYPE_*` GUIDs but no
+dedicated codec CLSID literal (binary constructs it dynamically;
+deferred).  **Total: 428 tests.**
+
 **Round 26 — `user32!CreateWindowExA` cascade stubs land + IPin
 ReceiveConnection probed.** Synthetic-HWND registry
 (`HWND_BASE = 0xCAFE_0000` + monotonic counter) plus

@@ -53,8 +53,10 @@
 use crate::emulator::{Cpu, Mmu};
 
 pub mod call;
+pub mod host_iface;
 
 pub use call::{add_ref, call_method, query_interface, release};
+pub use host_iface::mint_host_filter_graph;
 
 /// Canonical 128-bit globally-unique identifier.  Layout matches
 /// the MIDL `GUID` struct in `guiddef.h`:

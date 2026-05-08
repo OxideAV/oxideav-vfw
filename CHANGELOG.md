@@ -8,6 +8,60 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 27 — **IFilterGraph + IPin host stubs land; MPG4DS32
+  `IPin::ReceiveConnection` reaches `S_OK`.**  Past round 26's
+  `VFW_E_NO_TYPES` (`0x80040208`) gate.  Two sub-goals:
+  - **A.1 — MEDIASUBTYPE / FORMAT_* probe matrix.**  The new
+    `tests/round27_filtergraph_and_subtypes.rs::round27_probe_matrix_against_mpg4ds32`
+    walks 12 `(FOURCC, FORMAT_kind)` combinations
+    (`MP43`/`mp43`/`MP4S`/`mp4s`/`MPG4`/`MP42`/`DIV3`/`DIVX`/`DX50`
+    × `VIH1`/`VIH2`) against `IPin::ReceiveConnection`.  Without
+    a valid `pConnector`, every combination returns the same
+    `VFW_E_NO_TYPES` — i.e. CheckMediaType is fine with the AMT
+    shape and the rejection comes from the connector-direction
+    sanity check.
+  - **A.2 — IFilterGraph + IPin host stubs.**  New
+    `src/com/host_iface.rs` (~440 LOC) registers a family of
+    synthetic thunk addresses under the `host-com.host`
+    pseudo-DLL; `mint_host_filter_graph` and
+    `mint_host_output_pin(amt_addr)` build vtable layouts in
+    arena memory whose function-pointer slots dispatch through
+    `dispatch_stub`.  HostIFilterGraph: 11 methods, every
+    IFilterGraph method `E_NOTIMPL`, `QueryInterface(IUnknown |
+    IFilterGraph) → S_OK`.  HostIPin: 18 methods,
+    `QueryDirection → PIN_OUTPUT`, `QueryAccept → S_OK`,
+    `ConnectionMediaType` copies the staged AMT,
+    `EnumMediaTypes` vends a HostIEnumMediaTypes that yields the
+    AMT once.  HostIEnumMediaTypes: 7 methods.  `Sandbox` exposes
+    `mint_host_filter_graph` + `mint_host_output_pin`.  Drove
+    `JoinFilterGraph(host_graph, NULL) → S_OK` then
+    `ReceiveConnection(host_pin, MP43 VIH1) → S_OK = 0`.  Round
+    27 deliverable.
+  - **B (stretch) — IMemInputPin probe after S_OK.** With the
+    pin connected, `QueryInterface(IID_IMemInputPin)` returns
+    a valid IMemInputPin pointer; `GetAllocator` returns
+    `VFW_E_NO_ALLOCATOR` (codec waits for upstream's
+    `NotifyAllocator`); `GetAllocatorRequirements` returns
+    `E_NOTIMPL` (codec is happy with caller-provided sizing);
+    `ReceiveCanBlock → S_OK`.  Trace ring captured 64 EIPs of
+    codec internal state advance through the QI / GetAllocator /
+    GetAllocatorRequirements / ReceiveCanBlock sequence —
+    confirming the codec is now live past the connection
+    handshake.  Round 28 stages the host-side IMemAllocator +
+    IMediaSample.
+  - **Side-bonus — WMVDS32 CLSID hunt (deferred).**  Static
+    analysis of `WMVDS32.AX` `.rdata` finds 23 fourcc-base
+    `MEDIASUBTYPE_*` GUIDs (`WMV1` / `wmv1` / `MPG4` / `mpg4` /
+    `MP42` / `mp42` / `MP43` / `mp43` / `MP4S` / `mp4s` /
+    `MSS1` / `mss1` / `Y41T` / `Y42T` / `UYVY` / `YUY2` /
+    `Y41P` / `YVU9` / `YV12` / `I420` / `IYUV` / `vids` /
+    `auds`) plus standard DirectShow IID / FORMAT_VideoInfo /
+    Quartz interface GUIDs — but no unique codec CLSID literal.
+    The `82CCD3E1-F71A-11D0-…` CLSID family used for sibling
+    MPG4DS32 is not present.  WMVDS32 likely constructs its
+    CLSID dynamically; deferred to a round that disassembles
+    `DllRegisterServer` (`RVA 0x20D5` in WMVDS32) to pinpoint
+    the constructor call site.
 - Round 26 — **`user32!CreateWindowExA` cascade stubs +
   IPin::ReceiveConnection probe.** Two sub-goals:
   - **A. user32 cascade stubs.** Many DirectShow filters and

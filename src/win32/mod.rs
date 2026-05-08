@@ -529,9 +529,14 @@ impl Registry {
     }
 
     /// Register every Round-1+4+8+20 stub family in one call:
-    /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt.
-    /// Returns the total number registered.
+    /// kernel32, gdi32, user32, winmm, advapi32, ole32, msvcrt,
+    /// plus the round-27 host-COM thunk family used by
+    /// [`crate::com::mint_host_filter_graph`].  Returns the total
+    /// number registered.
     pub fn register_all(&mut self) -> usize {
+        let host_before = self.by_name.len();
+        crate::com::host_iface::register(self);
+        let host_count = self.by_name.len() - host_before;
         self.register_kernel32()
             + self.register_gdi32()
             + self.register_user32()
@@ -539,6 +544,7 @@ impl Registry {
             + self.register_advapi32()
             + self.register_ole32()
             + self.register_msvcrt()
+            + host_count
     }
 }
 
