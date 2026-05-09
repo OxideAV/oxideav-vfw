@@ -117,14 +117,19 @@ pub fn register(registry: &mut Registry) {
     registry.register(HOST_DLL, "IPin::Connect", notimpl_3 as StubFn, 3);
     registry.register(HOST_DLL, "IPin::ReceiveConnection", notimpl_3 as StubFn, 3);
     registry.register(HOST_DLL, "IPin::Disconnect", pin_s_ok_1 as StubFn, 1);
-    registry.register(HOST_DLL, "IPin::ConnectedTo", notimpl_2 as StubFn, 2);
+    registry.register(HOST_DLL, "IPin::ConnectedTo", pin_connected_to as StubFn, 2);
     registry.register(
         HOST_DLL,
         "IPin::ConnectionMediaType",
         pin_connection_media_type as StubFn,
         2,
     );
-    registry.register(HOST_DLL, "IPin::QueryPinInfo", notimpl_2 as StubFn, 2);
+    registry.register(
+        HOST_DLL,
+        "IPin::QueryPinInfo",
+        pin_query_pin_info as StubFn,
+        2,
+    );
     registry.register(
         HOST_DLL,
         "IPin::QueryDirection",
@@ -634,32 +639,81 @@ pub fn mint_host_filter_graph(
 /// staged `AM_MEDIA_TYPE`).  Returned guest pointer is suitable
 /// as the `pConnector` argument of `IPin::ReceiveConnection`.
 ///
+/// **Round 37** — extended with parent-filter + connected-pin slots
+/// so [`pin_query_pin_info`] / [`pin_connected_to`] can answer the
+/// codec's introspection of the upstream pin.  Per MSDN
+/// `IPin::QueryPinInfo` returns a `PIN_INFO { IBaseFilter* pFilter,
+/// PIN_DIRECTION dir, WCHAR achName[128] }`; the codec uses
+/// `pFilter` to call back into the upstream filter (e.g. via
+/// `IBaseFilter::QueryFilterInfo`).
+///
 /// Object layout (16-byte aligned):
 ///
 /// | offset | content                    |
 /// |--------|-----------------------------|
-/// | obj    | vtbl_ptr (= obj + 16)      |
+/// | obj    | vtbl_ptr (= obj + 24)      |
 /// | obj+4  | refcount = 1               |
 /// | obj+8  | advertised_amt = amt_addr  |
-/// | obj+12 | reserved (0)               |
-/// | obj+16 | vtbl[0..18] (72 bytes)     |
+/// | obj+12 | connected_pin (codec input pin we'll be connected to, or 0) |
+/// | obj+16 | parent_filter (host IBaseFilter wrapping `self`, or 0)      |
+/// | obj+20 | reserved (0)               |
+/// | obj+24 | vtbl[0..18] (72 bytes)     |
 ///
-/// Total = 16 + 72 = 88 bytes; arena allocator rounds to 96.
+/// Total = 24 + 72 = 96 bytes; arena allocator rounds to 112 with
+/// some headroom for future fields.
+///
+/// Round-27/30/32 callers that don't track the codec's input pin
+/// pass `0` for `connected_pin` and the synthesized
+/// `parent_filter`; the layout still holds.  Round 37's discovery
+/// path uses [`mint_host_output_pin_with_connection`] to plumb the
+/// real codec input pin through.
 pub fn mint_host_output_pin(
     state: &mut HostState,
     mmu: &mut Mmu,
     registry: &Registry,
     amt_addr: u32,
 ) -> Result<u32, crate::Error> {
-    let obj = state.arena_alloc(96).map_err(crate::Error::Win32)?;
-    let vtbl = obj.wrapping_add(16);
+    mint_host_output_pin_with_connection(state, mmu, registry, amt_addr, 0)
+}
+
+/// Round 37 — same as [`mint_host_output_pin`] but also stamps the
+/// codec's input-pin pointer (`connected_pin`) into the new pin
+/// object so [`pin_connected_to`] can return it, and synthesizes a
+/// host `IBaseFilter` parent so [`pin_query_pin_info`] can fill in
+/// `PIN_INFO::pFilter`.
+///
+/// `connected_pin == 0` is allowed (pre-r37 behaviour); in that
+/// case `pin_connected_to` reports `VFW_E_NOT_CONNECTED`.
+///
+/// The synthesized parent filter is minted through
+/// [`crate::com::host_iface_r31::mint_host_base_filter`] (round-31
+/// helper) — it exposes `obj+8 = self_pin` so a codec walking
+/// `pFilter->EnumPins → IPin*` reaches back to the same host pin
+/// it called `QueryPinInfo` on.
+pub fn mint_host_output_pin_with_connection(
+    state: &mut HostState,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    amt_addr: u32,
+    connected_pin: u32,
+) -> Result<u32, crate::Error> {
+    let obj = state.arena_alloc(112).map_err(crate::Error::Win32)?;
+    let vtbl = obj.wrapping_add(24);
     mmu.write_initializer(obj, &vtbl.to_le_bytes())
         .map_err(crate::Error::Trap)?;
     mmu.write_initializer(obj + 4, &1u32.to_le_bytes())
         .map_err(crate::Error::Trap)?;
     mmu.write_initializer(obj + 8, &amt_addr.to_le_bytes())
         .map_err(crate::Error::Trap)?;
-    mmu.write_initializer(obj + 12, &0u32.to_le_bytes())
+    mmu.write_initializer(obj + 12, &connected_pin.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    // Mint a parent IBaseFilter wrapping `self` (obj+8 of the
+    // r31 base-filter struct holds the pin pointer; we point it
+    // at our own pin so a recursive walk closes back here).
+    let parent_filter = super::host_iface_r31::mint_host_base_filter(state, mmu, registry, obj)?;
+    mmu.write_initializer(obj + 16, &parent_filter.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 20, &0u32.to_le_bytes())
         .map_err(crate::Error::Trap)?;
     let methods: [&str; 18] = [
         "IPin::QueryInterface",
@@ -1171,6 +1225,135 @@ fn pin_enum_media_types(
     Ok(S_OK)
 }
 
+/// Round 37 — `IPin::QueryPinInfo(this, PIN_INFO* pInfo)`.
+///
+/// Per `axextend.h` the `PIN_INFO` struct is 132 bytes:
+///
+/// ```c
+/// typedef struct _PinInfo {
+///     IBaseFilter* pFilter;          // offset 0  (4 bytes)
+///     PIN_DIRECTION dir;             // offset 4  (4 bytes)
+///     WCHAR achName[128];            // offset 8  (256 bytes)
+/// } PIN_INFO;
+/// ```
+///
+/// Total: 4 + 4 + 256 = 264 bytes (the WCHAR field is `MAX_PIN_NAME
+/// = 128` `WCHAR`s = 256 bytes).
+///
+/// We populate:
+///  * `pFilter` ← the synthesized `HostIBaseFilter` parent stamped
+///    at `this + 16` by [`mint_host_output_pin_with_connection`].
+///    Per MSDN the caller is responsible for `Release`-ing this
+///    pointer; the host-side floor at refcount=1 keeps the object
+///    alive past any over-release.
+///  * `dir` ← `PIN_OUTPUT (1)` — host pin is the source feeding
+///    the codec's input pin.
+///  * `achName` ← UTF-16 LE `"HostOutPin"` followed by NUL +
+///    zero padding to 256 bytes.
+///
+/// Returns `S_OK` on success, `E_POINTER` if `pInfo == 0`.
+fn pin_query_pin_info(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let p_info = arg(cpu, mmu, 1)?;
+    if p_info == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let parent_filter = mmu
+        .load32(this + 16)
+        .map_err(|t| trap("HostIPin::QueryPinInfo", t))?;
+    // pFilter
+    mmu.write_initializer(p_info, &parent_filter.to_le_bytes())
+        .map_err(|t| trap("HostIPin::QueryPinInfo", t))?;
+    // Per MSDN, QueryPinInfo's pFilter is AddRef'd before return.
+    if parent_filter != 0 {
+        if let Ok(rc) = mmu.load32(parent_filter + 4) {
+            let _ = mmu.write_initializer(parent_filter + 4, &rc.saturating_add(1).to_le_bytes());
+        }
+        state
+            .com
+            .intern(parent_filter, Some(crate::com::IID_IBASEFILTER));
+    }
+    // PIN_DIRECTION = PIN_OUTPUT (1)
+    mmu.write_initializer(p_info + 4, &1u32.to_le_bytes())
+        .map_err(|t| trap("HostIPin::QueryPinInfo", t))?;
+    // achName: WCHAR[128] = UTF-16 "HostOutPin\0" + zero pad.
+    let name_utf16: [u16; 11] = [
+        b'H' as u16,
+        b'o' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'O' as u16,
+        b'u' as u16,
+        b't' as u16,
+        b'P' as u16,
+        b'i' as u16,
+        b'n' as u16,
+        0,
+    ];
+    for (i, w) in name_utf16.iter().enumerate() {
+        mmu.write_initializer(p_info + 8 + (i as u32) * 2, &w.to_le_bytes())
+            .map_err(|t| trap("HostIPin::QueryPinInfo", t))?;
+    }
+    // Zero-pad the rest of achName (offsets 8 + 22 .. 8 + 256).
+    for off in (8 + 22)..(8 + 256u32) {
+        mmu.store8(p_info + off, 0)
+            .map_err(|t| trap("HostIPin::QueryPinInfo", t))?;
+    }
+    record_query_pin_info_call(state, this);
+    Ok(S_OK)
+}
+
+/// Round 37 — `IPin::ConnectedTo(this, IPin** ppPin)`.
+///
+/// Per MSDN: returns the pin this one is connected to in the
+/// filter graph.  When the host output pin has been wired against
+/// the codec's input pin via [`mint_host_output_pin_with_connection`],
+/// `connected_pin` (= codec input pin) is stamped at `this + 12`
+/// and we return it AddRef'd through `*ppPin`.  When no connection
+/// has been recorded, returns `VFW_E_NOT_CONNECTED = 0x80040209`
+/// — the canonical HRESULT for "this pin has no peer".
+fn pin_connected_to(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let pp = arg(cpu, mmu, 1)?;
+    if pp == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    // Default *ppPin = NULL.
+    let _ = mmu.write_initializer(pp, &0u32.to_le_bytes());
+    let connected = mmu
+        .load32(this + 12)
+        .map_err(|t| trap("HostIPin::ConnectedTo", t))?;
+    if connected == 0 {
+        // VFW_E_NOT_CONNECTED — canonical "no peer pin" HRESULT
+        // per MSDN (`vfwmsgs.h`, `0x80040209`).
+        return Ok(0x8004_0209);
+    }
+    // Bump refcount per COM ABI rule that ConnectedTo returns an
+    // AddRef'd pointer.  This is the *codec's* input pin, so we
+    // are reaching into guest-managed memory; it's safe to bump
+    // because the codec's IPin vtable's AddRef will be called by
+    // the caller.  We pre-AddRef here because the codec sees the
+    // ABI contract "pointer comes back AddRef'd"; the codec then
+    // calls Release when done.
+    if let Ok(rc) = mmu.load32(connected + 4) {
+        let _ = mmu.write_initializer(connected + 4, &rc.saturating_add(1).to_le_bytes());
+    }
+    state.com.intern(connected, Some(crate::com::IID_IPIN));
+    mmu.write_initializer(pp, &connected.to_le_bytes())
+        .map_err(|t| trap("HostIPin::ConnectedTo", t))?;
+    Ok(S_OK)
+}
+
 // ---- HostIEnumMediaTypes stubs ---------------------------------------
 
 /// `QueryInterface` for the enumerator.  Same shape as the pin's
@@ -1436,6 +1619,87 @@ pub fn all_set_properties(state: &HostState) -> Vec<AllocatorPropertiesCapture> 
 /// this to reset the per-sandbox state between scenarios.
 pub fn clear_set_properties_log(state: &HostState) {
     if let Ok(mut l) = set_properties_log().lock() {
+        l.remove(&host_key(state));
+    }
+}
+
+// ---- Round 37 — IPin::QueryPinInfo / IBaseFilter::QueryFilterInfo
+// call counters.  Tests / decoder paths use these to confirm the
+// codec actually drives the introspection methods r37 wired up.
+
+fn query_pin_info_log() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u32>>> {
+    static L: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn query_filter_info_log() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<u32>>>
+{
+    static L: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn record_query_pin_info_call(state: &HostState, this: u32) {
+    if let Ok(mut l) = query_pin_info_log().lock() {
+        l.entry(host_key(state)).or_default().push(this);
+    }
+}
+
+pub(crate) fn record_query_filter_info_call(state: &HostState, this: u32) {
+    if let Ok(mut l) = query_filter_info_log().lock() {
+        l.entry(host_key(state)).or_default().push(this);
+    }
+}
+
+/// Round 37 — number of `IPin::QueryPinInfo` calls the codec has
+/// driven against any host pin during this sandbox's lifetime.
+pub fn query_pin_info_call_count(state: &HostState) -> usize {
+    query_pin_info_log()
+        .lock()
+        .ok()
+        .map(|l| l.get(&host_key(state)).map(|v| v.len()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Round 37 — number of `IBaseFilter::QueryFilterInfo` calls the
+/// codec has driven against any host base filter during this
+/// sandbox's lifetime.
+pub fn query_filter_info_call_count(state: &HostState) -> usize {
+    query_filter_info_log()
+        .lock()
+        .ok()
+        .map(|l| l.get(&host_key(state)).map(|v| v.len()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Round 37 — `this` pointers of every `IPin::QueryPinInfo` call
+/// observed for `state`, in arrival order.
+pub fn query_pin_info_calls(state: &HostState) -> Vec<u32> {
+    query_pin_info_log()
+        .lock()
+        .ok()
+        .map(|l| l.get(&host_key(state)).cloned().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Round 37 — `this` pointers of every `IBaseFilter::QueryFilterInfo`
+/// call observed for `state`, in arrival order.
+pub fn query_filter_info_calls(state: &HostState) -> Vec<u32> {
+    query_filter_info_log()
+        .lock()
+        .ok()
+        .map(|l| l.get(&host_key(state)).cloned().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Round 37 — drop every captured introspection call (both
+/// QueryPinInfo and QueryFilterInfo) for `state`.
+pub fn clear_query_info_log(state: &HostState) {
+    if let Ok(mut l) = query_pin_info_log().lock() {
+        l.remove(&host_key(state));
+    }
+    if let Ok(mut l) = query_filter_info_log().lock() {
         l.remove(&host_key(state));
     }
 }

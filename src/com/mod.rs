@@ -58,9 +58,11 @@ pub mod host_iface_r31;
 
 pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
-    all_set_properties, clear_set_properties_log, last_set_properties, media_sample_set_payload,
-    mint_host_filter_graph, mint_host_media_sample, mint_host_mem_allocator,
-    mint_host_mem_allocator_class_factory, AllocatorPropertiesCapture,
+    all_set_properties, clear_query_info_log, clear_set_properties_log, last_set_properties,
+    media_sample_set_payload, mint_host_filter_graph, mint_host_media_sample,
+    mint_host_mem_allocator, mint_host_mem_allocator_class_factory,
+    mint_host_output_pin_with_connection, query_filter_info_call_count, query_filter_info_calls,
+    query_pin_info_call_count, query_pin_info_calls, AllocatorPropertiesCapture,
     DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY, DEFAULT_MEM_ALLOCATOR_FACTORY_POOL,
 };
 

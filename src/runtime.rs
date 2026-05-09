@@ -598,6 +598,61 @@ impl Sandbox {
         )
     }
 
+    /// Round 37 — same as [`Self::mint_host_output_pin`] but also
+    /// stamps the codec's input-pin pointer (`connected_pin`) into
+    /// the new pin object so `IPin::ConnectedTo` can return it,
+    /// and synthesizes a parent `HostIBaseFilter` so
+    /// `IPin::QueryPinInfo` can fill in `PIN_INFO::pFilter`.
+    ///
+    /// `connected_pin == 0` falls back to the round-30 behaviour
+    /// where the pin reports `VFW_E_NOT_CONNECTED` from
+    /// `ConnectedTo`.
+    pub fn mint_host_output_pin_with_connection(
+        &mut self,
+        amt_addr: u32,
+        connected_pin: u32,
+    ) -> Result<u32, crate::Error> {
+        crate::com::host_iface::mint_host_output_pin_with_connection(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+            amt_addr,
+            connected_pin,
+        )
+    }
+
+    /// Round 37 — number of `IPin::QueryPinInfo` calls the codec
+    /// has driven against any host pin during this sandbox's
+    /// lifetime.
+    pub fn query_pin_info_call_count(&self) -> usize {
+        crate::com::host_iface::query_pin_info_call_count(&self.host)
+    }
+
+    /// Round 37 — number of `IBaseFilter::QueryFilterInfo` calls
+    /// the codec has driven against any host filter during this
+    /// sandbox's lifetime.
+    pub fn query_filter_info_call_count(&self) -> usize {
+        crate::com::host_iface::query_filter_info_call_count(&self.host)
+    }
+
+    /// Round 37 — `this` pointers of every `IPin::QueryPinInfo`
+    /// call observed.
+    pub fn query_pin_info_calls(&self) -> Vec<u32> {
+        crate::com::host_iface::query_pin_info_calls(&self.host)
+    }
+
+    /// Round 37 — `this` pointers of every
+    /// `IBaseFilter::QueryFilterInfo` call observed.
+    pub fn query_filter_info_calls(&self) -> Vec<u32> {
+        crate::com::host_iface::query_filter_info_calls(&self.host)
+    }
+
+    /// Round 37 — drop every captured introspection call from this
+    /// sandbox's per-state log.
+    pub fn clear_query_info_log(&self) {
+        crate::com::host_iface::clear_query_info_log(&self.host)
+    }
+
     /// Round 30 — mint a host-side `IMemAllocator` backed by a
     /// pool of `pool_size` IMediaSample slots, each carrying a
     /// fresh `sample_capacity`-byte data region. The returned

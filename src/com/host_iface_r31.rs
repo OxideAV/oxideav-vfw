@@ -883,20 +883,59 @@ fn filter_find_pin(
     Ok(S_OK)
 }
 
+/// Round 37 — `IBaseFilter::QueryFilterInfo(this, FILTER_INFO* pInfo)`.
+///
+/// Per `axextend.h`:
+///
+/// ```c
+/// typedef struct _FilterInfo {
+///     WCHAR achName[128];      // offset 0   (256 bytes)
+///     IFilterGraph* pGraph;    // offset 256 (4 bytes)
+/// } FILTER_INFO;
+/// ```
+///
+/// Total: 260 bytes.
+///
+/// Round 37 populates `achName` with UTF-16 LE `"HostFilter\0"` so
+/// any codec that diagnostically dumps the filter name doesn't see
+/// raw zero garbage; `pGraph` stays NULL (we don't yet vend a host
+/// IFilterGraph from this slot).  Records the call into the
+/// per-state log so tests can introspect whether the codec drove
+/// it during init.
 fn filter_query_filter_info(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _this = arg(cpu, mmu, 0)?;
+    let this = arg(cpu, mmu, 0)?;
     let p_info = arg(cpu, mmu, 1)?;
     if p_info == 0 {
         return Ok(crate::com::E_POINTER);
     }
+    // Zero the whole 260-byte struct first.
     for i in 0..260u32 {
         let _ = mmu.store8(p_info + i, 0);
     }
+    // achName (WCHAR[128]) = "HostFilter\0".
+    let name_utf16: [u16; 11] = [
+        b'H' as u16,
+        b'o' as u16,
+        b's' as u16,
+        b't' as u16,
+        b'F' as u16,
+        b'i' as u16,
+        b'l' as u16,
+        b't' as u16,
+        b'e' as u16,
+        b'r' as u16,
+        0,
+    ];
+    for (i, w) in name_utf16.iter().enumerate() {
+        let _ = mmu.write_initializer(p_info + (i as u32) * 2, &w.to_le_bytes());
+    }
+    // pGraph at offset 256 stays NULL — already zeroed above.
+    crate::com::host_iface::record_query_filter_info_call(state, this);
     Ok(S_OK)
 }
 

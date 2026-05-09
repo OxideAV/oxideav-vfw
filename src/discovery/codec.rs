@@ -837,11 +837,17 @@ impl SandboxedDshowDecoder {
         let mut accepted_amt = 0u32;
         let mut last_hr = 0u32;
         for (i, cap) in captured.iter().enumerate() {
-            let host_out_pin = sb.mint_host_output_pin(cap.amt_addr).map_err(|e| {
-                Error::other(format!(
-                    "vfw discovery (DShow): mint host output pin (codec amt {i}): {e}"
-                ))
-            })?;
+            // Round 37 — pass codec's input pin so the host output
+            // pin's QueryPinInfo / ConnectedTo answer the codec's
+            // upstream introspection (the round-36 trap was the
+            // codec walking a NULL upstream-pin field).
+            let host_out_pin = sb
+                .mint_host_output_pin_with_connection(cap.amt_addr, self.input_pin)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): mint host output pin (codec amt {i}): {e}"
+                    ))
+                })?;
             let r = crate::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
@@ -863,12 +869,15 @@ impl SandboxedDshowDecoder {
             }
         }
         if accepted_amt == 0 {
-            // Fall back to synthetic AMT.
-            let host_out_pin = sb.mint_host_output_pin(synth_amt).map_err(|e| {
-                Error::other(format!(
-                    "vfw discovery (DShow): mint host output pin (synth): {e}"
-                ))
-            })?;
+            // Fall back to synthetic AMT.  Round 37 — same
+            // connection-aware mint as the codec-AMT branch above.
+            let host_out_pin = sb
+                .mint_host_output_pin_with_connection(synth_amt, self.input_pin)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): mint host output pin (synth): {e}"
+                    ))
+                })?;
             let r = crate::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
