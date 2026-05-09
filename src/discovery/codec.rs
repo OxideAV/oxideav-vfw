@@ -1774,11 +1774,36 @@ impl Decoder for SandboxedDshowDecoder {
         }
 
         // Snapshot trace ring before Receive so we can document
-        // what the codec did.
-        sb.cpu.enable_trace_ring(64);
+        // what the codec did.  Round 36 — bumped to 4096 entries
+        // so on trap we can see the chain of function calls leading
+        // up to the failure (the prior 64-entry ring barely covered
+        // the failing function's prolog).
+        sb.cpu.enable_trace_ring(4096);
 
-        // Drive IMemInputPin::Receive(sample).
-        let r_recv = crate::com::call::call_method(
+        // Round 36 — dump `[mip+0..0x100]` so the diagnostic carries
+        // the per-field state of the codec's own IMemInputPin
+        // object before the Receive call.  Helps identify which
+        // field at +0x8c (the trap site) the codec expected us to
+        // populate.
+        let mut mip_state: Vec<String> = Vec::new();
+        for off in (0..=0xa0u32).step_by(4) {
+            if let Ok(v) = sb.mmu.load32(mip + off) {
+                mip_state.push(format!("[+{off:#04x}]={v:#010x}"));
+            }
+        }
+        log::debug!(
+            "vfw discovery (DShow): pre-Receive mip={mip:#010x} state: {:?}",
+            mip_state
+        );
+
+        // Drive IMemInputPin::Receive(sample).  On trap, snapshot
+        // the CPU register file + the last 8 entries of the trace
+        // ring so the round-36+ diagnostic doesn't require a
+        // separate trace-feature build.  The last trace ring entry
+        // is the entry-EIP of the failing instruction (set in
+        // `Cpu::step` BEFORE the opcode dispatch); regs reflect
+        // state at the point of the trap.
+        let r_recv = match crate::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
@@ -1786,8 +1811,86 @@ impl Decoder for SandboxedDshowDecoder {
             mip,
             crate::com::SLOT_MEMINPUTPIN_RECEIVE,
             &[sample],
-        )
-        .map_err(|e| Error::other(format!("vfw discovery (DShow): Receive trapped: {e}")))?;
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                use crate::emulator::regs::Reg32;
+                let ring = sb.cpu.trace_ring.clone();
+                let trap_eip = ring.last().copied().unwrap_or(sb.cpu.regs.eip);
+                let module_base = sb.host.primary_module_base;
+                let rva = trap_eip.wrapping_sub(module_base);
+                let reg = |r: Reg32| sb.cpu.regs.get32(r);
+                let ring_tail: Vec<String> = ring
+                    .iter()
+                    .rev()
+                    .take(8)
+                    .map(|e| format!("{e:#010x}"))
+                    .collect();
+                // Round 36 — capture the unique sequence of RVAs
+                // visited (call-site chain).  Compress the ring by
+                // emitting one entry per "function entry" — i.e.
+                // any RVA that's the target of a CALL or any new
+                // RVA region.  We do this naively by detecting
+                // backward jumps: when eip[i] < eip[i-1] - 0x100
+                // or eip[i] > eip[i-1] + 0x40 we've crossed a
+                // function boundary.
+                let mut call_chain: Vec<u32> = Vec::new();
+                let mut prev: u32 = 0;
+                for &eip in ring.iter() {
+                    let rva_e = eip.wrapping_sub(module_base);
+                    if prev == 0 || (eip >= prev + 0x40) || (eip + 0x100 < prev) {
+                        call_chain.push(rva_e);
+                    }
+                    prev = eip;
+                }
+                // Last 24 entries of the chain.
+                let chain_tail: Vec<String> = call_chain
+                    .iter()
+                    .rev()
+                    .take(24)
+                    .rev()
+                    .map(|e| format!("{e:#010x}"))
+                    .collect();
+                // Walk the stack frame: dump esp..esp+32 dwords as
+                // potential return addresses + saved registers, so
+                // a follow-up disasm pass can identify the caller.
+                let esp = sb.cpu.regs.esp();
+                let mut stack_frame: Vec<String> = Vec::new();
+                for i in 0..16u32 {
+                    if let Ok(v) = sb.mmu.load32(esp + i * 4) {
+                        let v_rva = v.wrapping_sub(module_base);
+                        // Filter to values that look like they
+                        // could be code RVAs in the codec (< 0x1_0000_0000
+                        // and > 0).
+                        stack_frame.push(format!(
+                            "[esp+{:02x}]={:#010x} (rva={:#010x})",
+                            i * 4,
+                            v,
+                            v_rva
+                        ));
+                    }
+                }
+                return Err(Error::other(format!(
+                    "vfw discovery (DShow): Receive trapped: {e} \
+                     [trap_eip={trap_eip:#010x} rva={rva:#010x} \
+                     eax={:#010x} ecx={:#010x} edx={:#010x} ebx={:#010x} \
+                     esp={:#010x} ebp={:#010x} esi={:#010x} edi={:#010x} \
+                     trace_tail={:?} call_chain={:?} stack={:?} mip_state={:?}]",
+                    reg(Reg32::Eax),
+                    reg(Reg32::Ecx),
+                    reg(Reg32::Edx),
+                    reg(Reg32::Ebx),
+                    esp,
+                    reg(Reg32::Ebp),
+                    reg(Reg32::Esi),
+                    reg(Reg32::Edi),
+                    ring_tail,
+                    chain_tail,
+                    stack_frame,
+                    mip_state,
+                )));
+            }
+        };
 
         // Round 31 — drain the host-side queue populated by the
         // downstream `HostIMemInputPin::Receive` callback.

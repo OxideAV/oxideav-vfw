@@ -8,6 +8,66 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 36 — **diagnose `IMemInputPin::Receive` trap site** that
+  r35 unblocked.  Round 35 closed with the codec successfully
+  minting its own allocator + driving `SetProperties + Commit`
+  on it, then trapping inside `Receive` with `memory fault at
+  0x0000001c (page unmapped)` — the canonical "NULL+0x1c"
+  pattern when the codec dereferences a NULL pointer and
+  reads the dword at +0x1c off it.
+  - **Diagnostic infrastructure** — the production-path
+    `Receive` call in `discovery::codec` now catches the trap,
+    snapshots `cpu.regs.eip`, every GP register
+    (`eax/ecx/edx/ebx/esp/ebp/esi/edi`), the last 16 dwords of
+    the guest stack, the last 24 entries of a 4096-deep trace
+    ring (compressed to call-site boundaries), and every dword
+    in the codec's IMemInputPin object (offsets 0x00..=0xa0).
+    All folded into the `Error::other` message so a failing
+    test surfaces actionable register state without needing a
+    separate `cargo test --features trace` build.
+  - **Trap site identified**: codec MPG4DS32.AX, RVA `0x7184`,
+    instruction `f3 a7` = `repe cmpsd` (compare 4 dwords).
+    Function at RVA `0x7176` is an inlined `IsEqualGUID`:
+    `mov esi, ecx; mov edi, &kZeroGuid (= rva 0x26c08, all-zeros);
+    mov ecx, 4; xor eax, eax; repe cmpsd; setne al; ret`.
+    Caller at RVA `0x2da7` does `mov ecx, [ebx+0x8c]; add ecx,
+    0x1c; call IsEqualGUID(ecx, &kZeroGuid)`.  Trap fires
+    because `ebx+0x8c` (the `this` of the calling function,
+    where `ebx = 0x900ffee0` — a STACK address — meaning a
+    stack-allocated codec object) holds NULL at offset 0x8c,
+    so `[NULL+0x1c]` faults.
+  - **Call chain to trap** (compressed RVAs, oldest first):
+    `0x69ab → 0x5e34 → 0x674f → 0x5e5f → 0x69c9 → 0x25a2 →
+    0x6fee (IMemInputPin::Receive entry) → 0x70f1 → 0x25ba
+    → 0x261a → 0x6473 → 0x6560 → 0x2626 → 0x2da7 → 0x7176
+    (IsEqualGUID, traps)`.  Function 0x6fee is the codec's
+    own `IMemInputPin::Receive(IMediaSample*)` — confirmed by
+    its prolog `mov ebx, [ebp+8]; mov esi, ecx; mov eax, [ebx];
+    push &local2; push &local1; push ebx; call [eax+0x14]`
+    (the `[eax+0x14]` = slot 5 = `IMediaSample::GetTime`).
+  - **Failing semantic**: the codec's stack-local helper struct
+    has a field at offset `+0x8c` that was never initialised.
+    The codec checks `if (m_pSomething->guid_at_0x1c ==
+    GUID_NULL) return E_FAIL;` — this is a defence against
+    uninitialised media-type GUIDs.  When `m_pSomething` itself
+    is NULL we trap before the comparison can run.
+  - **Round-37 candidate**: the actual fix needs to identify
+    which initialisation step (likely deeper than what r33-r35
+    pre-`Receive` already drives — `JoinFilterGraph + 
+    EnumPins + ReceiveConnection + QI(IMemInputPin) + 
+    GetAllocator + SetProperties + Commit + Pause + Run +
+    GetState`) the codec expects to populate the stack-local's
+    `+0x8c` field.  Likely candidates: `IPin::QueryPinInfo` /
+    `IPin::ConnectedTo` (currently both return `E_NOTIMPL`
+    from our host stubs), or a per-pin `IFilterGraph2`/
+    `IMediaSeeking`/`IBaseFilter::QueryFilterInfo` interface
+    we haven't minted.
+  - +6 tests in `tests/round36_receive_trap_site.rs`
+    documenting the trap state, the disassembly of the trap
+    site, the bytes at the static GUID literal, the call
+    chain, the IMemInputPin field layout, and a smoke check
+    that round-30/32/33/34/35's host-allocator path still
+    works.  Test count: 541 → 556.
 - Round 35 — **register host-side `CLSID_MemoryAllocator` class
   factory** so `mpg4ds32`'s internal
   `CoCreateInstance(CLSID_MemoryAllocator, NULL, _,
