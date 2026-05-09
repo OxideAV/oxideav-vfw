@@ -536,6 +536,7 @@ impl Registry {
     pub fn register_all(&mut self) -> usize {
         let host_before = self.by_name.len();
         crate::com::host_iface::register(self);
+        crate::com::host_iface_r31::register(self);
         let host_count = self.by_name.len() - host_before;
         self.register_kernel32()
             + self.register_gdi32()

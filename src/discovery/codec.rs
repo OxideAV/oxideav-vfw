@@ -662,37 +662,94 @@ impl SandboxedDshowDecoder {
             self.host_graph = host_graph;
         }
 
-        // Stage an AM_MEDIA_TYPE for the discovery FourCC, mint a
-        // host output pin advertising it, drive ReceiveConnection.
-        let amt =
-            stage_am_media_type_dshow(sb, self.fourcc_bytes, self.width as i32, self.height as i32)
-                .map_err(|e| Error::other(format!("vfw discovery (DShow): stage AMT: {e}")))?;
-        let host_out_pin = sb.mint_host_output_pin(amt).map_err(|e| {
-            Error::other(format!("vfw discovery (DShow): mint host output pin: {e}"))
-        })?;
-        let r = crate::com::call::call_method(
+        // Round 31 A — walk the codec's input pin AMT enumeration
+        // first.  If it surfaces any AMTs, prefer them over the
+        // fabricated VIH+BIH the round-30 path forced.
+        let captured = crate::com::host_iface_r31::walk_codec_input_pin_amts(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             self.input_pin,
-            4, // SLOT_PIN_RECEIVE_CONNECTION
-            &[host_out_pin, amt],
+            8,
         )
         .map_err(|e| {
             Error::other(format!(
-                "vfw discovery (DShow): IPin::ReceiveConnection trapped: {e}"
+                "vfw discovery (DShow): walk_codec_input_pin_amts: {e}"
             ))
         })?;
-        if r != 0 {
-            return Err(Error::unsupported(format!(
-                "vfw discovery (DShow): IPin::ReceiveConnection returned \
-                 HRESULT {r:#010x} (codec rejected the offered AM_MEDIA_TYPE; \
-                 round 30 ships the IMemAllocator+IMediaSample stubs but the \
-                 codec's CheckMediaType still rejects our fabricated input \
-                 type — see r31 candidates in the next-round notes)"
-            )));
+        if !captured.is_empty() {
+            log::debug!(
+                "vfw discovery (DShow): captured {} codec-native AMT(s); first subtype={}",
+                captured.len(),
+                captured[0].subtype
+            );
         }
+
+        let synth_amt =
+            stage_am_media_type_dshow(sb, self.fourcc_bytes, self.width as i32, self.height as i32)
+                .map_err(|e| Error::other(format!("vfw discovery (DShow): stage AMT: {e}")))?;
+
+        let mut accepted_amt = 0u32;
+        let mut last_hr = 0u32;
+        for (i, cap) in captured.iter().enumerate() {
+            let host_out_pin = sb.mint_host_output_pin(cap.amt_addr).map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): mint host output pin (codec amt {i}): {e}"
+                ))
+            })?;
+            let r = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                self.input_pin,
+                4, // SLOT_PIN_RECEIVE_CONNECTION
+                &[host_out_pin, cap.amt_addr],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): IPin::ReceiveConnection (codec amt {i}) trapped: {e}"
+                ))
+            })?;
+            last_hr = r;
+            if r == 0 {
+                accepted_amt = cap.amt_addr;
+                break;
+            }
+        }
+        if accepted_amt == 0 {
+            // Fall back to synthetic AMT.
+            let host_out_pin = sb.mint_host_output_pin(synth_amt).map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): mint host output pin (synth): {e}"
+                ))
+            })?;
+            let r = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                self.input_pin,
+                4, // SLOT_PIN_RECEIVE_CONNECTION
+                &[host_out_pin, synth_amt],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): IPin::ReceiveConnection (synth) trapped: {e}"
+                ))
+            })?;
+            if r != 0 {
+                return Err(Error::unsupported(format!(
+                    "vfw discovery (DShow): IPin::ReceiveConnection rejected every \
+                     candidate AMT (codec-native count={}, last codec-native HRESULT \
+                     {last_hr:#010x}, synth HRESULT {r:#010x})",
+                    captured.len()
+                )));
+            }
+            accepted_amt = synth_amt;
+        }
+        let amt = accepted_amt;
         self.connection_done = true;
 
         // QI for IMemInputPin.
@@ -733,8 +790,206 @@ impl SandboxedDshowDecoder {
         // for NotifyAllocator and rely entirely on GetAllocator;
         // the host-allocator path is best-effort.
         log::debug!("vfw discovery (DShow): NotifyAllocator → {r_na:#010x}; alloc = {alloc:#010x}");
+
+        // Round 31 B — wire a downstream HostIPin / HostIMemInputPin
+        // pair into the codec's output pin so that when the codec
+        // emits a decoded sample, our `Receive` callback captures
+        // the bytes into the per-state queue.  The output pin's
+        // ReceiveConnection is best-effort — some codecs don't
+        // expose a separate output pin (transform-in-place); for
+        // those we still pre-mint the host pair so that QI from the
+        // input side can find it.
+        let (h_pin, h_mip) = sb.host_iface_r31_mint_input_pin_pair().map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): mint host input pin pair: {e}"
+            ))
+        })?;
+        let _h_filter = sb.host_iface_r31_mint_base_filter(h_pin).map_err(|e| {
+            Error::other(format!("vfw discovery (DShow): mint host base filter: {e}"))
+        })?;
+        if let Some(out_pin) = first_output_pin_dshow(sb, self.filter, self.input_pin) {
+            // Stage a downstream RGB24 AMT.
+            let dn_amt = stage_am_media_type_rgb24_dshow(sb, self.width as i32, self.height as i32)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): stage downstream RGB24 AMT: {e}"
+                    ))
+                })?;
+            let r_dn = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                out_pin,
+                4, // SLOT_PIN_RECEIVE_CONNECTION
+                &[h_pin, dn_amt],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): output ReceiveConnection trapped: {e}"
+                ))
+            })?;
+            log::debug!(
+                "vfw discovery (DShow): downstream Connect → {r_dn:#010x} (out_pin={out_pin:#010x})"
+            );
+        }
+        let _ = h_mip; // retained on the sandbox via QI on h_pin.
         Ok(())
     }
+}
+
+/// Round 31 — find a PIN_OUTPUT pin on the codec filter (skipping
+/// `skip` which is already-bound input).  Returns `None` if the
+/// filter has no output pin.
+fn first_output_pin_dshow(sb: &mut crate::Sandbox, filter: u32, skip: u32) -> Option<u32> {
+    use crate::com::call::call_method;
+    // Walk EnumPins to gather all pin pointers.
+    let mut pins = Vec::new();
+    let scratch = sb.host.arena_alloc(8).ok()?;
+    let _ = sb.mmu.write_initializer(scratch, &[0u8; 8]);
+    let r = call_method(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &sb.registry,
+        &mut sb.host,
+        filter,
+        crate::com::SLOT_BASEFILTER_ENUM_PINS,
+        &[scratch],
+    );
+    let pp = sb.mmu.load32(scratch).unwrap_or(0);
+    if !matches!(r, Ok(0)) || pp == 0 {
+        return None;
+    }
+    sb.host.com.intern(pp, None);
+    for _ in 0..16 {
+        let pin_slot = sb.host.arena_alloc(8).ok()?;
+        let _ = sb.mmu.write_initializer(pin_slot, &[0u8; 8]);
+        let r = call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            pp,
+            3, // IEnumPins::Next
+            &[1, pin_slot, pin_slot + 4],
+        );
+        let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
+        let fetched = sb.mmu.load32(pin_slot + 4).unwrap_or(0);
+        if !matches!(r, Ok(0) | Ok(1)) || pin == 0 || fetched == 0 {
+            break;
+        }
+        sb.host.com.intern(pin, None);
+        pins.push(pin);
+        if matches!(r, Ok(1)) {
+            break;
+        }
+    }
+    let _ = sb.com_release(pp);
+    for pin in pins {
+        if pin == skip {
+            continue;
+        }
+        let dir_slot = sb.host.arena_alloc(4).ok()?;
+        let _ = sb.mmu.write_initializer(dir_slot, &0u32.to_le_bytes());
+        let r = call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            pin,
+            9, // IPin::QueryDirection
+            &[dir_slot],
+        );
+        if !matches!(r, Ok(0)) {
+            continue;
+        }
+        let dir = sb.mmu.load32(dir_slot).unwrap_or(0);
+        if dir == 1 {
+            return Some(pin);
+        }
+    }
+    None
+}
+
+/// Stage a downstream RGB24 AM_MEDIA_TYPE.  Used by round 31 B.
+fn stage_am_media_type_rgb24_dshow(
+    sb: &mut crate::Sandbox,
+    width: i32,
+    height: i32,
+) -> Result<u32> {
+    let to_oxide =
+        |e: crate::Error| Error::other(format!("vfw discovery (DShow): stage RGB24 AMT: {e}"));
+    let blob = sb
+        .host
+        .arena_alloc(72 + 88 + 16)
+        .map_err(|e| to_oxide(crate::Error::Win32(e)))?;
+    let amt = blob;
+    let fmt = blob + 72;
+    let mediatype_video =
+        crate::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
+    let format_videoinfo =
+        crate::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
+    let mediasubtype_rgb24 =
+        crate::com::Guid::parse("{E436EB7D-524F-11CE-9F53-0020AF0BA770}").unwrap();
+    let trap = |e: crate::emulator::Trap| to_oxide(crate::Error::Trap(e));
+    mediatype_video.stage(&mut sb.mmu, amt).map_err(trap)?;
+    mediasubtype_rgb24
+        .stage(&mut sb.mmu, amt + 16)
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 32, &1u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 36, &0u32.to_le_bytes())
+        .map_err(trap)?;
+    let stride = (width.unsigned_abs() * 3 + 3) & !3;
+    let img = stride * height.unsigned_abs();
+    sb.mmu
+        .write_initializer(amt + 40, &img.to_le_bytes())
+        .map_err(trap)?;
+    format_videoinfo
+        .stage(&mut sb.mmu, amt + 44)
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 60, &0u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 64, &88u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 68, &fmt.to_le_bytes())
+        .map_err(trap)?;
+    for i in 0..48u32 {
+        sb.mmu.store8(fmt + i, 0).map_err(trap)?;
+    }
+    let bih = fmt + 48;
+    sb.mmu
+        .write_initializer(bih, &40u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 4, &(width as u32).to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 8, &(height as u32).to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 12, &1u16.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 14, &24u16.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 16, &0u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 20, &img.to_le_bytes())
+        .map_err(trap)?;
+    for off in [24u32, 28, 32, 36] {
+        sb.mmu
+            .write_initializer(bih + off, &0u32.to_le_bytes())
+            .map_err(trap)?;
+    }
+    Ok(amt)
 }
 
 /// Stage an AM_MEDIA_TYPE (72 B) + VIDEOINFOHEADER (88 B) in arena
@@ -980,6 +1235,12 @@ impl Decoder for SandboxedDshowDecoder {
         )
         .map_err(|e| Error::other(format!("vfw discovery (DShow): Receive trapped: {e}")))?;
 
+        // Round 31 — drain the host-side queue populated by the
+        // downstream `HostIMemInputPin::Receive` callback.
+        if let Some(rs) = sb.pop_received_sample() {
+            return surface_received_dshow_frame(rs, packet.pts, self.width, self.height);
+        }
+
         // Capture trace ring head / tail for diagnostics.
         let ring = sb.cpu.trace_ring.clone();
         let ring_summary = if ring.is_empty() {
@@ -995,14 +1256,20 @@ impl Decoder for SandboxedDshowDecoder {
             format!("len={} head={:?} tail={:?}", ring.len(), head, tail)
         };
 
-        // Round 30 doesn't have a downstream HostIPin::Receive
-        // capture path: codec output goes nowhere we can observe
-        // as a `Frame::Video`. Surface Unsupported with diagnostics.
-        Err(Error::unsupported(format!(
-            "vfw discovery (DShow): IMemInputPin::Receive → {r_recv:#010x}; \
-             codec output capture via downstream HostIPin::Receive is r31 work \
-             (trace_ring {ring_summary})"
-        )))
+        // Per round-31 goal: prefer Eof when codec accepted input
+        // but emitted nothing (vs round 30's Unsupported path).
+        if r_recv == 0 {
+            log::debug!(
+                "vfw discovery (DShow): Receive ok but no output sample queued \
+                 (trace_ring {ring_summary})"
+            );
+            Err(Error::Eof)
+        } else {
+            Err(Error::unsupported(format!(
+                "vfw discovery (DShow): IMemInputPin::Receive → {r_recv:#010x}; \
+                 no decoded sample emitted (trace_ring {ring_summary})"
+            )))
+        }
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1023,8 +1290,45 @@ impl Drop for SandboxedDshowDecoder {
             if self.filter != 0 {
                 let _ = sb.com_release(self.filter);
             }
+            crate::com::host_iface_r31::clear_queue(&sb.host);
         }
     }
+}
+
+/// Round 31 — turn a host-captured `ReceivedSample` into a
+/// `Frame::Video`.  Assumes the codec emitted RGB24 in the
+/// negotiated dimensions; pads / truncates to `stride * height`.
+/// Bottom-up storage is flipped to top-down to match the VfW
+/// path's surface convention.
+fn surface_received_dshow_frame(
+    rs: crate::com::host_iface_r31::ReceivedSample,
+    pts: Option<i64>,
+    width: u32,
+    height: u32,
+) -> Result<Frame> {
+    let w = width as usize;
+    let h = height as usize;
+    let stride = w * 3;
+    let expected = stride * h;
+    let raw = if rs.data.len() >= expected {
+        rs.data[..expected].to_vec()
+    } else {
+        let mut padded = vec![0u8; expected];
+        padded[..rs.data.len()].copy_from_slice(&rs.data);
+        padded
+    };
+    let mut data = vec![0u8; expected];
+    if h > 0 && stride > 0 {
+        for row in 0..h {
+            let src_off = (h - 1 - row) * stride;
+            let dst_off = row * stride;
+            data[dst_off..dst_off + stride].copy_from_slice(&raw[src_off..src_off + stride]);
+        }
+    }
+    Ok(Frame::Video(VideoFrame {
+        pts,
+        planes: vec![VideoPlane { stride, data }],
+    }))
 }
 
 /// Stream-level pixel format for [`Frame::Video`]s emitted by

@@ -638,6 +638,39 @@ impl Sandbox {
         crate::com::media_sample_set_payload(&mut self.mmu, sample, payload, sync_point)
     }
 
+    /// Round 31 — mint a paired downstream `(HostIPin, HostIMemInputPin)`
+    /// for receiving samples the codec pushes from its output pin.
+    pub fn host_iface_r31_mint_input_pin_pair(&mut self) -> Result<(u32, u32), crate::Error> {
+        crate::com::host_iface_r31::mint_host_input_pin_pair(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+        )
+    }
+
+    /// Round 31 — mint a minimal HostIBaseFilter exposing
+    /// `input_pin`.
+    pub fn host_iface_r31_mint_base_filter(&mut self, input_pin: u32) -> Result<u32, crate::Error> {
+        crate::com::host_iface_r31::mint_host_base_filter(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+            input_pin,
+        )
+    }
+
+    /// Round 31 — pop the oldest sample captured by the
+    /// downstream `HostIMemInputPin::Receive` callback.
+    pub fn pop_received_sample(&self) -> Option<crate::com::host_iface_r31::ReceivedSample> {
+        crate::com::host_iface_r31::pop_sample(&self.host)
+    }
+
+    /// Round 31 — number of samples currently waiting in the
+    /// host-side queue.
+    pub fn received_samples_len(&self) -> usize {
+        crate::com::host_iface_r31::queue_len(&self.host)
+    }
+
     /// Drive `obj->AddRef()`.  Returns the codec-reported new
     /// refcount; the host's bookkeeping is updated automatically.
     pub fn com_add_ref(&mut self, obj: u32) -> Result<u32, crate::Error> {

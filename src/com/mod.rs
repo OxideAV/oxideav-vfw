@@ -54,6 +54,7 @@ use crate::emulator::{Cpu, Mmu};
 
 pub mod call;
 pub mod host_iface;
+pub mod host_iface_r31;
 
 pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
