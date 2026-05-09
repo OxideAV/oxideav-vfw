@@ -242,6 +242,11 @@ fn host_media_sample_get_pointer_size_actual_length_round_trip() {
 }
 
 /// Allocator GetBuffer / ReleaseBuffer cycle through the pool.
+///
+/// Round 32: the host allocator now starts *decommitted*; the
+/// caller must drive `IMemAllocator::Commit()` before any
+/// `GetBuffer` call succeeds.  `Decommit()` flips the state
+/// back so subsequent `GetBuffer` returns `VFW_E_NOT_COMMITTED`.
 #[test]
 fn host_mem_allocator_get_buffer_release_buffer_cycle() {
     use oxideav_vfw::com::call::call_method;
@@ -249,6 +254,19 @@ fn host_mem_allocator_get_buffer_release_buffer_cycle() {
     let alloc = sb.mint_host_mem_allocator(2, 1024, 0).expect("mint alloc");
     let pp = sb.host.arena_alloc(4).unwrap();
     sb.mmu.write_initializer(pp, &0u32.to_le_bytes()).unwrap();
+
+    // Round 32 — explicit Commit before GetBuffer.
+    let r_commit = call_method(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &sb.registry,
+        &mut sb.host,
+        alloc,
+        oxideav_vfw::com::SLOT_MEMALLOCATOR_COMMIT,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(r_commit, 0);
 
     // Two GetBuffer calls should return distinct pointers.
     let r1 = call_method(

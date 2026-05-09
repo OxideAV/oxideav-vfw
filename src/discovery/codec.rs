@@ -834,81 +834,86 @@ impl SandboxedDshowDecoder {
             );
         }
         let _ = h_mip; // retained on the sandbox via QI on h_pin.
+
+        // Round 32 B — Commit the host allocator so subsequent
+        // GetBuffer calls succeed (the allocator starts decommitted
+        // per real IMemAllocator semantics).
+        let r_commit = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            alloc,
+            crate::com::SLOT_MEMALLOCATOR_COMMIT,
+            &[],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): host allocator Commit trapped: {e}"
+            ))
+        })?;
+        log::debug!("vfw discovery (DShow): host alloc Commit → {r_commit:#010x}");
+
+        // Round 32 A — drive the codec from State_Stopped into
+        // State_Running through `IMediaFilter::Pause()` →
+        // `IMediaFilter::Run(0)`.  Per the DShow filter-state
+        // machine (MSDN: "Filter States"), `Receive()` is only
+        // legal in Paused or Running; codecs that QI for
+        // IMediaFilter and check the state will return
+        // VFW_E_NOT_COMMITTED to upstream Receive() while still
+        // Stopped.  Both methods are safe even when the codec
+        // ignores them — S_OK / S_FALSE are both acceptable.
+        //
+        // `IBaseFilter` extends `IMediaFilter` so the same vtable
+        // slots (5 = Pause, 6 = Run) are reachable directly via
+        // the IBaseFilter pointer; no explicit QI(IID_IMediaFilter)
+        // is required.
+        let r_pause = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            self.filter,
+            crate::com::SLOT_MEDIAFILTER_PAUSE,
+            &[],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IMediaFilter::Pause trapped: {e}"
+            ))
+        })?;
+        log::debug!("vfw discovery (DShow): IMediaFilter::Pause → {r_pause:#010x}");
+
+        // `IMediaFilter::Run(REFERENCE_TIME tStart)` — `tStart` is
+        // a 64-bit integer marshalled as two adjacent dwords on the
+        // stdcall stack (low dword first, high dword next).  We
+        // start the stream at t=0.
+        let r_run = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            self.filter,
+            crate::com::SLOT_MEDIAFILTER_RUN,
+            &[0, 0],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IMediaFilter::Run trapped: {e}"
+            ))
+        })?;
+        log::debug!("vfw discovery (DShow): IMediaFilter::Run(0) → {r_run:#010x}");
+
         Ok(())
     }
 }
 
 /// Round 31 — find a PIN_OUTPUT pin on the codec filter (skipping
 /// `skip` which is already-bound input).  Returns `None` if the
-/// filter has no output pin.
+/// filter has no output pin.  Round 32 unifies on
+/// [`pin_with_direction`].
 fn first_output_pin_dshow(sb: &mut crate::Sandbox, filter: u32, skip: u32) -> Option<u32> {
-    use crate::com::call::call_method;
-    // Walk EnumPins to gather all pin pointers.
-    let mut pins = Vec::new();
-    let scratch = sb.host.arena_alloc(8).ok()?;
-    let _ = sb.mmu.write_initializer(scratch, &[0u8; 8]);
-    let r = call_method(
-        &mut sb.cpu,
-        &mut sb.mmu,
-        &sb.registry,
-        &mut sb.host,
-        filter,
-        crate::com::SLOT_BASEFILTER_ENUM_PINS,
-        &[scratch],
-    );
-    let pp = sb.mmu.load32(scratch).unwrap_or(0);
-    if !matches!(r, Ok(0)) || pp == 0 {
-        return None;
-    }
-    sb.host.com.intern(pp, None);
-    for _ in 0..16 {
-        let pin_slot = sb.host.arena_alloc(8).ok()?;
-        let _ = sb.mmu.write_initializer(pin_slot, &[0u8; 8]);
-        let r = call_method(
-            &mut sb.cpu,
-            &mut sb.mmu,
-            &sb.registry,
-            &mut sb.host,
-            pp,
-            3, // IEnumPins::Next
-            &[1, pin_slot, pin_slot + 4],
-        );
-        let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
-        let fetched = sb.mmu.load32(pin_slot + 4).unwrap_or(0);
-        if !matches!(r, Ok(0) | Ok(1)) || pin == 0 || fetched == 0 {
-            break;
-        }
-        sb.host.com.intern(pin, None);
-        pins.push(pin);
-        if matches!(r, Ok(1)) {
-            break;
-        }
-    }
-    let _ = sb.com_release(pp);
-    for pin in pins {
-        if pin == skip {
-            continue;
-        }
-        let dir_slot = sb.host.arena_alloc(4).ok()?;
-        let _ = sb.mmu.write_initializer(dir_slot, &0u32.to_le_bytes());
-        let r = call_method(
-            &mut sb.cpu,
-            &mut sb.mmu,
-            &sb.registry,
-            &mut sb.host,
-            pin,
-            9, // IPin::QueryDirection
-            &[dir_slot],
-        );
-        if !matches!(r, Ok(0)) {
-            continue;
-        }
-        let dir = sb.mmu.load32(dir_slot).unwrap_or(0);
-        if dir == 1 {
-            return Some(pin);
-        }
-    }
-    None
+    pin_with_direction(sb, filter, crate::com::PIN_DIRECTION_OUTPUT, Some(skip))
 }
 
 /// Stage a downstream RGB24 AM_MEDIA_TYPE.  Used by round 31 B.
@@ -1083,12 +1088,40 @@ fn stage_am_media_type_dshow(
     Ok(amt)
 }
 
-/// Walk the codec's IBaseFilter::EnumPins → IEnumPins::Next chain
-/// for the first pin (assumed to be the input pin — DirectShow
-/// convention is input pins enumerate first, output pins next).
+/// Round 32 — walk every pin the codec exposes via
+/// `IBaseFilter::EnumPins → IEnumPins::Next`, query each for its
+/// direction (`IPin::QueryDirection(PIN_DIRECTION*)` — slot 9),
+/// and return the *first* pin that reports `PIN_INPUT (0)`.
+///
+/// Round 30 (and r31) returned the *first enumerated* pin and
+/// trusted DirectShow's "input pins enumerate first" convention.
+/// Some codecs (e.g. `mpg4ds32`) violate this — their first pin
+/// is non-input, which causes downstream `EnumMediaTypes` to
+/// return `E_NOTIMPL` and `ReceiveConnection` to reject every
+/// AMT.  Walking + filtering by `QueryDirection` is the canonical
+/// MSDN recipe.
+///
+/// Reference: MSDN — "IPin::QueryDirection" + `PIN_DIRECTION`
+/// enum (`PINDIR_INPUT = 0`, `PINDIR_OUTPUT = 1`).  Source:
+/// `strmif.h` from the Windows SDK.
 fn first_input_pin(sb: &mut crate::Sandbox, filter: u32) -> Option<u32> {
+    pin_with_direction(sb, filter, crate::com::PIN_DIRECTION_INPUT, None)
+}
+
+/// Walk every pin on `filter` via EnumPins/Next; for each pin
+/// that reports `direction`, return it (skipping `skip` if any).
+/// Released enumerator + non-matching pin objects on the way.
+fn pin_with_direction(
+    sb: &mut crate::Sandbox,
+    filter: u32,
+    direction: u32,
+    skip: Option<u32>,
+) -> Option<u32> {
     use crate::com::call::call_method;
-    // Stop the filter so ReceiveConnection is legal.
+    // Stop the filter so ReceiveConnection is legal in the caller's
+    // subsequent flow (matches the round-30 behaviour for the input
+    // pin path; harmless on output-pin probing — codec is already
+    // stopped at construction time).
     let _ = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
@@ -1098,8 +1131,8 @@ fn first_input_pin(sb: &mut crate::Sandbox, filter: u32) -> Option<u32> {
         crate::com::SLOT_BASEFILTER_STOP,
         &[],
     );
-    let scratch = sb.host.arena_alloc(8).ok()?;
-    sb.mmu.write_initializer(scratch, &[0u8; 8]).ok()?;
+    let scratch = sb.host.arena_alloc(4).ok()?;
+    sb.mmu.write_initializer(scratch, &[0u8; 4]).ok()?;
     let r = call_method(
         &mut sb.cpu,
         &mut sb.mmu,
@@ -1114,27 +1147,78 @@ fn first_input_pin(sb: &mut crate::Sandbox, filter: u32) -> Option<u32> {
         return None;
     }
     sb.host.com.intern(pp, None);
-    let pin_slot = sb.host.arena_alloc(8).ok()?;
-    sb.mmu.write_initializer(pin_slot, &[0u8; 8]).ok()?;
-    let _ = call_method(
-        &mut sb.cpu,
-        &mut sb.mmu,
-        &sb.registry,
-        &mut sb.host,
-        pp,
-        3, // IEnumPins::Next
-        &[1, pin_slot, pin_slot + 4],
-    );
-    let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
-    if pin != 0 {
-        sb.host.com.intern(pin, None);
+
+    // Walk Next() up to 16 times, capturing every pin pointer.
+    let mut pins: Vec<u32> = Vec::new();
+    for _ in 0..16 {
+        let pin_slot = sb.host.arena_alloc(8).ok()?;
+        sb.mmu.write_initializer(pin_slot, &[0u8; 8]).ok()?;
+        let r = call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            pp,
+            crate::com::SLOT_ENUMPINS_NEXT,
+            &[1, pin_slot, pin_slot + 4],
+        );
+        let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
+        let fetched = sb.mmu.load32(pin_slot + 4).unwrap_or(0);
+        match r {
+            Ok(0) if pin != 0 && fetched == 1 => {
+                sb.host.com.intern(pin, None);
+                pins.push(pin);
+            }
+            Ok(1) => {
+                // S_FALSE — possibly with one last pin populated.
+                if pin != 0 && fetched == 1 {
+                    sb.host.com.intern(pin, None);
+                    pins.push(pin);
+                }
+                break;
+            }
+            _ => break,
+        }
     }
     let _ = sb.com_release(pp);
-    if pin == 0 {
-        None
-    } else {
-        Some(pin)
+
+    // Pick the first pin matching `direction` (skipping `skip`).
+    let mut chosen: Option<u32> = None;
+    for &pin in &pins {
+        if let Some(s) = skip {
+            if pin == s {
+                continue;
+            }
+        }
+        let dir_slot = sb.host.arena_alloc(4).ok()?;
+        let _ = sb.mmu.write_initializer(dir_slot, &0xFFu32.to_le_bytes());
+        let r = call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            pin,
+            crate::com::SLOT_PIN_QUERY_DIRECTION,
+            &[dir_slot],
+        );
+        if !matches!(r, Ok(0)) {
+            continue;
+        }
+        let dir = sb.mmu.load32(dir_slot).unwrap_or(u32::MAX);
+        if dir == direction {
+            chosen = Some(pin);
+            break;
+        }
     }
+    // Release every pin we won't return (the chosen one stays
+    // owned by the caller).
+    for pin in pins {
+        if Some(pin) == chosen {
+            continue;
+        }
+        let _ = sb.com_release(pin);
+    }
+    chosen
 }
 
 impl Decoder for SandboxedDshowDecoder {
@@ -1192,7 +1276,7 @@ impl Decoder for SandboxedDshowDecoder {
             &sb.registry,
             &mut sb.host,
             self.host_allocator,
-            7, // SLOT_MEMALLOCATOR_GET_BUFFER
+            crate::com::SLOT_MEMALLOCATOR_GET_BUFFER,
             &[pp, 0, 0, 0],
         )
         .map_err(|e| Error::other(format!("vfw discovery (DShow): GetBuffer trapped: {e}")))?;
@@ -1230,7 +1314,7 @@ impl Decoder for SandboxedDshowDecoder {
             &sb.registry,
             &mut sb.host,
             mip,
-            6, // SLOT_MEMINPUTPIN_RECEIVE
+            crate::com::SLOT_MEMINPUTPIN_RECEIVE,
             &[sample],
         )
         .map_err(|e| Error::other(format!("vfw discovery (DShow): Receive trapped: {e}")))?;

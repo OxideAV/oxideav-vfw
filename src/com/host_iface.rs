@@ -321,8 +321,15 @@ pub fn register(registry: &mut Registry) {
 // | obj    | vtbl_ptr (= obj + 16)                     |
 // | obj+4  | refcount = 1                              |
 // | obj+8  | sample_pool_head (= guest VA of first sample, 0 if not yet minted) |
-// | obj+12 | reserved                                   |
+// | obj+12 | committed flag (0 = decommitted, 1 = committed) — round 32 |
 // | obj+16 | vtbl[0..9] (36 bytes; rest of 96 unused)  |
+//
+// Round 32 — Commit/Decommit state machine (per IMemAllocator
+// MSDN semantics): the allocator starts decommitted; GetBuffer
+// returns VFW_E_NOT_COMMITTED until Commit() flips obj+12 to 1.
+// Decommit() flips it back to 0. ReleaseBuffer is allowed in
+// either state (codec may still hold samples it acquired before
+// Decommit).
 //
 // HostIMediaSample @ obj (64 bytes header + payload region):
 // | offset | content                                   |
@@ -1124,25 +1131,49 @@ fn alloc_get_properties(
     Ok(S_OK)
 }
 
-/// `IMemAllocator::Commit(this)` — make the pool active. No-op
-/// for the host pool (memory is permanently mapped). Returns S_OK.
+/// `IMemAllocator::Commit(this)` — round 32 transitions the
+/// allocator from *decommitted* to *committed*. Sets the flag at
+/// `obj+12` to 1; subsequent `GetBuffer` calls observe live state.
+/// Idempotent (re-committing an already-committed allocator
+/// returns S_OK without side effects). Returns S_OK.
+///
+/// Per MSDN
+/// <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imemallocator-commit>
+/// — Commit() is the canonical way for an upstream filter to
+/// "lock in" the pool shape that `SetProperties()` requested,
+/// after which downstream filters' `Receive()` calls may legally
+/// observe samples drawn from the pool.
 fn alloc_commit(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    mmu.write_initializer(this + 12, &1u32.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::Commit", t))?;
     Ok(S_OK)
 }
 
-/// `IMemAllocator::Decommit(this)` — release pool memory. No-op
-/// (we keep the arena allocations around for the test's lifetime).
+/// `IMemAllocator::Decommit(this)` — round 32 transitions the
+/// allocator back to *decommitted*. Sets the flag at `obj+12` to
+/// 0; subsequent `GetBuffer` calls return VFW_E_NOT_COMMITTED
+/// until the next `Commit()`.
+///
+/// Per MSDN
+/// <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imemallocator-decommit>
+/// — Decommit() unwinds the Commit(); the host pool memory is
+/// permanently mapped (no actual deallocation), but the state
+/// flag enforces the contract.
 fn alloc_decommit(
-    _cpu: &mut Cpu,
-    _mmu: &mut Mmu,
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    mmu.write_initializer(this + 12, &0u32.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::Decommit", t))?;
     Ok(S_OK)
 }
 
@@ -1154,6 +1185,12 @@ fn alloc_decommit(
 /// looking for a sample with `in_use == 0` (offset +36); mark it
 /// in-use, store its address into `*ppBuffer`, return S_OK. If
 /// the pool is exhausted return `VFW_E_TIMEOUT = 0x80040211`.
+///
+/// Round 32 — refuses to return a buffer when the allocator is
+/// in the *decommitted* state (`obj+12 == 0`); returns
+/// `VFW_E_NOT_COMMITTED = 0x80040209`. Codecs that QI for
+/// IMemAllocator and check Commit state before pushing samples
+/// downstream depend on this check.
 fn alloc_get_buffer(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1168,6 +1205,13 @@ fn alloc_get_buffer(
         return Ok(crate::com::E_POINTER);
     }
     let _ = mmu.write_initializer(pp, &0u32.to_le_bytes());
+    // Round 32 — gate on Commit state.
+    let committed = mmu
+        .load32(this + 12)
+        .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+    if committed == 0 {
+        return Ok(0x8004_0209 /* VFW_E_NOT_COMMITTED */);
+    }
     let mut cur = mmu
         .load32(this + 8)
         .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;

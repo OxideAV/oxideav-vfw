@@ -8,6 +8,68 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 32 — **close the DirectShow decode loop end-to-end:
+  `IMediaFilter::Run(0)` drive + `HostIMemAllocator::Commit` state
+  machine + `IPin::QueryDirection` filter on `first_input_pin`.**
+  - **A.** `SandboxedDshowDecoder::ensure_open` now drives
+    `IMediaFilter::Pause()` (slot 5) → `IMediaFilter::Run(0)`
+    (slot 6) against the codec filter after `NotifyAllocator` so
+    the codec transitions out of `State_Stopped` before
+    `IMemInputPin::Receive`. Slots are reachable directly via the
+    `IBaseFilter` pointer because `IBaseFilter` extends
+    `IMediaFilter` (no explicit QI(IID_IMediaFilter) needed).
+  - **B.** `HostIMemAllocator` now tracks a per-instance commit
+    flag in guest memory (`obj+12`: 0 = decommitted, 1 = committed).
+    `Commit()` flips the flag to 1; `Decommit()` flips it back to 0;
+    `GetBuffer()` returns `VFW_E_NOT_COMMITTED (0x80040209)` while
+    decommitted, regardless of pool state. The newly-minted
+    allocator starts decommitted to match real `IMemAllocator`
+    semantics; `ensure_open` Commit()s it explicitly before driving
+    the first `Receive`. Round-30's GetBuffer-after-mint test was
+    updated to drive Commit first.
+  - **C.** `first_input_pin` (and the new `pin_with_direction`
+    helper used by both `first_input_pin` and `first_output_pin_dshow`)
+    now walks every pin via `IBaseFilter::EnumPins → IEnumPins::Next`,
+    queries each for `IPin::QueryDirection(PIN_DIRECTION*)`
+    (slot 9), and picks the first pin reporting the requested
+    direction (`PIN_INPUT = 0` / `PIN_OUTPUT = 1`). This replaces
+    the historic "input pins enumerate first" heuristic, which
+    `mpg4ds32` violated (its first enumerated pin was non-input,
+    causing downstream `EnumMediaTypes` to return `E_NOTIMPL` and
+    `ReceiveConnection` to reject every AMT). Non-chosen pins are
+    Released on the way out.
+  - New public constants in `crate::com`: `SLOT_MEDIAFILTER_{STOP,
+    PAUSE, RUN, GET_STATE}` (= IBaseFilter slots — IBaseFilter
+    extends IMediaFilter), `SLOT_MEMALLOCATOR_{SET_PROPERTIES,
+    COMMIT, DECOMMIT, GET_BUFFER, RELEASE_BUFFER}`,
+    `SLOT_MEMINPUTPIN_{NOTIFY_ALLOCATOR, RECEIVE}`,
+    `SLOT_PIN_{RECEIVE_CONNECTION, QUERY_DIRECTION,
+    ENUM_MEDIA_TYPES}`, `SLOT_ENUMPINS_NEXT`,
+    `PIN_DIRECTION_{INPUT, OUTPUT}`, `VFW_E_NOT_COMMITTED`,
+    `VFW_E_TIMEOUT`, `VFW_E_NO_ALLOCATOR`. Replaces magic-number
+    slot literals throughout `discovery::codec`.
+  - New `tests/round32_dshow_run_commit_querydir.rs` — 5 tests:
+    decommitted-on-mint allocator rejects GetBuffer; Commit /
+    Decommit round-trip toggles the state; the new
+    `SLOT_MEDIAFILTER_*` constants alias their `SLOT_BASEFILTER_*`
+    siblings; HostIPin output role + input role report distinct
+    directions (PIN_OUTPUT / PIN_INPUT); end-to-end DShow trait
+    path against MPG4DS32.AX exercises Run+Commit+QueryDir without
+    panicking. Test count: 499 → 504.
+- Round 31 — **`IPin::EnumMediaTypes` walk + downstream
+  `HostIPin::Receive` capture.** New `crate::com::host_iface_r31`
+  module mints paired (HostIPin (input role), HostIMemInputPin)
+  + HostIBaseFilter + HostIEnumPins; `HostIMemInputPin::Receive`
+  re-enters the guest to read `IMediaSample::GetActualDataLength /
+  GetPointer / GetTime / IsSyncPoint / GetMediaType` and queues
+  the captured bytes onto a per-`HostState` FIFO. New
+  `walk_codec_input_pin_amts` drives `IPin::EnumMediaTypes →
+  IEnumMediaTypes::Next` against the codec's input pin and
+  captures every advertised AMT. `SandboxedDshowDecoder::ensure_open`
+  prefers codec-native AMTs over the synth fabrication when any
+  surface; falls back to the synth AMT only when every codec-native
+  candidate is rejected.
+
 - Round 30 — **two sub-goals: DirectShow IMemAllocator + IMediaSample
   host stubs (sub-goal A) + Indeo / Cinepak fixture-driven trait
   tests + ICM_DECOMPRESS_GET_FORMAT dimension probe (sub-goal B).**

@@ -456,6 +456,68 @@ pub const SLOT_BASEFILTER_FIND_PIN: u32 = 11;
 /// LPCWSTR pName)` — slot 13.
 pub const SLOT_BASEFILTER_JOIN_FILTER_GRAPH: u32 = 13;
 
+/// `IMediaFilter::Stop()` — slot 4 (after IPersist::GetClassID at
+/// slot 3).  Same numeric slot as `IBaseFilter::Stop` because
+/// `IBaseFilter` extends `IMediaFilter`.
+pub const SLOT_MEDIAFILTER_STOP: u32 = 4;
+/// `IMediaFilter::Pause()` — slot 5.
+pub const SLOT_MEDIAFILTER_PAUSE: u32 = 5;
+/// `IMediaFilter::Run(REFERENCE_TIME tStart)` — slot 6.  `tStart`
+/// is a 64-bit integer marshalled as two adjacent dwords on the
+/// stdcall stack (low dword first, high dword next).
+pub const SLOT_MEDIAFILTER_RUN: u32 = 6;
+/// `IMediaFilter::GetState(DWORD dwMilliSecsTimeout, FILTER_STATE
+/// *State)` — slot 7.
+pub const SLOT_MEDIAFILTER_GET_STATE: u32 = 7;
+
+/// `IMemAllocator::SetProperties(ALLOCATOR_PROPERTIES* pRequest,
+/// ALLOCATOR_PROPERTIES* pActual)` — slot 3.
+pub const SLOT_MEMALLOCATOR_SET_PROPERTIES: u32 = 3;
+/// `IMemAllocator::Commit()` — slot 5.
+pub const SLOT_MEMALLOCATOR_COMMIT: u32 = 5;
+/// `IMemAllocator::Decommit()` — slot 6.
+pub const SLOT_MEMALLOCATOR_DECOMMIT: u32 = 6;
+/// `IMemAllocator::GetBuffer(IMediaSample** ppBuffer,
+/// REFERENCE_TIME* pStartTime, REFERENCE_TIME* pEndTime,
+/// DWORD dwFlags)` — slot 7.
+pub const SLOT_MEMALLOCATOR_GET_BUFFER: u32 = 7;
+/// `IMemAllocator::ReleaseBuffer(IMediaSample* pBuffer)` — slot 8.
+pub const SLOT_MEMALLOCATOR_RELEASE_BUFFER: u32 = 8;
+
+/// `IMemInputPin::NotifyAllocator(IMemAllocator*, BOOL bReadOnly)`
+/// — slot 4.
+pub const SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR: u32 = 4;
+/// `IMemInputPin::Receive(IMediaSample*)` — slot 6.
+pub const SLOT_MEMINPUTPIN_RECEIVE: u32 = 6;
+
+/// `IPin::ReceiveConnection(IPin* pConnector, AM_MEDIA_TYPE* pmt)`
+/// — slot 4.
+pub const SLOT_PIN_RECEIVE_CONNECTION: u32 = 4;
+/// `IPin::QueryDirection(PIN_DIRECTION*)` — slot 9. Codec-side
+/// pins return `PIN_INPUT (0)` or `PIN_OUTPUT (1)`.
+pub const SLOT_PIN_QUERY_DIRECTION: u32 = 9;
+/// `IPin::EnumMediaTypes(IEnumMediaTypes**)` — slot 12.
+pub const SLOT_PIN_ENUM_MEDIA_TYPES: u32 = 12;
+
+/// `IEnumPins::Next(ULONG cPins, IPin** ppPins, ULONG* pcFetched)`
+/// — slot 3.
+pub const SLOT_ENUMPINS_NEXT: u32 = 3;
+
+/// `PIN_DIRECTION` enum: input pin.  Source: `strmif.h` `PINDIR_INPUT`.
+pub const PIN_DIRECTION_INPUT: u32 = 0;
+/// `PIN_DIRECTION` enum: output pin.
+pub const PIN_DIRECTION_OUTPUT: u32 = 1;
+
+/// `VFW_E_NOT_COMMITTED = 0x80040209` — IMemAllocator::GetBuffer
+/// returns this when the allocator has not been Commit()'d.
+pub const VFW_E_NOT_COMMITTED: u32 = 0x8004_0209;
+/// `VFW_E_NOT_CONNECTED = 0x80040209`'s sibling at 0x80040211 —
+/// also reused by IMemAllocator::GetBuffer for "pool exhausted"
+/// in our host stub (real DShow uses `VFW_E_TIMEOUT` here).
+pub const VFW_E_TIMEOUT: u32 = 0x8004_0211;
+/// `VFW_E_NO_ALLOCATOR = 0x80040261`.
+pub const VFW_E_NO_ALLOCATOR: u32 = 0x8004_0261;
+
 // ---- Host-side object-handle table -------------------------------------
 //
 // Round-25 stage 1 keeps this minimal: a counter for how many
