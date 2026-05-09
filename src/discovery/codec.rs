@@ -552,6 +552,15 @@ struct SandboxedDshowDecoder {
     fourcc_bytes: [u8; 4],
     pending: Option<Packet>,
     eof: bool,
+    /// Round 33 — `IMediaFilter::GetState` HRESULT observed
+    /// immediately after `Run(0)`.  `S_OK` (0) means the
+    /// transition completed; `VFW_S_STATE_INTERMEDIATE`
+    /// (0x00040003) means the filter is still transitioning.
+    last_get_state_hr: u32,
+    /// Round 33 — `FILTER_STATE` value the codec wrote into
+    /// `*pState` from the same `GetState` call.  Per MSDN:
+    /// `State_Stopped=0`, `State_Paused=1`, `State_Running=2`.
+    last_get_state_value: u32,
 }
 
 impl SandboxedDshowDecoder {
@@ -581,7 +590,25 @@ impl SandboxedDshowDecoder {
             fourcc_bytes,
             pending: None,
             eof: false,
+            last_get_state_hr: 0xFFFF_FFFF,
+            last_get_state_value: 0xFFFF_FFFF,
         })
+    }
+
+    /// Round 33 — `IMediaFilter::GetState` HRESULT observed
+    /// immediately after `Run(0)` (or `0xFFFF_FFFF` if the codec
+    /// has not yet been driven through `Run`).
+    #[allow(dead_code)]
+    fn last_get_state_hr(&self) -> u32 {
+        self.last_get_state_hr
+    }
+
+    /// Round 33 — `FILTER_STATE` value the codec wrote into
+    /// `*pState` from the same `GetState` call.  `0xFFFF_FFFF`
+    /// when not-yet-probed.
+    #[allow(dead_code)]
+    fn last_get_state_value(&self) -> u32 {
+        self.last_get_state_value
     }
 
     fn ensure_open(&mut self) -> Result<()> {
@@ -903,6 +930,52 @@ impl SandboxedDshowDecoder {
             ))
         })?;
         log::debug!("vfw discovery (DShow): IMediaFilter::Run(0) → {r_run:#010x}");
+
+        // Round 33 B — drive `IMediaFilter::GetState(1000ms,
+        // FILTER_STATE*)` to confirm the codec actually
+        // transitioned into `State_Running (2)`.  Per MSDN
+        // <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imediafilter-getstate>,
+        // GetState blocks for up to `dwMilliSecsTimeout` waiting
+        // for any pending state transition to complete.  HRESULT
+        // is `S_OK (0)` on completion or
+        // `VFW_S_STATE_INTERMEDIATE (0x00040003)` if the
+        // transition is still in flight.  Many codecs simply
+        // return E_NOTIMPL because they do not maintain explicit
+        // state — that's fine, we just record what we see.
+        let state_slot = sb.host.arena_alloc(4).map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IMediaFilter::GetState arena: {e}"
+            ))
+        })?;
+        sb.mmu
+            .write_initializer(state_slot, &0xFFFF_FFFFu32.to_le_bytes())
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): IMediaFilter::GetState seed: {e}"
+                ))
+            })?;
+        let r_state = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            self.filter,
+            crate::com::SLOT_MEDIAFILTER_GET_STATE,
+            &[1000, state_slot],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IMediaFilter::GetState trapped: {e}"
+            ))
+        })?;
+        let state_value = sb.mmu.load32(state_slot).unwrap_or(0xFFFF_FFFF);
+        self.last_get_state_hr = r_state;
+        self.last_get_state_value = state_value;
+        log::debug!(
+            "vfw discovery (DShow): IMediaFilter::GetState(1000ms) \
+             → hr={r_state:#010x}, state={state_value:#010x} \
+             (Stopped=0, Paused=1, Running=2)"
+        );
 
         Ok(())
     }

@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 33 — **pursue all three round-32 follow-ups: real MP43
+  keyframe, `IMediaFilter::GetState` drive, `SetProperties`
+  capture.**
+  - **A.** New integration test
+    `tests/round33_dshow_real_mp43.rs` extracts the real
+    MS-MPEG-4-v3 keyframe sample 0 from
+    `docs/video/msmpeg4-fixtures/fourcc-MP43/input.avi` (176×144,
+    183-byte payload — same bitstream the VfW path decodes
+    bit-perfectly) via the existing `common::avi_extractor` walker
+    and feeds it into `SandboxedDshowDecoder` through the public
+    `oxideav_core::Decoder` trait.  Falls back to the gop-30 /
+    DIV3-tagged 352×288 fixture if the explicit-MP43 fixture is
+    missing.  The test confirms the path no longer panics and
+    surfaces a DShow-pathway diagnostic; the codec currently still
+    returns `VFW_E_NOT_COMMITTED` from `IMemInputPin::Receive`
+    (suggesting it walks its own internal allocator rather than
+    the host-supplied one — round-34 candidate).
+  - **B.** `SandboxedDshowDecoder::ensure_open` now drives
+    `IMediaFilter::GetState(1000ms, FILTER_STATE*)` immediately
+    after `Run(0)` and stashes both the HRESULT and the
+    `FILTER_STATE` value into `last_get_state_hr` /
+    `last_get_state_value` private fields for diagnostic logging.
+    New public constants in `crate::com`:
+    `FILTER_STATE_{STOPPED, PAUSED, RUNNING}` (per `strmif.h`
+    `FILTER_STATE` enum), `VFW_S_STATE_INTERMEDIATE`,
+    `VFW_S_CANT_CUE`.
+  - **C.** `HostIMemAllocator::SetProperties` now captures the
+    four `ALLOCATOR_PROPERTIES` LONG fields (cBuffers / cbBuffer /
+    cbAlign / cbPrefix) plus the `this` pointer into a per-
+    `HostState` log via the same static-mutex pattern the round-31
+    `host_iface_r31` queue uses.  Surfaced through new
+    `Sandbox::{last_set_properties, all_set_properties,
+    clear_set_properties_log}` accessors and the public
+    `crate::com::AllocatorPropertiesCapture` struct.  Tests can
+    now assert exactly what shape a codec asks for.
+  - +10 tests (one DShow trait integration test + one host
+    SetProperties unit test + one constants smoke test + 7
+    re-runs of the avi_extractor unit module).
+
 - Round 32 — **close the DirectShow decode loop end-to-end:
   `IMediaFilter::Run(0)` drive + `HostIMemAllocator::Commit` state
   machine + `IPin::QueryDirection` filter on `first_input_pin`.**

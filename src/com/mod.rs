@@ -58,8 +58,9 @@ pub mod host_iface_r31;
 
 pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
-    media_sample_set_payload, mint_host_filter_graph, mint_host_media_sample,
-    mint_host_mem_allocator,
+    all_set_properties, clear_set_properties_log, last_set_properties, media_sample_set_payload,
+    mint_host_filter_graph, mint_host_media_sample, mint_host_mem_allocator,
+    AllocatorPropertiesCapture,
 };
 
 /// Canonical 128-bit globally-unique identifier.  Layout matches
@@ -507,6 +508,25 @@ pub const SLOT_ENUMPINS_NEXT: u32 = 3;
 pub const PIN_DIRECTION_INPUT: u32 = 0;
 /// `PIN_DIRECTION` enum: output pin.
 pub const PIN_DIRECTION_OUTPUT: u32 = 1;
+
+/// `FILTER_STATE` enum value `State_Stopped = 0` (per `strmif.h`).
+/// `IMediaFilter::GetState` returns this when the filter is not
+/// running and not paused.
+pub const FILTER_STATE_STOPPED: u32 = 0;
+/// `FILTER_STATE` enum value `State_Paused = 1`.
+pub const FILTER_STATE_PAUSED: u32 = 1;
+/// `FILTER_STATE` enum value `State_Running = 2`.
+pub const FILTER_STATE_RUNNING: u32 = 2;
+
+/// `VFW_S_STATE_INTERMEDIATE = 0x00040003` —
+/// `IMediaFilter::GetState` returns this when the filter is
+/// transitioning (caller should retry, possibly with a longer
+/// timeout).  See MSDN
+/// <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imediafilter-getstate>.
+pub const VFW_S_STATE_INTERMEDIATE: u32 = 0x0004_0003;
+/// `VFW_S_CANT_CUE = 0x00040004` — Run() returned but the filter
+/// graph could not seek; non-fatal.
+pub const VFW_S_CANT_CUE: u32 = 0x0004_0004;
 
 /// `VFW_E_NOT_COMMITTED = 0x80040209` — IMemAllocator::GetBuffer
 /// returns this when the allocator has not been Commit()'d.

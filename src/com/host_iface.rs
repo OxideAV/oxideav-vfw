@@ -1063,18 +1063,31 @@ fn alloc_qi(
 }
 
 /// `IMemAllocator::SetProperties(this, ALLOCATOR_PROPERTIES* pRequest,
-/// ALLOCATOR_PROPERTIES* pActual)`. We pretend to accept whatever
-/// the codec asks for: copy `pRequest` into `pActual` and return
-/// `S_OK`. The codec never re-reads our pool with the new
-/// properties — round 30's payload is staged before
-/// `NotifyAllocator`.
+/// ALLOCATOR_PROPERTIES* pActual)`.
+///
+/// `ALLOCATOR_PROPERTIES` layout (per `strmif.h`):
+///
+/// ```c
+/// typedef struct _AllocatorProperties {
+///   long cBuffers;
+///   long cbBuffer;
+///   long cbAlign;
+///   long cbPrefix;
+/// } ALLOCATOR_PROPERTIES;
+/// ```
+///
+/// We accept whatever the codec asks for (copy `pRequest` into
+/// `pActual` and return `S_OK`).  Round 33 — additionally captures
+/// the four LONG fields into a host-side per-`HostState` log via
+/// [`record_set_properties`], so tests / decoder paths can inspect
+/// what shape `mpg4ds32` (or any codec) actually requested.
 fn alloc_set_properties(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
-    _state: &mut HostState,
+    state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
-    let _this = arg(cpu, mmu, 0)?;
+    let this = arg(cpu, mmu, 0)?;
     let p_request = arg(cpu, mmu, 1)?;
     let p_actual = arg(cpu, mmu, 2)?;
     if p_actual != 0 && p_request != 0 {
@@ -1086,7 +1099,100 @@ fn alloc_set_properties(
                 .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
         }
     }
+    // Round 33 — capture the codec-requested allocator shape.
+    if p_request != 0 {
+        let c_buffers = mmu
+            .load32(p_request)
+            .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+        let cb_buffer = mmu
+            .load32(p_request + 4)
+            .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+        let cb_align = mmu
+            .load32(p_request + 8)
+            .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+        let cb_prefix = mmu
+            .load32(p_request + 12)
+            .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+        record_set_properties(
+            state,
+            AllocatorPropertiesCapture {
+                this,
+                c_buffers,
+                cb_buffer,
+                cb_align,
+                cb_prefix,
+            },
+        );
+    }
     Ok(S_OK)
+}
+
+/// One `IMemAllocator::SetProperties` capture — the four LONG
+/// fields of `ALLOCATOR_PROPERTIES` plus the `this` pointer of the
+/// allocator the codec called us through.  Round 33 logs every call
+/// so the decoder path can introspect what `mpg4ds32` asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorPropertiesCapture {
+    /// Guest VA of the host allocator the codec called us through.
+    pub this: u32,
+    /// `cBuffers` — number of pool slots requested.
+    pub c_buffers: u32,
+    /// `cbBuffer` — bytes per sample.
+    pub cb_buffer: u32,
+    /// `cbAlign` — required byte alignment.
+    pub cb_align: u32,
+    /// `cbPrefix` — pre-payload header bytes the codec wants to
+    /// reserve in front of every sample's data region.
+    pub cb_prefix: u32,
+}
+
+/// Per-`HostState` capture log of every `SetProperties` call the
+/// codec drove against any host allocator.  Lives behind a static
+/// mutex keyed by `&HostState as usize` (same pattern the round-31
+/// `host_iface_r31` queue uses).
+fn set_properties_log(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<AllocatorPropertiesCapture>>> {
+    static L: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, Vec<AllocatorPropertiesCapture>>>,
+    > = std::sync::OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn host_key(state: &HostState) -> usize {
+    state as *const HostState as usize
+}
+
+fn record_set_properties(state: &HostState, cap: AllocatorPropertiesCapture) {
+    if let Ok(mut l) = set_properties_log().lock() {
+        l.entry(host_key(state)).or_default().push(cap);
+    }
+}
+
+/// Return the most recent `SetProperties` capture observed for
+/// `state`, or `None` if no codec has called `SetProperties` yet.
+pub fn last_set_properties(state: &HostState) -> Option<AllocatorPropertiesCapture> {
+    set_properties_log()
+        .lock()
+        .ok()
+        .and_then(|l| l.get(&host_key(state)).and_then(|v| v.last().copied()))
+}
+
+/// Return every `SetProperties` capture observed for `state`, in
+/// arrival order.  Empty `Vec` if no codec has called yet.
+pub fn all_set_properties(state: &HostState) -> Vec<AllocatorPropertiesCapture> {
+    set_properties_log()
+        .lock()
+        .ok()
+        .map(|l| l.get(&host_key(state)).cloned().unwrap_or_default())
+        .unwrap_or_default()
+}
+
+/// Drop every captured `SetProperties` for `state`.  Tests call
+/// this to reset the per-sandbox state between scenarios.
+pub fn clear_set_properties_log(state: &HostState) {
+    if let Ok(mut l) = set_properties_log().lock() {
+        l.remove(&host_key(state));
+    }
 }
 
 /// `IMemAllocator::GetProperties(this, ALLOCATOR_PROPERTIES* pProps)`.

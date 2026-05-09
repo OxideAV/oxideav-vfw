@@ -671,6 +671,27 @@ impl Sandbox {
         crate::com::host_iface_r31::queue_len(&self.host)
     }
 
+    /// Round 33 — return the most recent
+    /// `IMemAllocator::SetProperties` capture observed on this
+    /// sandbox, or `None` if no codec has called `SetProperties`
+    /// yet.  See [`crate::com::AllocatorPropertiesCapture`] for
+    /// the captured field shape.
+    pub fn last_set_properties(&self) -> Option<crate::com::AllocatorPropertiesCapture> {
+        crate::com::last_set_properties(&self.host)
+    }
+
+    /// Round 33 — return every `SetProperties` capture observed on
+    /// this sandbox, in arrival order.
+    pub fn all_set_properties(&self) -> Vec<crate::com::AllocatorPropertiesCapture> {
+        crate::com::all_set_properties(&self.host)
+    }
+
+    /// Round 33 — drop every captured `SetProperties` for this
+    /// sandbox.  Useful for resetting per-test state.
+    pub fn clear_set_properties_log(&self) {
+        crate::com::clear_set_properties_log(&self.host)
+    }
+
     /// Drive `obj->AddRef()`.  Returns the codec-reported new
     /// refcount; the host's bookkeeping is updated automatically.
     pub fn com_add_ref(&mut self, obj: u32) -> Result<u32, crate::Error> {
