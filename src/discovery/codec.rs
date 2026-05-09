@@ -66,6 +66,50 @@ pub fn lookup_record(codec_id: &str) -> Option<DiscoveryRecord> {
     t.get(codec_id).cloned()
 }
 
+/// Round 34 — outcome of `SandboxedDshowDecoder::ensure_open`'s
+/// codec-allocator negotiation handshake.  Captured globally
+/// (keyed on `codec_id`) so tests can introspect what
+/// `IMemInputPin::GetAllocator + SetProperties + Commit` did
+/// against the codec's own allocator without having to construct
+/// a parallel sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecAllocatorNegotiation {
+    /// `IMemInputPin::GetAllocator` HRESULT.
+    pub get_allocator_hr: u32,
+    /// Allocator interface pointer the codec wrote into `*pp`,
+    /// or `0` if NULL / GetAllocator failed.
+    pub codec_allocator: u32,
+    /// `IMemAllocator::SetProperties` HRESULT against the codec's
+    /// allocator, or `0xFFFF_FFFF` if not attempted.
+    pub set_properties_hr: u32,
+    /// `IMemAllocator::Commit` HRESULT against the codec's
+    /// allocator, or `0xFFFF_FFFF` if not attempted.
+    pub commit_hr: u32,
+    /// True iff the production path elected to drive `Receive`'s
+    /// `GetBuffer` against the codec's allocator (vs the host
+    /// allocator fallback).
+    pub using_codec_allocator: bool,
+}
+
+fn negotiation_table() -> &'static std::sync::Mutex<HashMap<String, CodecAllocatorNegotiation>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CodecAllocatorNegotiation>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn record_codec_allocator_negotiation(codec_id: &str, neg: CodecAllocatorNegotiation) {
+    if let Ok(mut t) = negotiation_table().lock() {
+        t.insert(codec_id.to_string(), neg);
+    }
+}
+
+/// Round 34 — return the most recent codec-allocator negotiation
+/// outcome captured for `codec_id`, or `None` if the decoder for
+/// that id has not yet been driven through `send_packet`.
+pub fn last_codec_allocator_negotiation(codec_id: &str) -> Option<CodecAllocatorNegotiation> {
+    negotiation_table().lock().ok()?.get(codec_id).copied()
+}
+
 /// Build the canonical codec id string for a given DLL + FourCC.
 ///
 /// Format: `vfw_<lowercase-fourcc>_<dll-basename-stem-lowercase>`.
@@ -544,6 +588,23 @@ struct SandboxedDshowDecoder {
     host_graph: u32,
     /// Host IMemAllocator (after NotifyAllocator).
     host_allocator: u32,
+    /// Round 34 — codec's own allocator obtained via
+    /// `IMemInputPin::GetAllocator`.  `0` if the codec did not
+    /// expose its own allocator (returned NULL or any HRESULT
+    /// other than S_OK).  When non-zero, `receive_frame` uses
+    /// THIS allocator's `GetBuffer` rather than the host's, so
+    /// the sample bytes live in codec-managed guest memory the
+    /// codec actually walks.  Per DShow:
+    /// <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imeminputpin-getallocator>
+    /// the input pin returns its preferred allocator interface
+    /// pointer; the upstream filter may use it directly without
+    /// allocating its own.
+    codec_allocator: u32,
+    /// Round 34 — true when the codec's `GetAllocator` returned
+    /// a usable allocator AND we successfully drove
+    /// `SetProperties + Commit` on it.  Drives the
+    /// `receive_frame` allocator selection.
+    using_codec_allocator: bool,
     /// Whether ReceiveConnection has succeeded — only after that
     /// can we safely proceed to NotifyAllocator + Receive.
     connection_done: bool,
@@ -561,6 +622,17 @@ struct SandboxedDshowDecoder {
     /// `*pState` from the same `GetState` call.  Per MSDN:
     /// `State_Stopped=0`, `State_Paused=1`, `State_Running=2`.
     last_get_state_value: u32,
+    /// Round 34 — `IMemInputPin::GetAllocator` HRESULT.
+    /// `0xFFFF_FFFF` until `ensure_open` runs the call.
+    last_get_allocator_hr: u32,
+    /// Round 34 — `IMemAllocator::SetProperties` HRESULT against
+    /// the codec's own allocator.  `0xFFFF_FFFF` when GetAllocator
+    /// did not surface a usable allocator.
+    last_codec_alloc_set_properties_hr: u32,
+    /// Round 34 — `IMemAllocator::Commit` HRESULT against the
+    /// codec's own allocator.  `0xFFFF_FFFF` when GetAllocator did
+    /// not surface a usable allocator.
+    last_codec_alloc_commit_hr: u32,
 }
 
 impl SandboxedDshowDecoder {
@@ -581,6 +653,8 @@ impl SandboxedDshowDecoder {
             mem_input_pin: 0,
             host_graph: 0,
             host_allocator: 0,
+            codec_allocator: 0,
+            using_codec_allocator: false,
             connection_done: false,
             // DShow path is more permissive than VfW; default to
             // 320×240 if dims missing — the negotiation may
@@ -592,6 +666,9 @@ impl SandboxedDshowDecoder {
             eof: false,
             last_get_state_hr: 0xFFFF_FFFF,
             last_get_state_value: 0xFFFF_FFFF,
+            last_get_allocator_hr: 0xFFFF_FFFF,
+            last_codec_alloc_set_properties_hr: 0xFFFF_FFFF,
+            last_codec_alloc_commit_hr: 0xFFFF_FFFF,
         })
     }
 
@@ -609,6 +686,46 @@ impl SandboxedDshowDecoder {
     #[allow(dead_code)]
     fn last_get_state_value(&self) -> u32 {
         self.last_get_state_value
+    }
+
+    /// Round 34 — codec's own allocator obtained via
+    /// `IMemInputPin::GetAllocator`, or `0` if the codec did not
+    /// expose a usable allocator (NULL / E_NOTIMPL / SetProperties
+    /// rejection / Commit rejection).
+    #[allow(dead_code)]
+    fn codec_allocator(&self) -> u32 {
+        self.codec_allocator
+    }
+
+    /// Round 34 — true when `receive_frame` will use the codec's
+    /// own allocator (via `GetBuffer` against `codec_allocator`),
+    /// false when it falls back to the host allocator.
+    #[allow(dead_code)]
+    fn using_codec_allocator(&self) -> bool {
+        self.using_codec_allocator
+    }
+
+    /// Round 34 — `IMemInputPin::GetAllocator` HRESULT observed
+    /// during `ensure_open`.  `0xFFFF_FFFF` if not yet probed.
+    #[allow(dead_code)]
+    fn last_get_allocator_hr(&self) -> u32 {
+        self.last_get_allocator_hr
+    }
+
+    /// Round 34 — `IMemAllocator::SetProperties` HRESULT observed
+    /// when running it on the codec's allocator.  `0xFFFF_FFFF`
+    /// if the codec's allocator could not be obtained.
+    #[allow(dead_code)]
+    fn last_codec_alloc_set_properties_hr(&self) -> u32 {
+        self.last_codec_alloc_set_properties_hr
+    }
+
+    /// Round 34 — `IMemAllocator::Commit` HRESULT observed when
+    /// running it on the codec's allocator.  `0xFFFF_FFFF` if the
+    /// codec's allocator could not be obtained.
+    #[allow(dead_code)]
+    fn last_codec_alloc_commit_hr(&self) -> u32 {
+        self.last_codec_alloc_commit_hr
     }
 
     fn ensure_open(&mut self) -> Result<()> {
@@ -789,6 +906,65 @@ impl SandboxedDshowDecoder {
             })?;
         self.mem_input_pin = mip;
 
+        // Round 34 — try the codec's *own* allocator first via
+        // `IMemInputPin::GetAllocator(IMemAllocator** ppAllocator)`.
+        // Per MSDN, an input pin returns its preferred allocator
+        // there; the upstream filter then runs `SetProperties +
+        // Commit` on it and finally `NotifyAllocator(this, FALSE)`
+        // so both ends agree on which allocator to use.  Most
+        // DShow filters create their own allocator and walk it from
+        // inside `Receive` regardless of what was handed to
+        // `NotifyAllocator` — round 33's `VFW_E_NOT_COMMITTED` came
+        // from `mpg4ds32` walking *its own* uncommitted allocator
+        // (we'd Commit'd the host one, but not the codec's).
+        //
+        // The codec-allocator path is best-effort: if `GetAllocator`
+        // returns NULL, `E_NOTIMPL`, or `VFW_E_NO_ALLOCATOR`, we fall
+        // back to the existing host-allocator path which is then the
+        // sole allocator the codec sees.
+        let codec_alloc_pp = sb.host.arena_alloc(4).map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): codec_alloc out-slot arena: {e}"
+            ))
+        })?;
+        sb.mmu
+            .write_initializer(codec_alloc_pp, &0u32.to_le_bytes())
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec_alloc out-slot init: {e}"
+                ))
+            })?;
+        let r_ga = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            mip,
+            crate::com::SLOT_MEMINPUTPIN_GET_ALLOCATOR,
+            &[codec_alloc_pp],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IMemInputPin::GetAllocator trapped: {e}"
+            ))
+        })?;
+        let codec_alloc = sb.mmu.load32(codec_alloc_pp).unwrap_or(0);
+        self.last_get_allocator_hr = r_ga;
+        log::debug!(
+            "vfw discovery (DShow): IMemInputPin::GetAllocator → \
+             hr={r_ga:#010x}, allocator={codec_alloc:#010x}"
+        );
+        record_codec_allocator_negotiation(
+            self.codec_id.as_str(),
+            CodecAllocatorNegotiation {
+                get_allocator_hr: r_ga,
+                codec_allocator: codec_alloc,
+                set_properties_hr: 0xFFFF_FFFF,
+                commit_hr: 0xFFFF_FFFF,
+                using_codec_allocator: false,
+            },
+        );
+
         // Mint host IMemAllocator + drive NotifyAllocator(alloc, FALSE).
         // Sample capacity is 256 KiB by default — large enough for
         // 320×240 keyframes from the discovery FourCCs we drive
@@ -799,6 +975,123 @@ impl SandboxedDshowDecoder {
             Error::other(format!("vfw discovery (DShow): mint host allocator: {e}"))
         })?;
         self.host_allocator = alloc;
+
+        // Round 34 — when GetAllocator returned a usable allocator,
+        // drive `SetProperties + Commit` on IT (not just the host
+        // one) so the codec's internal pool transitions out of the
+        // "decommitted" state that produces VFW_E_NOT_COMMITTED on
+        // its first `GetBuffer` from inside `Receive`.
+        //
+        // ALLOCATOR_PROPERTIES values mirror the round-30 host
+        // shape — pool size 4, cbBuffer big enough for the largest
+        // keyframe we'd push (we use 384*288*3 = 331_776, capped at
+        // 256 KiB minimum), cbAlign = 1, cbPrefix = 0.
+        if r_ga == crate::com::S_OK && codec_alloc != 0 {
+            let props = sb.host.arena_alloc(16).map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec_alloc props arena: {e}"
+                ))
+            })?;
+            let actual = sb.host.arena_alloc(16).map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec_alloc actual arena: {e}"
+                ))
+            })?;
+            // cbBuffer = max(coded-frame upper bound, 256 KiB) so
+            // small fixtures still fit comfortably.
+            let cb_buffer = self
+                .width
+                .saturating_mul(self.height)
+                .saturating_mul(3)
+                .max(256 * 1024);
+            for (off, val) in [(0u32, 4u32), (4, cb_buffer), (8, 1), (12, 0)] {
+                sb.mmu
+                    .write_initializer(props + off, &val.to_le_bytes())
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "vfw discovery (DShow): codec_alloc props write: {e}"
+                        ))
+                    })?;
+                sb.mmu
+                    .write_initializer(actual + off, &0u32.to_le_bytes())
+                    .map_err(|e| {
+                        Error::other(format!(
+                            "vfw discovery (DShow): codec_alloc actual write: {e}"
+                        ))
+                    })?;
+            }
+            let r_sp = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                codec_alloc,
+                crate::com::SLOT_MEMALLOCATOR_SET_PROPERTIES,
+                &[props, actual],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec_alloc SetProperties trapped: {e}"
+                ))
+            })?;
+            self.last_codec_alloc_set_properties_hr = r_sp;
+            log::debug!(
+                "vfw discovery (DShow): codec_alloc SetProperties → \
+                 hr={r_sp:#010x} (cBuffers=4 cbBuffer={cb_buffer} \
+                 cbAlign=1 cbPrefix=0)"
+            );
+            let mut commit_ok = false;
+            // Treat any "success" HRESULT (high bit clear) as
+            // permissive — some codecs return VFW_S_NOT_NEEDED or
+            // other VFW_S_* informational codes from SetProperties
+            // when their internal pool already matches the request.
+            if (r_sp & 0x8000_0000) == 0 {
+                let r_co = crate::com::call::call_method(
+                    &mut sb.cpu,
+                    &mut sb.mmu,
+                    &sb.registry,
+                    &mut sb.host,
+                    codec_alloc,
+                    crate::com::SLOT_MEMALLOCATOR_COMMIT,
+                    &[],
+                )
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): codec_alloc Commit trapped: {e}"
+                    ))
+                })?;
+                self.last_codec_alloc_commit_hr = r_co;
+                log::debug!("vfw discovery (DShow): codec_alloc Commit → hr={r_co:#010x}");
+                commit_ok = (r_co & 0x8000_0000) == 0;
+            }
+            if commit_ok {
+                self.codec_allocator = codec_alloc;
+                self.using_codec_allocator = true;
+            }
+            // Update the per-codec capture stash with the resolved
+            // negotiation outcome.
+            record_codec_allocator_negotiation(
+                self.codec_id.as_str(),
+                CodecAllocatorNegotiation {
+                    get_allocator_hr: r_ga,
+                    codec_allocator: codec_alloc,
+                    set_properties_hr: self.last_codec_alloc_set_properties_hr,
+                    commit_hr: self.last_codec_alloc_commit_hr,
+                    using_codec_allocator: self.using_codec_allocator,
+                },
+            );
+        }
+
+        // Pick the allocator we'll advertise in NotifyAllocator —
+        // codec's own when usable, host's otherwise.  Per MSDN
+        // semantics either choice is legal: NotifyAllocator just
+        // confirms which allocator the upstream filter committed to
+        // use.
+        let advertised_alloc = if self.using_codec_allocator {
+            self.codec_allocator
+        } else {
+            alloc
+        };
         let r_na = crate::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
@@ -806,7 +1099,7 @@ impl SandboxedDshowDecoder {
             &mut sb.host,
             mip,
             4, // SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR
-            &[alloc, 0],
+            &[advertised_alloc, 0],
         )
         .map_err(|e| {
             Error::other(format!(
@@ -816,7 +1109,11 @@ impl SandboxedDshowDecoder {
         // We accept any HRESULT here — some codecs return E_NOTIMPL
         // for NotifyAllocator and rely entirely on GetAllocator;
         // the host-allocator path is best-effort.
-        log::debug!("vfw discovery (DShow): NotifyAllocator → {r_na:#010x}; alloc = {alloc:#010x}");
+        log::debug!(
+            "vfw discovery (DShow): NotifyAllocator → {r_na:#010x}; \
+             alloc = {advertised_alloc:#010x} (codec={})",
+            self.using_codec_allocator
+        );
 
         // Round 31 B — wire a downstream HostIPin / HostIMemInputPin
         // pair into the codec's output pin so that when the codec
@@ -1327,15 +1624,26 @@ impl Decoder for SandboxedDshowDecoder {
                 "vfw discovery (DShow): IMemInputPin not bound; ensure_open did not complete",
             ));
         }
+        // Round 34 — pick the allocator we negotiated in
+        // `ensure_open`: the codec's own when GetAllocator+SetProps+
+        // Commit succeeded, otherwise the host fallback.
+        let allocator = if self.using_codec_allocator {
+            self.codec_allocator
+        } else {
+            self.host_allocator
+        };
+        let from_codec = self.using_codec_allocator;
         let sb = self
             .sandbox
             .as_mut()
             .ok_or_else(|| Error::other("vfw discovery (DShow): no sandbox"))?;
 
-        // Acquire a sample from the host allocator: emulate the
+        // Acquire a sample from the chosen allocator: emulate the
         // codec calling `IMemAllocator::GetBuffer(&sample, 0, 0, 0)`
-        // by driving the host stub directly (we own the allocator
-        // so this is a no-emulation call).
+        // by driving the vtable directly.  The codec allocator path
+        // is a real guest call (mpg4ds32 returns a sample backed by
+        // codec-managed guest memory it walks from inside `Receive`);
+        // the host-allocator path executes the host Rust stub.
         let pp = sb
             .host
             .arena_alloc(4)
@@ -1348,14 +1656,16 @@ impl Decoder for SandboxedDshowDecoder {
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
-            self.host_allocator,
+            allocator,
             crate::com::SLOT_MEMALLOCATOR_GET_BUFFER,
             &[pp, 0, 0, 0],
         )
         .map_err(|e| Error::other(format!("vfw discovery (DShow): GetBuffer trapped: {e}")))?;
         if r_gb != 0 {
             return Err(Error::other(format!(
-                "vfw discovery (DShow): host GetBuffer returned {r_gb:#010x} (pool exhausted?)"
+                "vfw discovery (DShow): {} allocator GetBuffer returned \
+                 {r_gb:#010x} (pool exhausted?)",
+                if from_codec { "codec" } else { "host" }
             )));
         }
         let sample = sb
@@ -1363,18 +1673,105 @@ impl Decoder for SandboxedDshowDecoder {
             .load32(pp)
             .map_err(|e| Error::other(format!("vfw discovery (DShow): load sample slot: {e}")))?;
         if sample == 0 {
-            return Err(Error::other(
-                "vfw discovery (DShow): host GetBuffer succeeded but sample = 0",
-            ));
+            return Err(Error::other(format!(
+                "vfw discovery (DShow): {} GetBuffer succeeded but sample = 0",
+                if from_codec { "codec" } else { "host" }
+            )));
         }
 
-        // Stage the packet bytes + sync flag into the sample.
-        sb.media_sample_set_payload(sample, &packet.data, packet.flags.keyframe)
-            .map_err(|e| {
+        // Stage the packet bytes + sync flag into the sample.  The
+        // host-allocator path uses `media_sample_set_payload` (which
+        // pokes our known sample layout directly); the codec-
+        // allocator path goes through the standard IMediaSample
+        // vtable methods (`GetPointer` + `SetActualDataLength` +
+        // `SetSyncPoint`) because the codec's sample uses an
+        // internal layout we cannot assume.
+        if from_codec {
+            // GetPointer(BYTE** ppBuffer) → byte address of payload.
+            let pp_buf = sb.host.arena_alloc(4).map_err(|e| {
                 Error::other(format!(
-                    "vfw discovery (DShow): media_sample_set_payload: {e}"
+                    "vfw discovery (DShow): codec sample GetPointer arena: {e}"
                 ))
             })?;
+            sb.mmu
+                .write_initializer(pp_buf, &0u32.to_le_bytes())
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): codec sample GetPointer init: {e}"
+                    ))
+                })?;
+            let r_gp = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                sample,
+                crate::com::SLOT_MEDIASAMPLE_GET_POINTER,
+                &[pp_buf],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec sample GetPointer trapped: {e}"
+                ))
+            })?;
+            if r_gp != crate::com::S_OK {
+                return Err(Error::other(format!(
+                    "vfw discovery (DShow): codec sample GetPointer returned \
+                     {r_gp:#010x}"
+                )));
+            }
+            let buf = sb.mmu.load32(pp_buf).unwrap_or(0);
+            if buf == 0 {
+                return Err(Error::other(
+                    "vfw discovery (DShow): codec sample GetPointer wrote NULL buffer",
+                ));
+            }
+            // Write the payload byte-by-byte (page-safe).
+            for (i, &b) in packet.data.iter().enumerate() {
+                sb.mmu.store8(buf + i as u32, b).map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): codec sample payload write: {e}"
+                    ))
+                })?;
+            }
+            // SetActualDataLength(packet.data.len()).
+            let _ = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                sample,
+                crate::com::SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH,
+                &[packet.data.len() as u32],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec sample SetActualDataLength: {e}"
+                ))
+            })?;
+            // SetSyncPoint(packet.flags.keyframe).
+            let _ = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                sample,
+                crate::com::SLOT_MEDIASAMPLE_SET_SYNC_POINT,
+                &[u32::from(packet.flags.keyframe)],
+            )
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): codec sample SetSyncPoint: {e}"
+                ))
+            })?;
+        } else {
+            sb.media_sample_set_payload(sample, &packet.data, packet.flags.keyframe)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): media_sample_set_payload: {e}"
+                    ))
+                })?;
+        }
 
         // Snapshot trace ring before Receive so we can document
         // what the codec did.

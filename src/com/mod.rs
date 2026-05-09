@@ -485,6 +485,36 @@ pub const SLOT_MEMALLOCATOR_GET_BUFFER: u32 = 7;
 /// `IMemAllocator::ReleaseBuffer(IMediaSample* pBuffer)` — slot 8.
 pub const SLOT_MEMALLOCATOR_RELEASE_BUFFER: u32 = 8;
 
+/// `IMediaSample::GetPointer(BYTE** ppBuffer)` — slot 3 (after
+/// IUnknown).  Returns the start address of the sample's payload
+/// buffer through `*ppBuffer`.
+pub const SLOT_MEDIASAMPLE_GET_POINTER: u32 = 3;
+/// `IMediaSample::GetSize()` — slot 4.  Returns the buffer
+/// capacity in bytes (NOT the actual data length).
+pub const SLOT_MEDIASAMPLE_GET_SIZE: u32 = 4;
+/// `IMediaSample::IsSyncPoint()` — slot 7.  Returns `S_OK` for
+/// sync (key) frames, `S_FALSE` otherwise.
+pub const SLOT_MEDIASAMPLE_IS_SYNC_POINT: u32 = 7;
+/// `IMediaSample::SetSyncPoint(BOOL bIsSyncPoint)` — slot 8.
+pub const SLOT_MEDIASAMPLE_SET_SYNC_POINT: u32 = 8;
+/// `IMediaSample::GetActualDataLength()` — slot 11.  Returns the
+/// number of valid bytes currently in the sample's buffer.
+pub const SLOT_MEDIASAMPLE_GET_ACTUAL_DATA_LENGTH: u32 = 11;
+/// `IMediaSample::SetActualDataLength(LONG lLen)` — slot 12.
+/// Caller declares the count of valid bytes the codec should
+/// process from the buffer.  Must be ≤ `GetSize()`.
+pub const SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH: u32 = 12;
+
+/// `IMemInputPin::GetAllocator(IMemAllocator** ppAllocator)` —
+/// slot 3.  Per MSDN
+/// <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nf-strmif-imeminputpin-getallocator>:
+/// "Retrieves the memory allocator proposed by this input pin."
+/// Most input pins create their own allocator and return it
+/// here; the upstream filter then calls `SetProperties` +
+/// `Commit` on it, then `NotifyAllocator(this, FALSE)` to
+/// confirm both ends agreed.  Returns `VFW_E_NO_ALLOCATOR` if
+/// the pin has no preference.
+pub const SLOT_MEMINPUTPIN_GET_ALLOCATOR: u32 = 3;
 /// `IMemInputPin::NotifyAllocator(IMemAllocator*, BOOL bReadOnly)`
 /// — slot 4.
 pub const SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR: u32 = 4;

@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 34 — **work WITH the codec's own allocator instead of
+  fighting our host one.**  Round 33 closed with the diagnosis
+  that `mpg4ds32` walks its OWN allocator from inside
+  `IMemInputPin::Receive` rather than the `NotifyAllocator`-
+  supplied host one we'd Commit'd, returning `VFW_E_NOT_COMMITTED
+  (0x80040209)` from every Receive call.  The fix follows the
+  canonical DShow allocator-negotiation contract:
+  - `SandboxedDshowDecoder::ensure_open` now drives
+    `IMemInputPin::GetAllocator(IMemAllocator** ppAllocator)`
+    (slot 3, per `axextend.h`) right after the QI for
+    `IMemInputPin`.  When the codec returns a non-NULL allocator
+    with `S_OK`, we drive `SetProperties(req, actual)` (cBuffers=4,
+    cbBuffer=max(w·h·3, 256 KiB), cbAlign=1, cbPrefix=0) then
+    `Commit()` on it; on success the codec allocator becomes the
+    `receive_frame` source.  When the codec rejects GetAllocator
+    (NULL / E_NOTIMPL / VFW_E_NO_ALLOCATOR / observed-empirical
+    `0x80040111`), the host-allocator fallback path remains
+    intact.
+  - `receive_frame` now picks the allocator (codec vs host) based
+    on the round-34 negotiation result.  The codec-allocator path
+    drives `IMediaSample::GetPointer + SetActualDataLength +
+    SetSyncPoint` through the vtable (because the codec's sample
+    layout is internal and opaque); the host-allocator path keeps
+    the round-30 `media_sample_set_payload` direct-poke shortcut.
+  - New public constants in `crate::com`:
+    `SLOT_MEMINPUTPIN_GET_ALLOCATOR=3`,
+    `SLOT_MEDIASAMPLE_GET_POINTER=3`,
+    `SLOT_MEDIASAMPLE_GET_SIZE=4`,
+    `SLOT_MEDIASAMPLE_IS_SYNC_POINT=7`,
+    `SLOT_MEDIASAMPLE_SET_SYNC_POINT=8`,
+    `SLOT_MEDIASAMPLE_GET_ACTUAL_DATA_LENGTH=11`,
+    `SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH=12`.
+  - New public capture surface
+    `discovery::CodecAllocatorNegotiation` + accessor
+    `discovery::last_codec_allocator_negotiation(codec_id)`
+    expose the per-codec `(GetAllocator HRESULT,
+    codec_allocator pointer, SetProperties HRESULT, Commit
+    HRESULT, using_codec_allocator)` tuple so tests can introspect
+    what the codec actually did without spawning a parallel
+    sandbox.
+  - +12 tests in `tests/round34_dshow_codec_allocator.rs` (3
+    integration tests against `MPG4DS32.AX` driving the production
+    path + slot-constant unit + host-allocator-fallback unit + 7
+    re-runs of the `avi_extractor` unit module).
+  - Empirical finding for `mpg4ds32`:
+    `IMemInputPin::GetAllocator` returns `0x80040111`
+    (`CLASS_E_CLASSNOTAVAILABLE`) — likely the codec's internal
+    `CoCreateInstance(CLSID_MemoryAllocator)` failing in the
+    sandbox.  The production path correctly falls back to the host
+    allocator; bridging this last gap (round 35 candidate) needs a
+    host-side `CLSID_MemoryAllocator` class factory so the codec's
+    internal allocator construction succeeds.
+
 - Round 33 — **pursue all three round-32 follow-ups: real MP43
   keyframe, `IMediaFilter::GetState` drive, `SetProperties`
   capture.**
