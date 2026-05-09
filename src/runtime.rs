@@ -116,8 +116,25 @@ impl Sandbox {
                 .expect("seed data import");
         }
 
-        let host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
+        let mut host = HostState::new(HEAP_ARENA_START, HEAP_ARENA_END)
             .with_const_arena(CONST_ARENA_START, CONST_ARENA_END);
+
+        // Round 35 — pre-register the canonical DirectShow memory
+        // allocator class factory in the in-process class-factory
+        // cache.  Codecs that internally call
+        // `CoCreateInstance(CLSID_MemoryAllocator, NULL, _,
+        // IID_IMemAllocator, &alloc)` (e.g. mpg4ds32 from inside
+        // `IMemInputPin::GetAllocator`) will now hit our host
+        // factory rather than the round-34 baseline
+        // `CLASS_E_CLASSNOTAVAILABLE` (`0x80040111`) miss.  CLSID
+        // value sourced from Windows SDK header `axextend.h`.
+        if let Ok(factory) =
+            crate::com::mint_host_mem_allocator_class_factory(&mut host, &mut mmu, &registry)
+        {
+            host.com
+                .register_class_factory(crate::com::CLSID_MEMORY_ALLOCATOR, factory);
+        }
+
         Sandbox {
             mmu,
             cpu,
@@ -604,6 +621,22 @@ impl Sandbox {
             pool_size,
             sample_capacity,
             media_type_ptr,
+        )
+    }
+
+    /// Round 35 — mint a host-side `IClassFactory` whose
+    /// `CreateInstance` mints fresh `HostIMemAllocator` instances.
+    ///
+    /// Pre-registered in [`Sandbox::new`] under
+    /// [`crate::com::CLSID_MEMORY_ALLOCATOR`]; this method exists
+    /// for tests that want a raw factory pointer to drive
+    /// `IClassFactory::CreateInstance` directly without going
+    /// through the `ole32!CoCreateInstance` cascade.
+    pub fn mint_host_mem_allocator_class_factory(&mut self) -> Result<u32, crate::Error> {
+        crate::com::mint_host_mem_allocator_class_factory(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
         )
     }
 

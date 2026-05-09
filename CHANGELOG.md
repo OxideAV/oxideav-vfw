@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 35 — **register host-side `CLSID_MemoryAllocator` class
+  factory** so `mpg4ds32`'s internal
+  `CoCreateInstance(CLSID_MemoryAllocator, NULL, _,
+  IID_IMemAllocator, &alloc)` (called from inside
+  `IMemInputPin::GetAllocator`) succeeds rather than returning
+  `CLASS_E_CLASSNOTAVAILABLE (0x80040111)`. Round 34 closed with
+  GetAllocator surfacing `0x80040111` because the host had no
+  factory for the canonical DirectShow memory-allocator class
+  (CLSID `{1E651CC0-B199-11D0-8212-00C04FC32C45}` per
+  `axextend.h`); the codec then returned that same HRESULT to our
+  upstream filter and the codec-allocator path could never engage.
+  - New `crate::com::CLSID_MEMORY_ALLOCATOR` Guid constant.
+  - New `crate::com::mint_host_mem_allocator_class_factory`
+    helper builds a 5-slot `IClassFactory` vtable (QI / AddRef /
+    Release / CreateInstance / LockServer); the CreateInstance
+    stub validates the requested IID is `IUnknown` or
+    `IMemAllocator`, rejects aggregation with
+    `CLASS_E_NOAGGREGATION (0x80040110)` per MSDN, and otherwise
+    mints a fresh `HostIMemAllocator` (4-slot pool × 256 KiB
+    capacity by default) and writes its address to `*ppv`.
+  - `Sandbox::new` now pre-registers this factory under
+    `CLSID_MEMORY_ALLOCATOR` in `HostState::com.class_factories`,
+    so any codec that calls `ole32!CoCreateInstance` for the
+    memory-allocator CLSID gets an immediate `S_OK` + non-NULL
+    allocator interface pointer.
+  - End-to-end against `mpg4ds32`: `GetAllocator` now returns
+    `S_OK` with a non-NULL codec allocator, `SetProperties` and
+    `Commit` on it both return `S_OK`, and
+    `using_codec_allocator` flips true. The round-34 baseline
+    `VFW_E_NOT_COMMITTED (0x80040209)` from `IMemInputPin::Receive`
+    is gone; receive now reaches a different (round-36) blocker
+    in the codec's downstream sample path.
+  - `Sandbox::mint_host_mem_allocator_class_factory` exposes the
+    factory mint helper for tests that want a raw factory pointer.
+  - Stack-cleanup correctness: registered
+    `IClassFactory::CreateInstance` with `arg_dwords=4` (the
+    `this` pointer counts as the first stdcall arg). A 3-arg
+    registration leaks 4 stack bytes per call, which surfaces as
+    a wild EIP after the next codec `ret`.
 - Round 34 — **work WITH the codec's own allocator instead of
   fighting our host one.**  Round 33 closed with the diagnosis
   that `mpg4ds32` walks its OWN allocator from inside

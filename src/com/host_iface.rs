@@ -39,7 +39,10 @@
 //! interface — slots 0..2 are IUnknown's; slots 3..10 are
 //! IFilterGraph's eight methods in declaration order.
 
-use super::{Guid, IID_IFILTERGRAPH, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR, IID_IPIN, IID_IUNKNOWN};
+use super::{
+    Guid, IID_ICLASSFACTORY, IID_IFILTERGRAPH, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR, IID_IPIN,
+    IID_IUNKNOWN,
+};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, StubFn, Win32Error};
 
@@ -300,6 +303,43 @@ pub fn register(registry: &mut Registry) {
         "IMediaSample::GetMediaTime",
         sample_get_media_time as StubFn,
         3,
+    );
+
+    // ---- Round 35 — host class factory for CLSID_MemoryAllocator -
+    //
+    // The IUnknown trio is shared with the IFilterGraph thunks
+    // (`qi` / `addref` / `release`) at the registry level — but we
+    // still need a dedicated `IClassFactory::QueryInterface` thunk
+    // because the QI handler must accept `IID_IClassFactory` (which
+    // the `IFilterGraph::QueryInterface` thunk above does not).
+    // CreateInstance dispatches to a fresh `HostIMemAllocator`.
+    //
+    // `arg_dwords` here counts every dword the codec pushes onto
+    // the stack, INCLUDING the `this` pointer (first stdcall arg
+    // for every COM method).  CreateInstance ABI is
+    // `HRESULT CreateInstance(this, IUnknown* pUnkOuter, REFIID,
+    // void** ppv)` = 4 dwords; LockServer is `(this, BOOL)` =
+    // 2 dwords.  Mismatching this leaves a stack-cleanup hole
+    // that surfaces as a wild EIP after the next `ret`.
+    registry.register(
+        HOST_DLL,
+        "IClassFactory::QueryInterface",
+        alloc_factory_qi as StubFn,
+        3,
+    );
+    registry.register(HOST_DLL, "IClassFactory::AddRef", addref as StubFn, 1);
+    registry.register(HOST_DLL, "IClassFactory::Release", release as StubFn, 1);
+    registry.register(
+        HOST_DLL,
+        "IClassFactory::CreateInstance",
+        alloc_factory_create_instance as StubFn,
+        4,
+    );
+    registry.register(
+        HOST_DLL,
+        "IClassFactory::LockServer",
+        alloc_factory_lock_server as StubFn,
+        2,
     );
 }
 
@@ -652,6 +692,211 @@ pub fn mint_host_output_pin(
             .map_err(crate::Error::Trap)?;
     }
     Ok(obj)
+}
+
+// ---- Round 35 — host class factory for CLSID_MemoryAllocator -------
+//
+// Reference: MSDN
+//  * `IClassFactory` —
+//    <https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nn-unknwn-iclassfactory>
+//  * `CoCreateInstance` —
+//    <https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cocreateinstance>
+//  * `CLSID_MemoryAllocator` GUID — Windows SDK header
+//    `axextend.h` (`{1E651CC0-B199-11D0-8212-00C04FC32C45}`).
+//
+// Layout — 16-byte aligned (arena allocator rounds to 16):
+//
+// HostIClassFactory @ obj (48 bytes total):
+// | offset | content                         |
+// |--------|----------------------------------|
+// | obj    | vtbl_ptr (= obj + 8)            |
+// | obj+4  | refcount = 1                    |
+// | obj+8  | vtbl[0..4] = QI / AddRef /      |
+// |        |   Release / CreateInstance /    |
+// |        |   LockServer (5 slots = 20 B)   |
+// | obj+28 | reserved (0)                    |
+//
+// Round 35 — `CreateInstance(pUnkOuter, REFIID, void** ppv)`
+// validates `riid == IID_IUnknown || riid == IID_IMemAllocator`,
+// mints a fresh `HostIMemAllocator` with default pool shape
+// (`DEFAULT_MEM_ALLOCATOR_FACTORY_POOL` slots × 256 KiB), writes
+// the new pointer to `*ppv`, and returns `S_OK`.  Aggregation
+// (`pUnkOuter != NULL`) is rejected with `CLASS_E_NOAGGREGATION`
+// per MSDN — DirectShow allocators do not aggregate.
+
+/// Default sample-pool size for the [`mint_host_mem_allocator_class_factory`]
+/// `CreateInstance` reply.  Matches the round-30+ host-allocator
+/// pool shape (4 slots = enough for codec-side queueing without
+/// exhausting the arena).
+pub const DEFAULT_MEM_ALLOCATOR_FACTORY_POOL: u32 = 4;
+/// Default per-sample data capacity for the
+/// [`mint_host_mem_allocator_class_factory`] `CreateInstance`
+/// reply.  256 KiB covers 320×240 RGB24 + headroom; the codec
+/// will SetProperties + Commit immediately afterwards anyway.
+pub const DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY: u32 = 256 * 1024;
+
+/// `CLASS_E_NOAGGREGATION = 0x80040110` — `IClassFactory::
+/// CreateInstance` rejects aggregation when `pUnkOuter != NULL`
+/// and the class doesn't support being aggregated.  Source:
+/// `winerror.h`.
+const CLASS_E_NOAGGREGATION: u32 = 0x8004_0110;
+
+/// Round 35 — mint a host-side `IClassFactory` whose
+/// `CreateInstance` mints fresh `HostIMemAllocator` instances.
+///
+/// Pre-registered in [`crate::Sandbox::new`]'s class-factory
+/// cache under `CLSID_MemoryAllocator` so codec-side
+/// `CoCreateInstance(CLSID_MemoryAllocator, NULL, _,
+/// IID_IMemAllocator, &alloc)` calls succeed without going
+/// through the (nonexistent) Windows SCM.  This lets codecs that
+/// rely on the canonical DShow memory-allocator class
+/// (`mpg4ds32` from inside `IMemInputPin::GetAllocator`)
+/// surface a usable allocator pointer instead of the round-34
+/// baseline `CLASS_E_CLASSNOTAVAILABLE` (`0x80040111`).
+pub fn mint_host_mem_allocator_class_factory(
+    state: &mut HostState,
+    mmu: &mut Mmu,
+    registry: &Registry,
+) -> Result<u32, crate::Error> {
+    let obj = state.arena_alloc(48).map_err(crate::Error::Win32)?;
+    let vtbl = obj.wrapping_add(8);
+    mmu.write_initializer(obj, &vtbl.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 4, &1u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    let methods: [&str; 5] = [
+        "IClassFactory::QueryInterface",
+        "IClassFactory::AddRef",
+        "IClassFactory::Release",
+        "IClassFactory::CreateInstance",
+        "IClassFactory::LockServer",
+    ];
+    for (i, name) in methods.iter().enumerate() {
+        let thunk = registry.resolve(HOST_DLL, name).ok_or_else(|| {
+            crate::Error::Win32(Win32Error::InvalidArgument {
+                stub: "mint_host_mem_allocator_class_factory",
+                reason: format!("host-com thunk {name:?} not registered"),
+            })
+        })?;
+        mmu.write_initializer(vtbl + (i as u32) * 4, &thunk.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+    }
+    Ok(obj)
+}
+
+/// `IClassFactory::QueryInterface(this, REFIID, void**)`.
+///
+/// Resolves `IID_IUnknown` and `IID_IClassFactory` to `this`;
+/// every other IID returns `E_NOINTERFACE` and zeros `*ppv`.
+fn alloc_factory_qi(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let piid = arg(cpu, mmu, 1)?;
+    let ppv = arg(cpu, mmu, 2)?;
+    if ppv == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let _ = mmu.write_initializer(ppv, &0u32.to_le_bytes());
+    if piid == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let iid = Guid::load(mmu, piid).map_err(|t| trap("HostIClassFactory::QI", t))?;
+    if iid == IID_IUNKNOWN || iid == IID_ICLASSFACTORY {
+        if let Ok(rc) = mmu.load32(this + 4) {
+            let _ = mmu.write_initializer(this + 4, &rc.saturating_add(1).to_le_bytes());
+        }
+        let _ = mmu.write_initializer(ppv, &this.to_le_bytes());
+        state.com.intern(this, Some(iid));
+        return Ok(S_OK);
+    }
+    Ok(E_NOINTERFACE)
+}
+
+/// `IClassFactory::CreateInstance(this, IUnknown* pUnkOuter,
+/// REFIID riid, void** ppv)` — slot 3.
+///
+/// Per MSDN
+/// <https://learn.microsoft.com/en-us/windows/win32/api/unknwn/nf-unknwn-iclassfactory-createinstance>:
+///
+/// * `pUnkOuter != NULL` and the class doesn't support
+///   aggregation → `CLASS_E_NOAGGREGATION`.
+/// * `ppv == NULL` → `E_POINTER`.
+/// * Successful instantiation → write the new pointer into `*ppv`,
+///   return `S_OK`.
+/// * Requested IID not satisfied by the class → `E_NOINTERFACE`.
+///
+/// We mint a fresh `HostIMemAllocator` (default 4-slot pool ×
+/// 256 KiB capacity) and accept `IID_IUnknown` /
+/// `IID_IMemAllocator`.  The codec is expected to drive
+/// `SetProperties + Commit` on the returned allocator immediately;
+/// the default capacity is large enough to survive any
+/// `GetBuffer` call before that.
+fn alloc_factory_create_instance(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _this = arg(cpu, mmu, 0)?;
+    let p_unk_outer = arg(cpu, mmu, 1)?;
+    let p_iid = arg(cpu, mmu, 2)?;
+    let ppv = arg(cpu, mmu, 3)?;
+    if ppv == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let _ = mmu.write_initializer(ppv, &0u32.to_le_bytes());
+    if p_unk_outer != 0 {
+        return Ok(CLASS_E_NOAGGREGATION);
+    }
+    if p_iid == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let iid = Guid::load(mmu, p_iid).map_err(|t| trap("HostIClassFactory::CreateInstance", t))?;
+    if iid != IID_IUNKNOWN && iid != IID_IMEMALLOCATOR {
+        return Ok(E_NOINTERFACE);
+    }
+    // Mint a fresh allocator. Errors propagate as Win32Error so
+    // dispatch_stub can report a meaningful diagnostic; this never
+    // happens in practice once Sandbox::new has registered the
+    // host-COM thunks.
+    let alloc = match super::mint_host_mem_allocator(
+        state,
+        mmu,
+        registry,
+        DEFAULT_MEM_ALLOCATOR_FACTORY_POOL,
+        DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY,
+        0,
+    ) {
+        Ok(a) => a,
+        Err(crate::Error::Win32(e)) => return Err(e),
+        Err(other) => {
+            return Err(Win32Error::InvalidArgument {
+                stub: "HostIClassFactory::CreateInstance",
+                reason: format!("mint_host_mem_allocator: {other}"),
+            });
+        }
+    };
+    state.com.intern(alloc, Some(iid));
+    mmu.write_initializer(ppv, &alloc.to_le_bytes())
+        .map_err(|t| trap("HostIClassFactory::CreateInstance", t))?;
+    Ok(S_OK)
+}
+
+/// `IClassFactory::LockServer(this, BOOL fLock)` — slot 4.  No-op
+/// success in our single-threaded sandbox; the lock-count concept
+/// only matters when CoFreeUnusedLibraries needs to know whether
+/// the in-process server has any outstanding factories.
+fn alloc_factory_lock_server(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(S_OK)
 }
 
 /// Mint a fresh HostIEnumMediaTypes that yields `amt_addr` once

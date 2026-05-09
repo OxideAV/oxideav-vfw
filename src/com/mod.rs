@@ -60,7 +60,8 @@ pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
     all_set_properties, clear_set_properties_log, last_set_properties, media_sample_set_payload,
     mint_host_filter_graph, mint_host_media_sample, mint_host_mem_allocator,
-    AllocatorPropertiesCapture,
+    mint_host_mem_allocator_class_factory, AllocatorPropertiesCapture,
+    DEFAULT_MEM_ALLOCATOR_FACTORY_CAPACITY, DEFAULT_MEM_ALLOCATOR_FACTORY_POOL,
 };
 
 /// Canonical 128-bit globally-unique identifier.  Layout matches
@@ -389,6 +390,26 @@ pub const IID_IFILTERGRAPH: Guid = Guid::new(
     0x0AD4,
     0x11CE,
     [0xB0, 0x3A, 0x00, 0x20, 0xAF, 0x0B, 0xA7, 0x70],
+);
+
+/// `CLSID_MemoryAllocator` (`{1E651CC0-B199-11D0-8212-00C04FC32C45}`).
+///
+/// Source: Windows SDK header `axextend.h`.  This is the canonical
+/// DirectShow memory-allocator class — `CoCreateInstance(this CLSID,
+/// NULL, CLSCTX_INPROC_SERVER, IID_IMemAllocator, &alloc)` is how
+/// every DirectShow input/output pin instantiates a fresh
+/// IMemAllocator backed by host-managed buffer pool.
+///
+/// Round 35 — registered in the host class-factory cache at
+/// `Sandbox::new` so codecs that internally call CoCreateInstance
+/// for it (mpg4ds32 from inside `IMemInputPin::GetAllocator`) get a
+/// usable allocator pointer rather than the round-34 baseline
+/// `CLASS_E_CLASSNOTAVAILABLE` (`0x80040111`).
+pub const CLSID_MEMORY_ALLOCATOR: Guid = Guid::new(
+    0x1E65_1CC0,
+    0xB199,
+    0x11D0,
+    [0x82, 0x12, 0x00, 0xC0, 0x4F, 0xC3, 0x2C, 0x45],
 );
 
 // ---- Public HRESULT codes ----------------------------------------------
