@@ -647,6 +647,67 @@ pub fn ic_decompress_query(
     )
 }
 
+/// `ICDecompressGetFormat` — ask the codec to fill in the output
+/// `BITMAPINFOHEADER` corresponding to the given input BIH.
+///
+/// The codec writes the output format (typically a BI_RGB or
+/// codec-native YUV BIH at the input's `width × height`) into the
+/// supplied output buffer. Returns the codec's `LRESULT` (0 on
+/// success). Round 30 uses this to probe the codec for stream
+/// dimensions when `CodecParameters` arrived with `width = None`
+/// (for callers that don't know dimensions ahead of time).
+///
+/// MSDN: `LRESULT ICDecompressGetFormat(HIC hic, LPBITMAPINFOHEADER
+/// lpbiInput, LPBITMAPINFOHEADER lpbiOutput)` — when `lpbiOutput`
+/// is NULL real vfw32 returns the size needed; we don't expose
+/// that variant since our caller always provides a 40-byte slot.
+pub fn ic_decompress_get_format(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    input: &Bih,
+) -> Result<(u32, Bih), crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICDecompressGetFormat",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input, in_addr)?;
+    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    // Pre-zero the output BIH so a codec that returns S_OK but
+    // doesn't populate every field still produces deterministic
+    // bytes.
+    for i in 0..BIH_SIZE {
+        mmu.store8(out_addr + i, 0)
+            .map_err(|t| Win32Error::InvalidArgument {
+                stub: "ICDecompressGetFormat",
+                reason: format!("{t}"),
+            })?;
+    }
+    let lr = call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[
+            entry.driver_id,
+            hic,
+            ICM_DECOMPRESS_GET_FORMAT,
+            in_addr,
+            out_addr,
+        ],
+    )?;
+    let out = guest_bih_to_host(mmu, out_addr)?;
+    Ok((lr, out))
+}
+
 /// Negotiate the decoder pipeline. Returns the codec's `LRESULT`.
 pub fn ic_decompress_begin(
     cpu: &mut Cpu,

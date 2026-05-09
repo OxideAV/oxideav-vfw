@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 30 — **two sub-goals: DirectShow IMemAllocator + IMediaSample
+  host stubs (sub-goal A) + Indeo / Cinepak fixture-driven trait
+  tests + ICM_DECOMPRESS_GET_FORMAT dimension probe (sub-goal B).**
+  - **A.** New `crate::com::host_iface` minting helpers
+    [`mint_host_mem_allocator`] and [`mint_host_media_sample`]
+    (re-exported on `Sandbox`) plus 11 IMemAllocator vtable thunks
+    (3 IUnknown + SetProperties / GetProperties / Commit /
+    Decommit / GetBuffer / ReleaseBuffer) and 18 IMediaSample
+    vtable thunks (3 IUnknown + GetPointer / GetSize / GetTime /
+    SetTime / IsSyncPoint / SetSyncPoint / IsPreroll / SetPreroll
+    / GetActualDataLength / SetActualDataLength / GetMediaType /
+    SetMediaType / IsDiscontinuity / SetDiscontinuity /
+    GetMediaTime). The host allocator threads its sample pool
+    through a singly-linked list at `obj+8 → sample+32 → …`;
+    GetBuffer marks each sample in-use until ReleaseBuffer flips
+    the flag back. New `SandboxedDshowDecoder` wires DirectShow
+    codecs end-to-end through `make_decoder` (round-29 used to
+    return `Err(Unsupported)` immediately): on first
+    `send_packet`, drives DllGetClassObject → CreateInstance →
+    EnumPins → JoinFilterGraph → ReceiveConnection →
+    QueryInterface(IMemInputPin) → NotifyAllocator(host_alloc,
+    FALSE) → IMemInputPin::Receive(host_sample) carrying the
+    packet bytes. Codec output capture via a downstream
+    HostIPin::Receive callback is r31 work — `receive_frame`
+    surfaces `Unsupported` carrying the diagnostic + a
+    `trace_ring` snapshot for the next round to mine.
+  - **B.** New `Sandbox::ic_decompress_get_format` (`vfw32::
+    ic_decompress_get_format`) drives `ICM_DECOMPRESS_GET_FORMAT`
+    against the codec to recover the output `BITMAPINFOHEADER` —
+    used by `SandboxedVfwDecoder::ensure_open` to probe stream
+    dimensions when `CodecParameters.{width,height}` are `None`
+    (more robust than round-29's hard-error path; callers without
+    advance dimension knowledge now decode end-to-end via the
+    trait surface). `tests/round30_dshow_and_indeo_cinepak.rs`
+    adds 19 new tests (workspace total 492): IMemAllocator pool
+    layout + GetBuffer/ReleaseBuffer cycle + GetProperties pool
+    walk + QI; IMediaSample GetPointer/GetSize/GetActualDataLength
+    + IsSyncPoint round-trip; DShow trait-path constructor +
+    diagnostic surface; trait-path keyframe decode for IV31
+    (cubes.mov 160×120 through IR32_32.DLL), IV41 (crashtest.avi
+    240×180 through IR41_32.AX), IV50 (cat_attack.avi 320×240
+    through IR50_32.DLL), and CVID (Cinepak through ICCVID.DLL);
+    plus a dim-probe test that drops `CodecParameters` dims and
+    confirms `ICM_DECOMPRESS_GET_FORMAT` populates them lazily.
+
 - Round 29 — **`oxideav_core::Decoder` trait wired end-to-end for
   VfW codecs discovered through round-28's auto-discovery path.**
   `SandboxedVfwDecoder` (in `discovery::codec`) now retains the

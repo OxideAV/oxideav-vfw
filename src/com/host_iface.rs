@@ -39,7 +39,7 @@
 //! interface — slots 0..2 are IUnknown's; slots 3..10 are
 //! IFilterGraph's eight methods in declaration order.
 
-use super::{Guid, IID_IFILTERGRAPH, IID_IPIN, IID_IUNKNOWN};
+use super::{Guid, IID_IFILTERGRAPH, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR, IID_IPIN, IID_IUNKNOWN};
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, StubFn, Win32Error};
 
@@ -160,6 +160,367 @@ pub fn register(registry: &mut Registry) {
     registry.register(HOST_DLL, "IEnumMediaTypes::Skip", enum_skip as StubFn, 2);
     registry.register(HOST_DLL, "IEnumMediaTypes::Reset", enum_reset as StubFn, 1);
     registry.register(HOST_DLL, "IEnumMediaTypes::Clone", notimpl_2 as StubFn, 2);
+
+    // ---- HostIMemAllocator (round 30) ------------------------
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::QueryInterface",
+        alloc_qi as StubFn,
+        3,
+    );
+    registry.register(HOST_DLL, "IMemAllocator::AddRef", addref as StubFn, 1);
+    registry.register(HOST_DLL, "IMemAllocator::Release", release as StubFn, 1);
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::SetProperties",
+        alloc_set_properties as StubFn,
+        3,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::GetProperties",
+        alloc_get_properties as StubFn,
+        2,
+    );
+    registry.register(HOST_DLL, "IMemAllocator::Commit", alloc_commit as StubFn, 1);
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::Decommit",
+        alloc_decommit as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::GetBuffer",
+        alloc_get_buffer as StubFn,
+        4,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMemAllocator::ReleaseBuffer",
+        alloc_release_buffer as StubFn,
+        2,
+    );
+
+    // ---- HostIMediaSample (round 30) -------------------------
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::QueryInterface",
+        sample_qi as StubFn,
+        3,
+    );
+    registry.register(HOST_DLL, "IMediaSample::AddRef", addref as StubFn, 1);
+    registry.register(HOST_DLL, "IMediaSample::Release", release as StubFn, 1);
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetPointer",
+        sample_get_pointer as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetSize",
+        sample_get_size as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetTime",
+        sample_get_time as StubFn,
+        3,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetTime",
+        sample_set_time as StubFn,
+        3,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::IsSyncPoint",
+        sample_is_sync_point as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetSyncPoint",
+        sample_set_sync_point as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::IsPreroll",
+        sample_returns_s_false_1 as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetPreroll",
+        sample_returns_s_ok_2 as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetActualDataLength",
+        sample_get_actual_data_length as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetActualDataLength",
+        sample_set_actual_data_length as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetMediaType",
+        sample_get_media_type as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetMediaType",
+        sample_returns_s_ok_2 as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::IsDiscontinuity",
+        sample_returns_s_false_1 as StubFn,
+        1,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetDiscontinuity",
+        sample_returns_s_ok_2 as StubFn,
+        2,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::GetMediaTime",
+        sample_get_media_time as StubFn,
+        3,
+    );
+}
+
+// ---- HostIMemAllocator + HostIMediaSample minting helpers --------------
+//
+// Reference: MSDN "DirectShow Reference":
+// * IMemAllocator —
+//   <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nn-strmif-imemallocator>
+// * IMediaSample —
+//   <https://learn.microsoft.com/en-us/windows/win32/api/strmif/nn-strmif-imediasample>
+// * ALLOCATOR_PROPERTIES —
+//   <https://learn.microsoft.com/en-us/windows/win32/api/strmif/ns-strmif-allocator_properties>
+//
+// Layouts (all 16-byte aligned via `arena_alloc`):
+//
+// HostIMemAllocator @ obj (96 bytes total):
+// | offset | content                                   |
+// |--------|--------------------------------------------|
+// | obj    | vtbl_ptr (= obj + 16)                     |
+// | obj+4  | refcount = 1                              |
+// | obj+8  | sample_pool_head (= guest VA of first sample, 0 if not yet minted) |
+// | obj+12 | reserved                                   |
+// | obj+16 | vtbl[0..9] (36 bytes; rest of 96 unused)  |
+//
+// HostIMediaSample @ obj (64 bytes header + payload region):
+// | offset | content                                   |
+// |--------|--------------------------------------------|
+// | obj    | vtbl_ptr (= obj + 64)                     |
+// | obj+4  | refcount                                   |
+// | obj+8  | data_ptr (guest VA of underlying byte region) |
+// | obj+12 | data_capacity                              |
+// | obj+16 | data_actual_length                         |
+// | obj+20 | sync_point flag (0 or 1)                  |
+// | obj+24 | media_type_ptr (guest VA of AM_MEDIA_TYPE, 0 = none) |
+// | obj+28 | reserved (cookie / pool linkage)           |
+// | obj+32 | next_pool_link (guest VA of next pool sample, 0 = end) |
+// | obj+36 | in_use flag (1 = checked out via GetBuffer) |
+// | obj+40 | reserved                                   |
+// | obj+44 | reserved                                   |
+// | obj+48 | reserved                                   |
+// | obj+52 | reserved                                   |
+// | obj+56 | reserved                                   |
+// | obj+60 | reserved                                   |
+// | obj+64 | vtbl[0..18] (72 bytes)                    |
+
+/// Mint a host IMemAllocator with `pool_size` IMediaSample slots,
+/// each backed by a fresh `sample_capacity`-byte data region. The
+/// returned guest VA is suitable as the `pAllocator` argument of
+/// `IMemInputPin::NotifyAllocator`.
+///
+/// Each minted sample carries `media_type_ptr` as its
+/// `GetMediaType` return value (typically the AMT the upstream pin
+/// negotiated through `IPin::ReceiveConnection`); pass `0` if no
+/// AMT should be reported.
+pub fn mint_host_mem_allocator(
+    state: &mut HostState,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    pool_size: u32,
+    sample_capacity: u32,
+    media_type_ptr: u32,
+) -> Result<u32, crate::Error> {
+    let obj = state.arena_alloc(96).map_err(crate::Error::Win32)?;
+    let vtbl = obj.wrapping_add(16);
+    mmu.write_initializer(obj, &vtbl.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 4, &1u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    // sample_pool_head — set after minting the pool below.
+    mmu.write_initializer(obj + 8, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 12, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+
+    let methods: [&str; 9] = [
+        "IMemAllocator::QueryInterface",
+        "IMemAllocator::AddRef",
+        "IMemAllocator::Release",
+        "IMemAllocator::SetProperties",
+        "IMemAllocator::GetProperties",
+        "IMemAllocator::Commit",
+        "IMemAllocator::Decommit",
+        "IMemAllocator::GetBuffer",
+        "IMemAllocator::ReleaseBuffer",
+    ];
+    for (i, name) in methods.iter().enumerate() {
+        let thunk = registry
+            .resolve(HOST_DLL, name)
+            .ok_or_else(|| Win32Error::InvalidArgument {
+                stub: "mint_host_mem_allocator",
+                reason: format!("thunk {name:?} not registered"),
+            })
+            .map_err(crate::Error::Win32)?;
+        mmu.write_initializer(vtbl + (i as u32) * 4, &thunk.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+    }
+
+    // Mint the pool: a singly-linked list anchored at obj+8.
+    let mut prev_link_addr: u32 = obj + 8;
+    for _ in 0..pool_size {
+        let sample = mint_host_media_sample(state, mmu, registry, sample_capacity, media_type_ptr)?;
+        // Patch prev's next-pool-link to point at this sample.
+        mmu.write_initializer(prev_link_addr, &sample.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+        // Next iteration links from this sample's `next_pool_link`.
+        prev_link_addr = sample + 32;
+    }
+    // Terminate.
+    mmu.write_initializer(prev_link_addr, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    Ok(obj)
+}
+
+/// Mint a single host IMediaSample wrapping a fresh
+/// `data_capacity`-byte region. `media_type_ptr` (may be 0) is
+/// returned by `GetMediaType`. Initial `actual_length` is 0;
+/// callers populate the bytes + length via [`media_sample_set_payload`]
+/// before passing the sample to the codec's `Receive`.
+pub fn mint_host_media_sample(
+    state: &mut HostState,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    data_capacity: u32,
+    media_type_ptr: u32,
+) -> Result<u32, crate::Error> {
+    // Round capacity up to 16 to keep arena alignment predictable.
+    let cap = data_capacity.div_ceil(16) * 16;
+    let header_size = 64u32 + 18 * 4; // 64-byte header + 72-byte vtable
+    let obj = state
+        .arena_alloc(header_size.div_ceil(16) * 16)
+        .map_err(crate::Error::Win32)?;
+    let data_region = state
+        .arena_alloc(cap.max(16))
+        .map_err(crate::Error::Win32)?;
+    let vtbl = obj.wrapping_add(64);
+
+    mmu.write_initializer(obj, &vtbl.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 4, &1u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 8, &data_region.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 12, &cap.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 16, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 20, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 24, &media_type_ptr.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 28, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 32, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(obj + 36, &0u32.to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    for off in [40u32, 44, 48, 52, 56, 60] {
+        mmu.write_initializer(obj + off, &0u32.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+    }
+
+    let methods: [&str; 18] = [
+        "IMediaSample::QueryInterface",
+        "IMediaSample::AddRef",
+        "IMediaSample::Release",
+        "IMediaSample::GetPointer",
+        "IMediaSample::GetSize",
+        "IMediaSample::GetTime",
+        "IMediaSample::SetTime",
+        "IMediaSample::IsSyncPoint",
+        "IMediaSample::SetSyncPoint",
+        "IMediaSample::IsPreroll",
+        "IMediaSample::SetPreroll",
+        "IMediaSample::GetActualDataLength",
+        "IMediaSample::SetActualDataLength",
+        "IMediaSample::GetMediaType",
+        "IMediaSample::SetMediaType",
+        "IMediaSample::IsDiscontinuity",
+        "IMediaSample::SetDiscontinuity",
+        "IMediaSample::GetMediaTime",
+    ];
+    for (i, name) in methods.iter().enumerate() {
+        let thunk = registry
+            .resolve(HOST_DLL, name)
+            .ok_or_else(|| Win32Error::InvalidArgument {
+                stub: "mint_host_media_sample",
+                reason: format!("thunk {name:?} not registered"),
+            })
+            .map_err(crate::Error::Win32)?;
+        mmu.write_initializer(vtbl + (i as u32) * 4, &thunk.to_le_bytes())
+            .map_err(crate::Error::Trap)?;
+    }
+    Ok(obj)
+}
+
+/// Copy `payload` into a previously-minted sample's data region
+/// + update the sample's actual-length / sync-point flags.
+///
+/// The payload must fit in the sample's `data_capacity`.
+pub fn media_sample_set_payload(
+    mmu: &mut Mmu,
+    sample: u32,
+    payload: &[u8],
+    sync_point: bool,
+) -> Result<(), crate::Error> {
+    let cap = mmu.load32(sample + 12).map_err(crate::Error::Trap)?;
+    if (payload.len() as u32) > cap {
+        return Err(crate::Error::Win32(Win32Error::InvalidArgument {
+            stub: "media_sample_set_payload",
+            reason: format!("payload {} > sample cap {}", payload.len(), cap),
+        }));
+    }
+    let data = mmu.load32(sample + 8).map_err(crate::Error::Trap)?;
+    for (i, &b) in payload.iter().enumerate() {
+        mmu.store8(data + i as u32, b).map_err(crate::Error::Trap)?;
+    }
+    mmu.write_initializer(sample + 16, &(payload.len() as u32).to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    mmu.write_initializer(sample + 20, &(sync_point as u32).to_le_bytes())
+        .map_err(crate::Error::Trap)?;
+    Ok(())
 }
 
 /// Lay out a host IFilterGraph in arena memory.  Returns the
@@ -662,6 +1023,434 @@ fn enum_reset(
 ) -> Result<u32, Win32Error> {
     let this = arg(cpu, mmu, 0)?;
     let _ = mmu.write_initializer(this + 12, &0u32.to_le_bytes());
+    Ok(S_OK)
+}
+
+// ---- HostIMemAllocator stubs -----------------------------------------
+
+/// `IMemAllocator::QueryInterface(this, REFIID, void**)`. Resolves
+/// IUnknown / IMemAllocator to `this`; everything else fails.
+fn alloc_qi(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let piid = arg(cpu, mmu, 1)?;
+    let ppv = arg(cpu, mmu, 2)?;
+    if ppv == 0 || piid == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let _ = mmu.write_initializer(ppv, &0u32.to_le_bytes());
+    let iid = Guid::load(mmu, piid).map_err(|t| trap("HostIMemAllocator::QI", t))?;
+    if iid == IID_IUNKNOWN || iid == IID_IMEMALLOCATOR {
+        if let Ok(rc) = mmu.load32(this + 4) {
+            let _ = mmu.write_initializer(this + 4, &rc.saturating_add(1).to_le_bytes());
+        }
+        let _ = mmu.write_initializer(ppv, &this.to_le_bytes());
+        state.com.intern(this, Some(iid));
+        return Ok(S_OK);
+    }
+    Ok(E_NOINTERFACE)
+}
+
+/// `IMemAllocator::SetProperties(this, ALLOCATOR_PROPERTIES* pRequest,
+/// ALLOCATOR_PROPERTIES* pActual)`. We pretend to accept whatever
+/// the codec asks for: copy `pRequest` into `pActual` and return
+/// `S_OK`. The codec never re-reads our pool with the new
+/// properties — round 30's payload is staged before
+/// `NotifyAllocator`.
+fn alloc_set_properties(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _this = arg(cpu, mmu, 0)?;
+    let p_request = arg(cpu, mmu, 1)?;
+    let p_actual = arg(cpu, mmu, 2)?;
+    if p_actual != 0 && p_request != 0 {
+        for i in 0..16u32 {
+            let b = mmu
+                .load8(p_request + i)
+                .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+            mmu.store8(p_actual + i, b)
+                .map_err(|t| trap("HostIMemAllocator::SetProperties", t))?;
+        }
+    }
+    Ok(S_OK)
+}
+
+/// `IMemAllocator::GetProperties(this, ALLOCATOR_PROPERTIES* pProps)`.
+/// Reports the pool's actual shape: cBuffers = pool length walked
+/// through `obj+8`, cbBuffer = first sample's data_capacity,
+/// cbAlign = 1, cbPrefix = 0.
+fn alloc_get_properties(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let p_props = arg(cpu, mmu, 1)?;
+    if p_props == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let mut count: u32 = 0;
+    let mut cur = mmu
+        .load32(this + 8)
+        .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    let mut buf_size: u32 = 0;
+    while cur != 0 && count < 1024 {
+        if count == 0 {
+            buf_size = mmu
+                .load32(cur + 12)
+                .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+        }
+        count += 1;
+        cur = mmu
+            .load32(cur + 32)
+            .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    }
+    mmu.write_initializer(p_props, &count.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    mmu.write_initializer(p_props + 4, &buf_size.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    mmu.write_initializer(p_props + 8, &1u32.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    mmu.write_initializer(p_props + 12, &0u32.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::GetProperties", t))?;
+    Ok(S_OK)
+}
+
+/// `IMemAllocator::Commit(this)` — make the pool active. No-op
+/// for the host pool (memory is permanently mapped). Returns S_OK.
+fn alloc_commit(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(S_OK)
+}
+
+/// `IMemAllocator::Decommit(this)` — release pool memory. No-op
+/// (we keep the arena allocations around for the test's lifetime).
+fn alloc_decommit(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(S_OK)
+}
+
+/// `IMemAllocator::GetBuffer(this, IMediaSample** ppBuffer,
+/// REFERENCE_TIME* pStartTime, REFERENCE_TIME* pEndTime,
+/// DWORD dwFlags)`.
+///
+/// Walk the sample pool linked list at `obj+8 → sample+32 → …`
+/// looking for a sample with `in_use == 0` (offset +36); mark it
+/// in-use, store its address into `*ppBuffer`, return S_OK. If
+/// the pool is exhausted return `VFW_E_TIMEOUT = 0x80040211`.
+fn alloc_get_buffer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let pp = arg(cpu, mmu, 1)?;
+    let _p_start = arg(cpu, mmu, 2)?;
+    let _p_end = arg(cpu, mmu, 3)?;
+    if pp == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let _ = mmu.write_initializer(pp, &0u32.to_le_bytes());
+    let mut cur = mmu
+        .load32(this + 8)
+        .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+    let mut steps = 0u32;
+    while cur != 0 && steps < 1024 {
+        let in_use = mmu
+            .load32(cur + 36)
+            .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+        if in_use == 0 {
+            mmu.write_initializer(cur + 36, &1u32.to_le_bytes())
+                .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+            // Bump refcount.
+            if let Ok(rc) = mmu.load32(cur + 4) {
+                let _ = mmu.write_initializer(cur + 4, &rc.saturating_add(1).to_le_bytes());
+            }
+            mmu.write_initializer(pp, &cur.to_le_bytes())
+                .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+            return Ok(S_OK);
+        }
+        cur = mmu
+            .load32(cur + 32)
+            .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+        steps += 1;
+    }
+    // Pool exhausted.
+    Ok(0x8004_0211 /* VFW_E_TIMEOUT */)
+}
+
+/// `IMemAllocator::ReleaseBuffer(this, IMediaSample* pBuffer)` —
+/// return the sample to the pool. Clears `in_use` and decrements
+/// refcount.
+fn alloc_release_buffer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _this = arg(cpu, mmu, 0)?;
+    let sample = arg(cpu, mmu, 1)?;
+    if sample == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    mmu.write_initializer(sample + 36, &0u32.to_le_bytes())
+        .map_err(|t| trap("HostIMemAllocator::ReleaseBuffer", t))?;
+    if let Ok(rc) = mmu.load32(sample + 4) {
+        let nrc = if rc > 1 { rc - 1 } else { 1 };
+        let _ = mmu.write_initializer(sample + 4, &nrc.to_le_bytes());
+    }
+    Ok(S_OK)
+}
+
+// ---- HostIMediaSample stubs ------------------------------------------
+
+/// `IMediaSample::QueryInterface(this, REFIID, void**)`. Resolves
+/// IUnknown / IMediaSample to `this`; everything else fails.
+fn sample_qi(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let piid = arg(cpu, mmu, 1)?;
+    let ppv = arg(cpu, mmu, 2)?;
+    if ppv == 0 || piid == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let _ = mmu.write_initializer(ppv, &0u32.to_le_bytes());
+    let iid = Guid::load(mmu, piid).map_err(|t| trap("HostIMediaSample::QI", t))?;
+    if iid == IID_IUNKNOWN || iid == IID_IMEDIASAMPLE {
+        if let Ok(rc) = mmu.load32(this + 4) {
+            let _ = mmu.write_initializer(this + 4, &rc.saturating_add(1).to_le_bytes());
+        }
+        let _ = mmu.write_initializer(ppv, &this.to_le_bytes());
+        state.com.intern(this, Some(iid));
+        return Ok(S_OK);
+    }
+    Ok(E_NOINTERFACE)
+}
+
+/// `IMediaSample::GetPointer(this, BYTE** ppBuffer)`. Stores the
+/// underlying data region's guest VA into `*ppBuffer`.
+fn sample_get_pointer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let pp = arg(cpu, mmu, 1)?;
+    if pp == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let data = mmu
+        .load32(this + 8)
+        .map_err(|t| trap("HostIMediaSample::GetPointer", t))?;
+    mmu.write_initializer(pp, &data.to_le_bytes())
+        .map_err(|t| trap("HostIMediaSample::GetPointer", t))?;
+    Ok(S_OK)
+}
+
+/// `IMediaSample::GetSize(this)` — returns the data region's
+/// capacity (LONG, treated as the dword in EAX). Real DirectShow
+/// returns LONG; HRESULT-style callers also treat the dword as
+/// the size in bytes.
+fn sample_get_size(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let cap = mmu
+        .load32(this + 12)
+        .map_err(|t| trap("HostIMediaSample::GetSize", t))?;
+    Ok(cap)
+}
+
+/// `IMediaSample::GetTime(this, REFERENCE_TIME* pStart,
+/// REFERENCE_TIME* pEnd)`. Returns `VFW_S_NO_STOP_TIME = 0x00040007`
+/// (success but no stop time available) and writes 0 into each
+/// timestamp slot. Codecs use this for A/V sync; round 30 doesn't
+/// drive real timing, so all-zeros is acceptable.
+fn sample_get_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _this = arg(cpu, mmu, 0)?;
+    let p_start = arg(cpu, mmu, 1)?;
+    let p_end = arg(cpu, mmu, 2)?;
+    if p_start != 0 {
+        let _ = mmu.write_initializer(p_start, &[0u8; 8]);
+    }
+    if p_end != 0 {
+        let _ = mmu.write_initializer(p_end, &[0u8; 8]);
+    }
+    Ok(0x0004_0007 /* VFW_S_NO_STOP_TIME */)
+}
+
+/// `IMediaSample::SetTime(this, REFERENCE_TIME* pStart,
+/// REFERENCE_TIME* pEnd)`. No-op success.
+fn sample_set_time(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(S_OK)
+}
+
+/// `IMediaSample::IsSyncPoint(this)`. Returns `S_OK` when the
+/// sync_point flag at `obj+20` is non-zero, `S_FALSE` otherwise.
+fn sample_is_sync_point(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let flag = mmu
+        .load32(this + 20)
+        .map_err(|t| trap("HostIMediaSample::IsSyncPoint", t))?;
+    if flag != 0 {
+        Ok(S_OK)
+    } else {
+        Ok(crate::com::S_FALSE)
+    }
+}
+
+/// `IMediaSample::SetSyncPoint(this, BOOL bIsSyncPoint)`. Updates
+/// the flag at `obj+20`. Returns `S_OK`.
+fn sample_set_sync_point(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let v = arg(cpu, mmu, 1)?;
+    mmu.write_initializer(this + 20, &(if v != 0 { 1u32 } else { 0 }).to_le_bytes())
+        .map_err(|t| trap("HostIMediaSample::SetSyncPoint", t))?;
+    Ok(S_OK)
+}
+
+/// `IMediaSample::GetActualDataLength(this)` — returns the dword
+/// at `obj+16`.
+fn sample_get_actual_data_length(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let len = mmu
+        .load32(this + 16)
+        .map_err(|t| trap("HostIMediaSample::GetActualDataLength", t))?;
+    Ok(len)
+}
+
+/// `IMediaSample::SetActualDataLength(this, LONG cbLength)`. Writes
+/// `cbLength` to `obj+16` (clamped to capacity), returns S_OK.
+fn sample_set_actual_data_length(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let cb = arg(cpu, mmu, 1)?;
+    let cap = mmu
+        .load32(this + 12)
+        .map_err(|t| trap("HostIMediaSample::SetActualDataLength", t))?;
+    let n = cb.min(cap);
+    mmu.write_initializer(this + 16, &n.to_le_bytes())
+        .map_err(|t| trap("HostIMediaSample::SetActualDataLength", t))?;
+    Ok(S_OK)
+}
+
+/// `IMediaSample::GetMediaType(this, AM_MEDIA_TYPE** ppMediaType)`.
+///
+/// If the sample has no per-sample media type (`obj+24 == 0`),
+/// returns `S_FALSE` and writes NULL — meaning "use the upstream's
+/// connection media type". Otherwise writes the cached AMT
+/// pointer and returns `S_OK`.
+fn sample_get_media_type(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let pp = arg(cpu, mmu, 1)?;
+    if pp == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    let mt = mmu
+        .load32(this + 24)
+        .map_err(|t| trap("HostIMediaSample::GetMediaType", t))?;
+    mmu.write_initializer(pp, &mt.to_le_bytes())
+        .map_err(|t| trap("HostIMediaSample::GetMediaType", t))?;
+    if mt == 0 {
+        Ok(crate::com::S_FALSE)
+    } else {
+        Ok(S_OK)
+    }
+}
+
+/// `IMediaSample::GetMediaTime(this, LONGLONG* pStart, LONGLONG*
+/// pEnd)`. Returns `VFW_E_MEDIA_TIME_NOT_SET = 0x80040251`.
+fn sample_get_media_time(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _this = arg(cpu, mmu, 0)?;
+    let _p_start = arg(cpu, mmu, 1)?;
+    let _p_end = arg(cpu, mmu, 2)?;
+    Ok(0x8004_0251 /* VFW_E_MEDIA_TIME_NOT_SET */)
+}
+
+/// 1-arg sample stub returning `S_FALSE` — used by IsPreroll /
+/// IsDiscontinuity (we never advertise either).
+fn sample_returns_s_false_1(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(crate::com::S_FALSE)
+}
+
+/// 2-arg sample stub returning `S_OK` — used by SetPreroll /
+/// SetDiscontinuity / SetMediaType. We accept whatever the codec
+/// asks (round 30 doesn't introspect the payload).
+fn sample_returns_s_ok_2(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
     Ok(S_OK)
 }
 

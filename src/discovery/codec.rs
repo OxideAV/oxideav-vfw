@@ -134,12 +134,10 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 
     match record.kind {
         Kind::Vfw => Ok(Box::new(SandboxedVfwDecoder::new(record, params.clone())?)),
-        Kind::DirectShow => Err(Error::unsupported(format!(
-            "vfw discovery: decode through DirectShow IPin::Receive not yet \
-             wired — needs IMemAllocator / IMediaSample host stubs (round 29). \
-             CLSID = {:?}",
-            record.clsid
-        ))),
+        Kind::DirectShow => Ok(Box::new(SandboxedDshowDecoder::new(
+            record,
+            params.clone(),
+        )?)),
         Kind::Unsupported => Err(Error::unsupported(
             "vfw discovery: this codec was probed but found unsupported",
         )),
@@ -188,11 +186,19 @@ struct SandboxedVfwDecoder {
     /// True once `ICDecompressBegin` has run successfully on
     /// `hic`. `Drop` calls `ICDecompressEnd` only when set.
     begin_done: bool,
-    /// Stream width / height taken from `CodecParameters`. Required
-    /// — VfW codecs need explicit dimensions in the input BIH
-    /// (the bitstream alone is insufficient for pre-decode setup).
+    /// Stream width / height. Resolved lazily from
+    /// [`CodecParameters`] when present, or — if absent — probed
+    /// from the codec via `ICM_DECOMPRESS_GET_FORMAT` after
+    /// `ICDecompressQuery` accepts the input format. Round 30
+    /// added the probe path; round 29 hard-required the caller
+    /// to populate dims, which made the trait surface awkward
+    /// for callers that don't know dims ahead of time.
     width: u32,
     height: u32,
+    /// Whether `width`/`height` were known at construction time
+    /// (false means we need to run the GET_FORMAT probe on first
+    /// `ensure_open` after a successful `ICDecompressQuery`).
+    dims_from_params: bool,
     /// Source BIH FOURCC, derived from `record.fourcc`.
     fourcc_bytes: [u8; 4],
     /// Pending packet awaiting `receive_frame`. Cleared on each
@@ -203,20 +209,11 @@ struct SandboxedVfwDecoder {
 
 impl SandboxedVfwDecoder {
     fn new(record: DiscoveryRecord, params: CodecParameters) -> Result<Self> {
-        let width = params.width.ok_or_else(|| {
-            Error::invalid(
-                "vfw discovery: CodecParameters.width is None — VfW codecs \
-                 need an explicit coded width to populate BITMAPINFOHEADER \
-                 before ICDecompressBegin",
-            )
-        })?;
-        let height = params.height.ok_or_else(|| {
-            Error::invalid(
-                "vfw discovery: CodecParameters.height is None — VfW codecs \
-                 need an explicit coded height to populate BITMAPINFOHEADER \
-                 before ICDecompressBegin",
-            )
-        })?;
+        let dims_from_params = params.width.is_some() && params.height.is_some();
+        // Use placeholder dims when missing; the GET_FORMAT probe
+        // populates them in `ensure_open` after `ICDecompressQuery`.
+        let width = params.width.unwrap_or(0);
+        let height = params.height.unwrap_or(0);
         let fourcc_bytes = fourcc_to_bytes(&record.fourcc).ok_or_else(|| {
             Error::other(format!(
                 "vfw discovery: bad fourcc {:?} in record",
@@ -232,6 +229,7 @@ impl SandboxedVfwDecoder {
             begin_done: false,
             width,
             height,
+            dims_from_params,
             fourcc_bytes,
             pending: None,
             eof: false,
@@ -278,7 +276,10 @@ impl SandboxedVfwDecoder {
     }
 
     fn output_capacity(&self) -> u32 {
-        self.width * self.height * 3
+        // Saturating so an as-yet-unprobed (0×0) decoder produces a
+        // sensible 0 here rather than wrapping; the
+        // `ICDecompressBegin` path validates dims afterwards.
+        self.width.saturating_mul(self.height).saturating_mul(3)
     }
 
     /// Lazy: load DLL, install codec, ICOpen, run ICDecompressQuery
@@ -333,6 +334,47 @@ impl SandboxedVfwDecoder {
         // pre-handshake DllMain call may have already mutated the
         // codec's internal state — running query/begin before the
         // first packet keeps the trait path's lifecycle predictable.
+        //
+        // If the caller didn't supply dims on `CodecParameters`,
+        // synthesise a placeholder input BIH and probe the codec
+        // via `ICM_DECOMPRESS_GET_FORMAT` first. The codec writes
+        // the output BIH (carrying the codec-known dims for the
+        // bound stream); we then re-build the input/output BIHs
+        // with the probed dims for the real query+begin.
+        if !self.dims_from_params {
+            // GET_FORMAT needs *some* input BIH. Use 0×0 — codecs
+            // that key on dims will simply mirror the dims back
+            // into the output BIH at decode time. For codecs that
+            // refuse 0×0 here, dims_from_params stays the
+            // hard-error path (callers can still pass them).
+            let probe_in = self.build_input_bih(0);
+            let hic = self.hic;
+            let sb = self
+                .sandbox
+                .as_mut()
+                .expect("sandbox just constructed above");
+            match sb.ic_decompress_get_format(hic, &probe_in) {
+                Ok((rc, out)) if rc == 0 && out.width > 0 && out.height > 0 => {
+                    self.width = out.width.unsigned_abs();
+                    self.height = out.height.unsigned_abs();
+                }
+                Ok((rc, out)) => {
+                    return Err(Error::invalid(format!(
+                        "vfw discovery: ICM_DECOMPRESS_GET_FORMAT \
+                         could not establish dims (rc={rc:#010x}, \
+                         out_width={}, out_height={}); pass \
+                         CodecParameters.{{width,height}} explicitly",
+                        out.width, out.height
+                    )));
+                }
+                Err(e) => {
+                    return Err(Error::invalid(format!(
+                        "vfw discovery: ICM_DECOMPRESS_GET_FORMAT failed: {e}; \
+                         pass CodecParameters.{{width,height}} explicitly"
+                    )));
+                }
+            }
+        }
         let bih_in = self.build_input_bih(0);
         let bih_out = self.build_output_bih();
         let hic = self.hic;
@@ -457,6 +499,534 @@ impl Drop for SandboxedVfwDecoder {
     }
 }
 
+// ────────────────────────────────────────────────────────────────
+// SandboxedDshowDecoder — round 30.
+//
+// Wires a `oxideav_core::Decoder` against a DirectShow filter
+// `.ax`. On `send_packet`:
+//
+// * `ensure_open` (lazy on first packet): load DLL, drive
+//   DllMain, drive `DllGetClassObject(CLSID, IID_IClassFactory)`
+//   then `IClassFactory::CreateInstance(NULL, IID_IBaseFilter,
+//   &filter)`. Walk `IBaseFilter::EnumPins → IEnumPins::Next`
+//   for the first input pin. Mint a host IFilterGraph, call
+//   `IBaseFilter::JoinFilterGraph(host_graph, NULL)`. Stage an
+//   AM_MEDIA_TYPE for the discovery FourCC + 320×240 (or
+//   user-supplied dims), mint a host output pin advertising
+//   the AMT, call `IPin::ReceiveConnection(host_out_pin, &amt)`.
+// * Then QI the input pin for `IID_IMemInputPin`, mint a
+//   HostIMemAllocator (4-sample pool, sample capacity =
+//   `max(packet.data.len(), 64 KiB)`), call
+//   `IMemInputPin::NotifyAllocator(host_alloc, FALSE)`. Stage
+//   the packet bytes into the first sample, call
+//   `IMemInputPin::Receive(sample)`.
+//
+// The codec's *output* path needs a downstream HostIPin::Receive
+// callback wired into the codec's output pin — that's the r31
+// gap the GOAL doc calls out. For r30 we observe via
+// `Cpu::trace_ring` what the codec did during `Receive` and
+// surface `Error::Unsupported` carrying the captured ring head/tail
+// so the next round can mine it.
+// ────────────────────────────────────────────────────────────────
+
+struct SandboxedDshowDecoder {
+    codec_id: CodecId,
+    record: DiscoveryRecord,
+    sandbox: Option<crate::Sandbox>,
+    image: Option<crate::pe::Image>,
+    /// IBaseFilter pointer (after CreateInstance).
+    filter: u32,
+    /// First input pin (after EnumPins → Next).
+    input_pin: u32,
+    /// Cached IMemInputPin (after QI).
+    mem_input_pin: u32,
+    /// Host IFilterGraph (after JoinFilterGraph).
+    host_graph: u32,
+    /// Host IMemAllocator (after NotifyAllocator).
+    host_allocator: u32,
+    /// Whether ReceiveConnection has succeeded — only after that
+    /// can we safely proceed to NotifyAllocator + Receive.
+    connection_done: bool,
+    width: u32,
+    height: u32,
+    fourcc_bytes: [u8; 4],
+    pending: Option<Packet>,
+    eof: bool,
+}
+
+impl SandboxedDshowDecoder {
+    fn new(record: DiscoveryRecord, params: CodecParameters) -> Result<Self> {
+        let fourcc_bytes = fourcc_to_bytes(&record.fourcc).ok_or_else(|| {
+            Error::other(format!(
+                "vfw discovery: bad fourcc {:?} in record",
+                record.fourcc
+            ))
+        })?;
+        Ok(SandboxedDshowDecoder {
+            codec_id: params.codec_id.clone(),
+            record,
+            sandbox: None,
+            image: None,
+            filter: 0,
+            input_pin: 0,
+            mem_input_pin: 0,
+            host_graph: 0,
+            host_allocator: 0,
+            connection_done: false,
+            // DShow path is more permissive than VfW; default to
+            // 320×240 if dims missing — the negotiation may
+            // override during ReceiveConnection.
+            width: params.width.unwrap_or(320),
+            height: params.height.unwrap_or(240),
+            fourcc_bytes,
+            pending: None,
+            eof: false,
+        })
+    }
+
+    fn ensure_open(&mut self) -> Result<()> {
+        if self.connection_done {
+            return Ok(());
+        }
+        if self.sandbox.is_none() {
+            let bytes = std::fs::read(&self.record.dll_path).map_err(|e| {
+                Error::other(format!("vfw discovery (DShow): read DLL failed: {e}"))
+            })?;
+            let mut sb = crate::Sandbox::new();
+            sb.cpu.set_instr_limit(8_000_000_000);
+            let img = sb.load("codec.ax", &bytes).map_err(|e| {
+                Error::other(format!("vfw discovery (DShow): Sandbox::load failed: {e}"))
+            })?;
+            let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+
+            // Resolve the CLSID from the discovery record.
+            let clsid_str = self.record.clsid.as_deref().ok_or_else(|| {
+                Error::unsupported(
+                    "vfw discovery (DShow): record carries no CLSID — \
+                     can't drive DllGetClassObject",
+                )
+            })?;
+            let clsid = crate::com::Guid::parse(clsid_str).map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): bad CLSID {clsid_str:?}: {e}"
+                ))
+            })?;
+            let _factory = sb
+                .dll_get_class_object(&img, clsid, crate::IID_ICLASSFACTORY)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): DllGetClassObject failed: {e}"
+                    ))
+                })?;
+            let filter = sb
+                .co_create_instance(clsid, crate::IID_IBASEFILTER)
+                .map_err(|e| {
+                    Error::other(format!(
+                        "vfw discovery (DShow): co_create_instance failed: {e}"
+                    ))
+                })?;
+            if filter == 0 {
+                return Err(Error::other(
+                    "vfw discovery (DShow): CreateInstance returned NULL filter",
+                ));
+            }
+            self.sandbox = Some(sb);
+            self.image = Some(img);
+            self.filter = filter;
+        }
+
+        let sb = self.sandbox.as_mut().expect("sandbox just constructed");
+
+        // Walk EnumPins → Next for the first input pin.
+        if self.input_pin == 0 {
+            let pin = first_input_pin(sb, self.filter).ok_or_else(|| {
+                Error::other("vfw discovery (DShow): could not enumerate input pin")
+            })?;
+            self.input_pin = pin;
+        }
+
+        // Mint host IFilterGraph + JoinFilterGraph.
+        if self.host_graph == 0 {
+            let host_graph = sb.mint_host_filter_graph().map_err(|e| {
+                Error::other(format!("vfw discovery (DShow): mint host graph: {e}"))
+            })?;
+            let _ = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                self.filter,
+                crate::com::SLOT_BASEFILTER_JOIN_FILTER_GRAPH,
+                &[host_graph, 0],
+            );
+            self.host_graph = host_graph;
+        }
+
+        // Stage an AM_MEDIA_TYPE for the discovery FourCC, mint a
+        // host output pin advertising it, drive ReceiveConnection.
+        let amt =
+            stage_am_media_type_dshow(sb, self.fourcc_bytes, self.width as i32, self.height as i32)
+                .map_err(|e| Error::other(format!("vfw discovery (DShow): stage AMT: {e}")))?;
+        let host_out_pin = sb.mint_host_output_pin(amt).map_err(|e| {
+            Error::other(format!("vfw discovery (DShow): mint host output pin: {e}"))
+        })?;
+        let r = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            self.input_pin,
+            4, // SLOT_PIN_RECEIVE_CONNECTION
+            &[host_out_pin, amt],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): IPin::ReceiveConnection trapped: {e}"
+            ))
+        })?;
+        if r != 0 {
+            return Err(Error::unsupported(format!(
+                "vfw discovery (DShow): IPin::ReceiveConnection returned \
+                 HRESULT {r:#010x} (codec rejected the offered AM_MEDIA_TYPE; \
+                 round 30 ships the IMemAllocator+IMediaSample stubs but the \
+                 codec's CheckMediaType still rejects our fabricated input \
+                 type — see r31 candidates in the next-round notes)"
+            )));
+        }
+        self.connection_done = true;
+
+        // QI for IMemInputPin.
+        let mip = sb
+            .query_interface(self.input_pin, crate::IID_IMEMINPUTPIN)
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): QI IMemInputPin failed: {e}"
+                ))
+            })?;
+        self.mem_input_pin = mip;
+
+        // Mint host IMemAllocator + drive NotifyAllocator(alloc, FALSE).
+        // Sample capacity is 256 KiB by default — large enough for
+        // 320×240 keyframes from the discovery FourCCs we drive
+        // here. Pool size 4 leaves room for codec-side queueing
+        // without exhausting the arena.
+        let cap = 256 * 1024;
+        let alloc = sb.mint_host_mem_allocator(4, cap, amt).map_err(|e| {
+            Error::other(format!("vfw discovery (DShow): mint host allocator: {e}"))
+        })?;
+        self.host_allocator = alloc;
+        let r_na = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            mip,
+            4, // SLOT_MEMINPUTPIN_NOTIFY_ALLOCATOR
+            &[alloc, 0],
+        )
+        .map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (DShow): NotifyAllocator trapped: {e}"
+            ))
+        })?;
+        // We accept any HRESULT here — some codecs return E_NOTIMPL
+        // for NotifyAllocator and rely entirely on GetAllocator;
+        // the host-allocator path is best-effort.
+        log::debug!("vfw discovery (DShow): NotifyAllocator → {r_na:#010x}; alloc = {alloc:#010x}");
+        Ok(())
+    }
+}
+
+/// Stage an AM_MEDIA_TYPE (72 B) + VIDEOINFOHEADER (88 B) in arena
+/// memory describing a video stream of (`fourcc`, `width × height`,
+/// 24 bpp). Returns the AMT's guest VA. Thin equivalent of the
+/// round-27 test helper, lifted into the production module so
+/// `SandboxedDshowDecoder` can reuse it.
+fn stage_am_media_type_dshow(
+    sb: &mut crate::Sandbox,
+    fourcc: [u8; 4],
+    width: i32,
+    height: i32,
+) -> Result<u32> {
+    let to_oxide = |e: crate::Error| Error::other(format!("vfw discovery (DShow): stage AMT: {e}"));
+    let blob = sb
+        .host
+        .arena_alloc(72 + 88 + 16)
+        .map_err(|e| to_oxide(crate::Error::Win32(e)))?;
+    let amt = blob;
+    let fmt = blob + 72;
+
+    // AM_MEDIA_TYPE @ amt.
+    let mediatype_video =
+        crate::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
+    let format_videoinfo =
+        crate::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
+    let d1 = u32::from_le_bytes(fourcc);
+    let subtype = crate::com::Guid::new(
+        d1,
+        0x0000,
+        0x0010,
+        [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+    );
+
+    let trap = |e: crate::emulator::Trap| to_oxide(crate::Error::Trap(e));
+    mediatype_video.stage(&mut sb.mmu, amt).map_err(trap)?;
+    subtype.stage(&mut sb.mmu, amt + 16).map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 32, &1u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 36, &1u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 40, &0u32.to_le_bytes())
+        .map_err(trap)?;
+    format_videoinfo
+        .stage(&mut sb.mmu, amt + 44)
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 60, &0u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 64, &88u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(amt + 68, &fmt.to_le_bytes())
+        .map_err(trap)?;
+
+    // VIH @ fmt — first 48 bytes (rcSource + rcTarget + dwBitRate +
+    // dwBitErrorRate + AvgTimePerFrame) zeroed; BIH at fmt+48.
+    for i in 0..48u32 {
+        sb.mmu.store8(fmt + i, 0).map_err(trap)?;
+    }
+    let bih = fmt + 48;
+    sb.mmu
+        .write_initializer(bih, &40u32.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 4, &(width as u32).to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 8, &(height as u32).to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 12, &1u16.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu
+        .write_initializer(bih + 14, &24u16.to_le_bytes())
+        .map_err(trap)?;
+    sb.mmu.write_initializer(bih + 16, &fourcc).map_err(trap)?;
+    let size_image = (width.unsigned_abs() * height.unsigned_abs() * 3) / 2;
+    sb.mmu
+        .write_initializer(bih + 20, &size_image.to_le_bytes())
+        .map_err(trap)?;
+    for off in [24u32, 28, 32, 36] {
+        sb.mmu
+            .write_initializer(bih + off, &0u32.to_le_bytes())
+            .map_err(trap)?;
+    }
+    Ok(amt)
+}
+
+/// Walk the codec's IBaseFilter::EnumPins → IEnumPins::Next chain
+/// for the first pin (assumed to be the input pin — DirectShow
+/// convention is input pins enumerate first, output pins next).
+fn first_input_pin(sb: &mut crate::Sandbox, filter: u32) -> Option<u32> {
+    use crate::com::call::call_method;
+    // Stop the filter so ReceiveConnection is legal.
+    let _ = call_method(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &sb.registry,
+        &mut sb.host,
+        filter,
+        crate::com::SLOT_BASEFILTER_STOP,
+        &[],
+    );
+    let scratch = sb.host.arena_alloc(8).ok()?;
+    sb.mmu.write_initializer(scratch, &[0u8; 8]).ok()?;
+    let r = call_method(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &sb.registry,
+        &mut sb.host,
+        filter,
+        crate::com::SLOT_BASEFILTER_ENUM_PINS,
+        &[scratch],
+    );
+    let pp = sb.mmu.load32(scratch).unwrap_or(0);
+    if !matches!(r, Ok(0)) || pp == 0 {
+        return None;
+    }
+    sb.host.com.intern(pp, None);
+    let pin_slot = sb.host.arena_alloc(8).ok()?;
+    sb.mmu.write_initializer(pin_slot, &[0u8; 8]).ok()?;
+    let _ = call_method(
+        &mut sb.cpu,
+        &mut sb.mmu,
+        &sb.registry,
+        &mut sb.host,
+        pp,
+        3, // IEnumPins::Next
+        &[1, pin_slot, pin_slot + 4],
+    );
+    let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
+    if pin != 0 {
+        sb.host.com.intern(pin, None);
+    }
+    let _ = sb.com_release(pp);
+    if pin == 0 {
+        None
+    } else {
+        Some(pin)
+    }
+}
+
+impl Decoder for SandboxedDshowDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::other(
+                "vfw discovery (DShow): receive_frame must be called before sending another packet",
+            ));
+        }
+        self.ensure_open()?;
+        self.pending = Some(packet.clone());
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        let packet = match self.pending.take() {
+            Some(p) => p,
+            None => {
+                return if self.eof {
+                    Err(Error::Eof)
+                } else {
+                    Err(Error::NeedMore)
+                };
+            }
+        };
+        let mip = self.mem_input_pin;
+        if mip == 0 {
+            return Err(Error::other(
+                "vfw discovery (DShow): IMemInputPin not bound; ensure_open did not complete",
+            ));
+        }
+        let sb = self
+            .sandbox
+            .as_mut()
+            .ok_or_else(|| Error::other("vfw discovery (DShow): no sandbox"))?;
+
+        // Acquire a sample from the host allocator: emulate the
+        // codec calling `IMemAllocator::GetBuffer(&sample, 0, 0, 0)`
+        // by driving the host stub directly (we own the allocator
+        // so this is a no-emulation call).
+        let pp = sb
+            .host
+            .arena_alloc(4)
+            .map_err(|e| Error::other(format!("vfw discovery (DShow): arena: {e}")))?;
+        sb.mmu
+            .write_initializer(pp, &0u32.to_le_bytes())
+            .map_err(|e| Error::other(format!("vfw discovery (DShow): mmu init: {e}")))?;
+        let r_gb = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            self.host_allocator,
+            7, // SLOT_MEMALLOCATOR_GET_BUFFER
+            &[pp, 0, 0, 0],
+        )
+        .map_err(|e| Error::other(format!("vfw discovery (DShow): GetBuffer trapped: {e}")))?;
+        if r_gb != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery (DShow): host GetBuffer returned {r_gb:#010x} (pool exhausted?)"
+            )));
+        }
+        let sample = sb
+            .mmu
+            .load32(pp)
+            .map_err(|e| Error::other(format!("vfw discovery (DShow): load sample slot: {e}")))?;
+        if sample == 0 {
+            return Err(Error::other(
+                "vfw discovery (DShow): host GetBuffer succeeded but sample = 0",
+            ));
+        }
+
+        // Stage the packet bytes + sync flag into the sample.
+        sb.media_sample_set_payload(sample, &packet.data, packet.flags.keyframe)
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (DShow): media_sample_set_payload: {e}"
+                ))
+            })?;
+
+        // Snapshot trace ring before Receive so we can document
+        // what the codec did.
+        sb.cpu.enable_trace_ring(64);
+
+        // Drive IMemInputPin::Receive(sample).
+        let r_recv = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            mip,
+            6, // SLOT_MEMINPUTPIN_RECEIVE
+            &[sample],
+        )
+        .map_err(|e| Error::other(format!("vfw discovery (DShow): Receive trapped: {e}")))?;
+
+        // Capture trace ring head / tail for diagnostics.
+        let ring = sb.cpu.trace_ring.clone();
+        let ring_summary = if ring.is_empty() {
+            String::from("empty")
+        } else {
+            let head: Vec<String> = ring.iter().take(4).map(|e| format!("{e:#010x}")).collect();
+            let tail: Vec<String> = ring
+                .iter()
+                .rev()
+                .take(4)
+                .map(|e| format!("{e:#010x}"))
+                .collect();
+            format!("len={} head={:?} tail={:?}", ring.len(), head, tail)
+        };
+
+        // Round 30 doesn't have a downstream HostIPin::Receive
+        // capture path: codec output goes nowhere we can observe
+        // as a `Frame::Video`. Surface Unsupported with diagnostics.
+        Err(Error::unsupported(format!(
+            "vfw discovery (DShow): IMemInputPin::Receive → {r_recv:#010x}; \
+             codec output capture via downstream HostIPin::Receive is r31 work \
+             (trace_ring {ring_summary})"
+        )))
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+impl Drop for SandboxedDshowDecoder {
+    fn drop(&mut self) {
+        if let Some(sb) = self.sandbox.as_mut() {
+            if self.mem_input_pin != 0 {
+                let _ = sb.com_release(self.mem_input_pin);
+            }
+            if self.input_pin != 0 {
+                let _ = sb.com_release(self.input_pin);
+            }
+            if self.filter != 0 {
+                let _ = sb.com_release(self.filter);
+            }
+        }
+    }
+}
+
 /// Stream-level pixel format for [`Frame::Video`]s emitted by
 /// [`SandboxedVfwDecoder`]. The decoder always renders to
 /// [`PixelFormat::Bgr24`] — VfW codecs reliably honour BI_RGB
@@ -521,22 +1091,23 @@ mod tests {
     }
 
     #[test]
-    fn make_decoder_dshow_returns_unsupported() {
-        let id = "vfw_dshow_make_decoder_test";
+    fn make_decoder_dshow_constructs_decoder_without_dll() {
+        // Round 30 — DShow path now constructs a `SandboxedDshowDecoder`
+        // at make_decoder time; the actual DLL load + handshake happen
+        // lazily on the first `send_packet`. Constructor only validates
+        // the FourCC. (Round 29 used to return Err(Unsupported) here.)
+        let id = "vfw_dshow_make_decoder_test_round30";
         register_factory_for_id(
             id,
             DiscoveryRecord {
-                dll_path: PathBuf::from("/x/foo.ax"),
+                dll_path: PathBuf::from("/dev/null"),
                 fourcc: "WMV3".to_string(),
                 kind: Kind::DirectShow,
                 clsid: Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
             },
         );
         let params = CodecParameters::video(CodecId::new(id));
-        match make_decoder(&params) {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("DirectShow")),
-            Err(other) => panic!("expected Unsupported, got {other:?}"),
-            Ok(_) => panic!("expected Err(Unsupported), got Ok(_)"),
-        }
+        let decoder = make_decoder(&params).expect("DShow make_decoder constructs lazily");
+        assert_eq!(decoder.codec_id().as_str(), id);
     }
 }

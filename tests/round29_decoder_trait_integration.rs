@@ -20,7 +20,7 @@ mod common;
 
 use std::path::PathBuf;
 
-use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, PixelFormat, TimeBase};
 use oxideav_vfw::discovery::{
     codec_id_for, make_decoder, output_pixel_format, register_factory_for_id, DiscoveryRecord, Kind,
 };
@@ -328,10 +328,13 @@ fn output_pixel_format_is_bgr24() {
 }
 
 #[test]
-fn make_decoder_without_width_errors() {
-    // Register a Vfw record so the early lookup succeeds; the
-    // failure must come from the missing width on CodecParameters.
-    let id = "vfw_mp43_round29_test_no_width";
+fn make_decoder_without_width_constructs_with_get_format_probe_path() {
+    // Round 30 — width is now optional on `CodecParameters`. When
+    // missing, the decoder probes the codec via
+    // `ICM_DECOMPRESS_GET_FORMAT` on first `send_packet` and
+    // populates dims from the codec's reply. `make_decoder` itself
+    // succeeds; the failure (if any) surfaces from the probe.
+    let id = "vfw_mp43_round30_test_no_width";
     register_factory_for_id(
         id,
         DiscoveryRecord {
@@ -342,25 +345,21 @@ fn make_decoder_without_width_errors() {
         },
     );
     let params = CodecParameters::video(CodecId::new(id));
-    match make_decoder(&params) {
-        Err(Error::InvalidData(msg)) => {
-            assert!(
-                msg.contains("width is None"),
-                "expected width-missing error, got {msg:?}"
-            );
-        }
-        Err(other) => panic!("expected InvalidData(width is None), got Err({other:?})"),
-        Ok(_) => panic!("expected InvalidData(width is None), got Ok(decoder)"),
-    }
+    let decoder = make_decoder(&params).expect("make_decoder constructs lazily");
+    assert_eq!(decoder.codec_id().as_str(), id);
 }
 
 #[test]
-fn make_decoder_dshow_kind_still_unsupported() {
-    let id = "vfw_round29_dshow_unsupported";
+fn make_decoder_dshow_kind_now_constructs_lazily() {
+    // Round 30 — DShow path constructs a `SandboxedDshowDecoder`
+    // at make_decoder time. The real DLL load + IPin handshake
+    // run on first `send_packet`; failure surfaces from
+    // `receive_frame` carrying r31-followup diagnostics.
+    let id = "vfw_round30_dshow_lazy_construct";
     register_factory_for_id(
         id,
         DiscoveryRecord {
-            dll_path: PathBuf::from("/x/foo.ax"),
+            dll_path: PathBuf::from("/dev/null"),
             fourcc: "WMV3".into(),
             kind: Kind::DirectShow,
             clsid: Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
@@ -369,13 +368,8 @@ fn make_decoder_dshow_kind_still_unsupported() {
     let mut params = CodecParameters::video(CodecId::new(id));
     params.width = Some(176);
     params.height = Some(144);
-    match make_decoder(&params) {
-        Err(Error::Unsupported(msg)) => {
-            assert!(msg.contains("DirectShow"));
-        }
-        Err(other) => panic!("expected Unsupported(DirectShow), got Err({other:?})"),
-        Ok(_) => panic!("expected Unsupported(DirectShow), got Ok(decoder)"),
-    }
+    let decoder = make_decoder(&params).expect("DShow make_decoder constructs lazily");
+    assert_eq!(decoder.codec_id().as_str(), id);
 }
 
 /// `codec_id_for` is exposed through the `discovery` module so test

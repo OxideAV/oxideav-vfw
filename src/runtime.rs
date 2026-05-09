@@ -297,6 +297,24 @@ impl Sandbox {
         )
     }
 
+    /// `ICDecompressGetFormat` — ask the codec for the output BIH
+    /// matching `input`. Round 30 uses this to probe stream
+    /// dimensions when `CodecParameters` lacks them.
+    pub fn ic_decompress_get_format(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+    ) -> Result<(u32, vfw32::Bih), crate::Error> {
+        vfw32::ic_decompress_get_format(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+        )
+    }
+
     /// `ICDecompressBegin` — set up the decoder pipeline.
     pub fn ic_decompress_begin(
         &mut self,
@@ -561,6 +579,63 @@ impl Sandbox {
             &self.registry,
             amt_addr,
         )
+    }
+
+    /// Round 30 — mint a host-side `IMemAllocator` backed by a
+    /// pool of `pool_size` IMediaSample slots, each carrying a
+    /// fresh `sample_capacity`-byte data region. The returned
+    /// guest pointer is suitable as the `pAllocator` argument of
+    /// `IMemInputPin::NotifyAllocator`.
+    ///
+    /// `media_type_ptr` is returned by every minted sample's
+    /// `IMediaSample::GetMediaType` — pass `0` if no AMT should
+    /// surface there (codecs then fall back to the upstream pin's
+    /// connection media type).
+    pub fn mint_host_mem_allocator(
+        &mut self,
+        pool_size: u32,
+        sample_capacity: u32,
+        media_type_ptr: u32,
+    ) -> Result<u32, crate::Error> {
+        crate::com::mint_host_mem_allocator(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+            pool_size,
+            sample_capacity,
+            media_type_ptr,
+        )
+    }
+
+    /// Round 30 — mint a single host-side `IMediaSample` wrapping
+    /// a fresh `data_capacity`-byte data region. Useful for
+    /// stand-alone tests; production paths typically mint samples
+    /// implicitly via [`Self::mint_host_mem_allocator`].
+    pub fn mint_host_media_sample(
+        &mut self,
+        data_capacity: u32,
+        media_type_ptr: u32,
+    ) -> Result<u32, crate::Error> {
+        crate::com::mint_host_media_sample(
+            &mut self.host,
+            &mut self.mmu,
+            &self.registry,
+            data_capacity,
+            media_type_ptr,
+        )
+    }
+
+    /// Round 30 — copy a payload into a previously-minted sample
+    /// + flag whether it is a sync (key) frame.
+    ///
+    /// Wraps [`crate::com::media_sample_set_payload`].
+    pub fn media_sample_set_payload(
+        &mut self,
+        sample: u32,
+        payload: &[u8],
+        sync_point: bool,
+    ) -> Result<(), crate::Error> {
+        crate::com::media_sample_set_payload(&mut self.mmu, sample, payload, sync_point)
     }
 
     /// Drive `obj->AddRef()`.  Returns the codec-reported new

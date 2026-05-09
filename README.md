@@ -9,6 +9,25 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 30 — DirectShow IMemAllocator + IMediaSample host stubs
+land; ICM_DECOMPRESS_GET_FORMAT dim probe + Indeo / Cinepak trait
+tests.** New `crate::com::host_iface::mint_host_mem_allocator` /
+`mint_host_media_sample` plus 11+18 vtable thunks back the codec's
+`IMemInputPin::NotifyAllocator(host_alloc, FALSE)` →
+`Receive(host_sample)` chain end-to-end. `SandboxedDshowDecoder`
+wires DirectShow `make_decoder` (round 29 returned `Unsupported`
+immediately) through DllGetClassObject → CreateInstance →
+EnumPins → JoinFilterGraph → ReceiveConnection → IMemInputPin →
+Receive. Codec output capture via a downstream HostIPin::Receive
+callback is r31 work — `receive_frame` surfaces `Unsupported`
+carrying the diagnostic + a `trace_ring` snapshot. Sub-goal B:
+`Sandbox::ic_decompress_get_format` lifts round-29's hard
+"`width is None` reject" into a lazy `ICM_DECOMPRESS_GET_FORMAT`
+probe, plus 4 trait-path keyframe-decode tests for IV31 (cubes.mov
+through IR32_32.DLL), IV41 (crashtest.avi through IR41_32.AX),
+IV50 (cat_attack.avi through IR50_32.DLL), CVID (Cinepak through
+ICCVID.DLL). **Total: 492 tests.**
+
 **Round 27 — IFilterGraph + IPin host stubs land; MPG4DS32
 input-pin handshake reaches `S_OK`.** New `src/com/host_iface.rs`
 mints synthetic guest-side COM objects whose vtable function

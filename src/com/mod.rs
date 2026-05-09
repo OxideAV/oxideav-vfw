@@ -56,7 +56,10 @@ pub mod call;
 pub mod host_iface;
 
 pub use call::{add_ref, call_method, query_interface, release};
-pub use host_iface::mint_host_filter_graph;
+pub use host_iface::{
+    media_sample_set_payload, mint_host_filter_graph, mint_host_media_sample,
+    mint_host_mem_allocator,
+};
 
 /// Canonical 128-bit globally-unique identifier.  Layout matches
 /// the MIDL `GUID` struct in `guiddef.h`:
