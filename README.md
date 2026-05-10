@@ -9,6 +9,24 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 38 — codec C++ class base identified; `[filter_base+0x8c]`
+proven non-NULL pre-Receive, falsifying the r36/r37 hypothesis.**
+Static disasm of MPG4DS32.AX RVAs `0x69ab` / `0x5e34` / `0x25a2` /
+`0x6473` / `0x6560` / `0x2da7` / `0x7176` (via `objdump -d -M intel`)
+maps the `Receive → Transform` call chain to the codec's primary
+C++ vtable at VA `0x1c4269f4` (constructor at `0x24ca` stamps it
+at `[obj+0]`).  Since CoCreateInstance returns the IBaseFilter
+sub-vtable (at `[obj+0xc]`), `filter_base = self.filter - 0xc`,
+and the `m_pInput` field that traps in `0x2da7` is at
+`[filter_base + 0x8c]` = `[self.filter + 0x80]`.  The new
+pre-Receive sanity dump in `discovery::codec::receive_frame`
+reads it on every call: for the MP43 fixture it's `0x60000280`
+(NON-NULL) — input pin IS allocated by EnumPins/Next, so the
+trap is on a DIFFERENT object reached deeper in Transform (likely
+via the QI at `0x4064f3` returning a sub-interface whose vtable
+also has `0x2da7` at slot 13).  Trap RVA `0x7184` unchanged from
+r36 baseline; r39 chases the intermediate object's `+0x8c`.
+
 **Round 30 — DirectShow IMemAllocator + IMediaSample host stubs
 land; ICM_DECOMPRESS_GET_FORMAT dim probe + Indeo / Cinepak trait
 tests.** New `crate::com::host_iface::mint_host_mem_allocator` /

@@ -8,6 +8,74 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 38 — **identify the codec's C++ class base + prove
+  `[filter_base+0x8c]` is NON-NULL pre-Receive**, ruling out
+  the round-36/37 hypothesis that the trap at MPG4DS32 RVA
+  `0x7184` was caused by an uninitialised input-pin field on
+  the CoCreateInstance-returned filter object.
+  - **Static disasm correlation** — the `Receive → Transform`
+    call chain is now fully reverse-engineered from the codec
+    DLL's own bytes (`objdump -d -M intel`) at every site
+    listed in the round-37 GOAL: `0x69ab` (CTransformInputPin::
+    Receive prologue, EnterCriticalSection + delegate to slot
+    21 = `0x25a2`), `0x5e34` (the worker that calls
+    `sample->GetTime` at slot 5 + `sample->GetMediaType` at
+    slot 13), `0x25a2` (CTransformFilter::Receive — calls
+    `0x6fee` preprocess then takes failure branch `0x261a`
+    when our `sample_get_time` returns `VFW_S_NO_STOP_TIME`,
+    falling through to call `0x6473` Transform), `0x6473`
+    (CTransformFilter::Transform — reads `[filter+0x8c]`
+    input-pin pointer, calls allocator GetBuffer, may QI for
+    a sub-interface and jump to cleanup `0x6560` on failure),
+    and `0x2da7` (slot 13 of vtable `0x269f4` — the codec's
+    PRIMARY C++ class vtable).
+  - **Vtable layout decoded** — the codec's filter constructor
+    at RVA `0x24ca` stamps FIVE vtables on the C++ class:
+    primary at `[obj+0] = 0x269f4` (`CTransformFilter`-style
+    polymorphic methods), IPersist at `[obj+0xc] = 0x269b8`
+    (this is what CoCreateInstance returns as IBaseFilter, so
+    `self.filter = filter_base + 0xc`), three more at `+0x10`,
+    `+0xc0`, `+0xc4`.  The `m_pInput` field that traps in
+    `0x2da7` (`mov ecx, [ebx+0x8c]; add ecx, 0x1c; call
+    0x7176`) is at `[filter_base + 0x8c]` — i.e.
+    `[self.filter + 0x80]`.
+  - **Pre-Receive sanity dump** — `discovery::codec::receive_
+    frame` now reads `[filter_base + 0]`, `[filter_base +
+    0x8c]`, `[filter_base + 0x90]`, `[sample]`, and
+    `[sample_vtbl + 0x34]` BEFORE driving Receive, so the
+    trap message's new `r38_pre=...` section carries:
+    `sample=<host arena>`, `sample_vtbl=<host arena + 0x40>`,
+    `sample_vtbl[+0x34]=0xfffe<thunk>` (proves slot 13 is
+    OUR `sample_get_media_type` host thunk), `mip=<host
+    arena>`, `self.filter=<host arena>`, `filter_base=<self.
+    filter - 0xc>`, `[filter_base+0]=0x1c4269f4` (matches
+    the constructor's stamp), `[filter_base+0x8c]=0x60000280`
+    (NON-NULL — input pin IS allocated by EnumPins/Next).
+  - **Round-37 hypothesis falsified** — the trap is reached
+    even though `[filter_base + 0x8c]` is non-NULL, so the
+    failing object inside the codec's Transform chain is NOT
+    the top-level filter.  r39 should chase which intermediate
+    object's `+0x8c` is being read at trap time (likely
+    accessed via the QI path at `0x4064f3` — the QI may
+    return a sub-interface whose vtable's slot 13 also =
+    `0x2da7`, leading to a cascading null-pointer in some
+    transient).
+  - **Force-allocation fallback (defensive, currently no-op)** —
+    if `[filter_base + 0x8c]` IS observed as NULL on a future
+    fixture, we now call slot 7 of the primary vtable
+    (`0x33fd`, the per-CLSID GetPin helper) on `filter_base`
+    to force lazy-init.  The current MP43 fixture's filter
+    has the field already non-NULL, so this branch never
+    runs in r38; it remains as a guard for r39+ scenarios.
+  - **`tests/round38_filter_base_offset.rs`** — three tests:
+    (1) the trap message MUST carry the `r38_pre=` section
+    + identify `filter_base`, `[filter_base+0]=0x1c4269f4`,
+    and `[filter_base+0x8c]` non-NULL; (2) the input sample's
+    slot 13 MUST resolve to a host thunk in `0xFFFE_xxxx`
+    space (proves no codec sample-substitution); (3) the
+    round-37 negotiation baseline (GA/SP/CO=S_OK,
+    using_codec_allocator=true) MUST hold.
+
 - Round 36 — **diagnose `IMemInputPin::Receive` trap site** that
   r35 unblocked.  Round 35 closed with the codec successfully
   minting its own allocator + driving `SetProperties + Commit`

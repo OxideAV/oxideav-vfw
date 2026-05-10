@@ -1805,6 +1805,159 @@ impl Decoder for SandboxedDshowDecoder {
             mip_state
         );
 
+        // Round 38 — also stamp `mip` into the diagnostic body so
+        // r39 can confirm `mip == filter_base` (or not) without
+        // recomputing.
+        let r38_mip = mip;
+
+        // Round 38 — pre-Receive sanity check.  Round 37 wired
+        // `IPin::QueryPinInfo` + `ConnectedTo` + `IBaseFilter::
+        // QueryFilterInfo`, but the trap at MPG4DS32 RVA `0x7184`
+        // (= `repe cmpsd` inside the `IsEqualGUID(this+0x1c, &kIID)`
+        // helper at `0x7176`) persisted because `[ebx+0x8c]` was
+        // still NULL when reached via the Receive → Transform call
+        // chain.
+        //
+        // Static disassembly of MPG4DS32.AX RVA `0x7176`/`0x2da7`/
+        // `0x6473`/`0x6560`/`0x2626`/`0x25a2`/`0x69ab`/`0x5e34`
+        // (function-table walk via `objdump -d -M intel`) identifies:
+        //
+        //  * `0x69ab` = `CTransformInputPin::Receive(IMediaSample*)`
+        //    — calls a worker `0x5e34` then delegates to filter
+        //    vtable slot 21 (`[+0x54]`) = `0x25a2`.
+        //  * `0x25a2` = `CTransformFilter::Receive(IMediaSample*)`
+        //    — calls preprocess helper `0x6fee` (which calls
+        //    `sample->GetTime` at vtable slot 5).  Our
+        //    `sample_get_time` returns `VFW_S_NO_STOP_TIME`
+        //    (`0x00040007`, not `S_OK`), which the codec treats
+        //    as failure: `xor eax, eax; jmp 0x70f1` returning 0.
+        //    `0x25a2` then takes the `0x261a` failure branch and
+        //    calls `0x6473` (`Transform`) anyway.
+        //  * `0x6473` = `CTransformFilter::Transform(in, out**)` —
+        //    reads `[filter+0x8c]` (input pin pointer) and
+        //    dereferences `pin+0xa8` for the connection media-type
+        //    sub-struct.  Returns S_OK from its 0x6560 cleanup
+        //    branch even when `inSample->GetMediaTime` returns the
+        //    `VFW_E_MEDIA_TIME_NOT_SET` we hand back.
+        //  * After `0x6473` returns to `0x25a2` at `0x402626`, the
+        //    next instruction at `0x402634-0x40263b` does
+        //    `mov eax, [ebx]; lea ecx, [ebp+8]; push ecx; push ebx;
+        //    call [eax+0x34]`.  `ebx` is the SAMPLE pointer
+        //    (function arg 1, never overwritten on this branch);
+        //    `[eax+0x34]` is slot 13 of its vtable.  The trap shows
+        //    execution lands at codec RVA `0x2da7`, and the only
+        //    vtable in the binary with `0x2da7` at slot 13 is
+        //    `0x1c4269f4` — the codec's PRIMARY C++ class vtable
+        //    for `CTransformFilter`/its derived class.
+        //
+        // The implication is that the SAMPLE we're handing to
+        // `Receive` has its first dword == `0x1c4269f4` — i.e. the
+        // codec's `IMemAllocator::GetBuffer` returned an object
+        // whose vtable IS the filter's primary vtable, NOT a
+        // `CMediaSample` vtable.  This can only happen if the
+        // codec re-purposed the filter pointer as a "sample" stub
+        // (some allocator implementations stamp a sentinel vtable
+        // for diagnostics), or our `[mip+0x40]` / `[mip+0x48]`
+        // back-references (both `0x60000110` per round-37 mip
+        // dump) are being mistaken for samples.
+        //
+        // For r38 the goal is observation, not speculation.  Dump
+        // the SAMPLE's first 0x40 bytes + the codec's filter
+        // primary-vtable view at `[filter]` so r39 can see whether
+        // the sample REALLY has the filter vtable, or whether the
+        // call chain actually walks through some other intermediate
+        // object.  Also dump `[filter+0x8c]` (the C++ `m_pInput`
+        // field whose NULL we keep crashing on).
+        let mut sample_state: Vec<String> = Vec::new();
+        for off in (0..=0x40u32).step_by(4) {
+            if let Ok(v) = sb.mmu.load32(sample + off) {
+                sample_state.push(format!("[+{off:#04x}]={v:#010x}"));
+            }
+        }
+        let sample_vtbl = sb.mmu.load32(sample).unwrap_or(0);
+        let sample_slot13 = if sample_vtbl != 0 {
+            sb.mmu.load32(sample_vtbl + 0x34).unwrap_or(0)
+        } else {
+            0
+        };
+        // The IBaseFilter pointer we hold is the IBaseFilter
+        // SUB-INTERFACE of the C++ class, which the constructor at
+        // RVA `0x24ca` stamps at `[filter_base + 0xc] = 0x1c4269b8`.
+        // The C++ class's primary vtable is at `[filter_base + 0]
+        // = 0x1c4269f4`, and its `m_pInput` (the field referenced
+        // as `[ebx+0x8c]` in the trap function `0x2da7`) is at
+        // `[filter_base + 0x8c]`.  Hence: `filter_base =
+        // self.filter - 0xc`, and `[filter_base + 0x8c] =
+        // [self.filter + 0x80]`.
+        let filter_base = self.filter.wrapping_sub(0xc);
+        let filter_primary_vtbl = sb.mmu.load32(filter_base).unwrap_or(0);
+        let filter_pin_in = sb.mmu.load32(filter_base.wrapping_add(0x8c)).unwrap_or(0);
+        let filter_pin_out = sb.mmu.load32(filter_base.wrapping_add(0x90)).unwrap_or(0);
+        log::debug!(
+            "vfw discovery (DShow): r38 pre-Receive sanity: \
+             sample={sample:#010x} sample[+0]={sample_vtbl:#010x} \
+             sample_vtbl[+0x34]={sample_slot13:#010x} \
+             self.filter={:#010x} filter_base={filter_base:#010x} \
+             [filter_base+0]={filter_primary_vtbl:#010x} \
+             [filter_base+0x8c]={filter_pin_in:#010x} \
+             [filter_base+0x90]={filter_pin_out:#010x}",
+            self.filter,
+        );
+
+        // Round 38 — if `[filter_base+0x8c]` is NULL, force the
+        // codec to lazy-allocate its input pin via slot 7 of its
+        // primary C++ class vtable (per static disasm:
+        // `[0x269f4 + 0x1c] = 0x33fd`, the per-CLSID GetPin helper
+        // that runs `new(0xe8); ctor(0, this, &hr_local,
+        // vtable=0x429264); [filter_base+0x8c] = pin`).
+        //
+        // Round 27's `EnumPins → Next` walked a DIFFERENT vtable
+        // (the IBaseFilter COM sub-vtable at `0x269b8`, slot 7 of
+        // which is `0x4ace = EnumPins`, NOT GetPin), so the
+        // PRIMARY-vtable `m_pInput` field never got lazy-
+        // initialized through that path.  IEnumPins::Next does
+        // call back into the filter via `[edx+0x1c]` (slot 7 of
+        // FILTER's primary vtable — see `0x404f25`), but that
+        // call-target is the FILTER's primary vtable, not the
+        // IBaseFilter sub-vtable, so the lazy-init only happens
+        // when the codec's IEnumPins enumerator is walked.  We DO
+        // walk that, but it appears to construct an enumerator
+        // bound to a DIFFERENT this-pointer than the one we hold
+        // via `self.filter`.
+        let r38_force_target = filter_base; // C++ class base
+        if filter_pin_in == 0 {
+            log::debug!(
+                "vfw discovery (DShow): r38 [filter_base+0x8c]=NULL — \
+                 calling filter_base->primary_slot7 to force input-pin \
+                 allocation"
+            );
+            // Slot 7 of the filter's primary C++ vtable. We need
+            // to pass `this = filter_base` (NOT `self.filter`),
+            // since the C++ class methods use offset-0 vtable.
+            let _ = crate::com::call::call_method(
+                &mut sb.cpu,
+                &mut sb.mmu,
+                &sb.registry,
+                &mut sb.host,
+                r38_force_target,
+                7,
+                &[0],
+            );
+            let now = sb.mmu.load32(filter_base.wrapping_add(0x8c)).unwrap_or(0);
+            log::debug!("vfw discovery (DShow): r38 post-force [filter_base+0x8c]={now:#010x}");
+        }
+
+        let r38_pre_receive = format!(
+            "sample={sample:#010x} sample_vtbl={sample_vtbl:#010x} \
+             sample_vtbl[+0x34]={sample_slot13:#010x} \
+             mip={r38_mip:#010x} self.filter={:#010x} \
+             filter_base={filter_base:#010x} \
+             [filter_base+0]={filter_primary_vtbl:#010x} \
+             [filter_base+0x8c]={filter_pin_in:#010x} \
+             sample_state={sample_state:?}",
+            self.filter,
+        );
+
         // Drive IMemInputPin::Receive(sample).  On trap, snapshot
         // the CPU register file + the last 8 entries of the trace
         // ring so the round-36+ diagnostic doesn't require a
@@ -1884,7 +2037,8 @@ impl Decoder for SandboxedDshowDecoder {
                      [trap_eip={trap_eip:#010x} rva={rva:#010x} \
                      eax={:#010x} ecx={:#010x} edx={:#010x} ebx={:#010x} \
                      esp={:#010x} ebp={:#010x} esi={:#010x} edi={:#010x} \
-                     trace_tail={:?} call_chain={:?} stack={:?} mip_state={:?}]",
+                     trace_tail={:?} call_chain={:?} stack={:?} \
+                     mip_state={:?} r38_pre={r38_pre_receive}]",
                     reg(Reg32::Eax),
                     reg(Reg32::Ecx),
                     reg(Reg32::Edx),
