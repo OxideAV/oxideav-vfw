@@ -40,8 +40,8 @@
 //! IFilterGraph's eight methods in declaration order.
 
 use super::{
-    Guid, IID_ICLASSFACTORY, IID_IFILTERGRAPH, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR, IID_IPIN,
-    IID_IUNKNOWN,
+    Guid, IID_ICLASSFACTORY, IID_IFILTERGRAPH, IID_IMEDIASAMPLE, IID_IMEDIASAMPLE2,
+    IID_IMEMALLOCATOR, IID_IPIN, IID_IUNKNOWN,
 };
 use crate::emulator::{Cpu, Mmu};
 use crate::win32::{HostState, Registry, StubFn, Win32Error};
@@ -309,6 +309,24 @@ pub fn register(registry: &mut Registry) {
         sample_get_media_time as StubFn,
         3,
     );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::SetMediaTime",
+        sample_set_media_time as StubFn,
+        3,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample2::GetProperties",
+        sample_get_properties as StubFn,
+        3,
+    );
+    registry.register(
+        HOST_DLL,
+        "IMediaSample2::SetProperties",
+        sample_set_properties as StubFn,
+        3,
+    );
 
     // ---- Round 35 — host class factory for CLSID_MemoryAllocator -
     //
@@ -479,7 +497,11 @@ pub fn mint_host_media_sample(
 ) -> Result<u32, crate::Error> {
     // Round capacity up to 16 to keep arena alignment predictable.
     let cap = data_capacity.div_ceil(16) * 16;
-    let header_size = 64u32 + 18 * 4; // 64-byte header + 72-byte vtable
+    // Round 39 — vtable extended from 18 → 21 entries to cover
+    // `SetMediaTime` (slot 18) + `IMediaSample2::GetProperties`
+    // (slot 19) + `IMediaSample2::SetProperties` (slot 20).  Header
+    // sized accordingly.
+    let header_size = 64u32 + 21 * 4; // 64-byte header + 84-byte vtable
     let obj = state
         .arena_alloc(header_size.div_ceil(16) * 16)
         .map_err(crate::Error::Win32)?;
@@ -513,7 +535,7 @@ pub fn mint_host_media_sample(
             .map_err(crate::Error::Trap)?;
     }
 
-    let methods: [&str; 18] = [
+    let methods: [&str; 21] = [
         "IMediaSample::QueryInterface",
         "IMediaSample::AddRef",
         "IMediaSample::Release",
@@ -532,6 +554,12 @@ pub fn mint_host_media_sample(
         "IMediaSample::IsDiscontinuity",
         "IMediaSample::SetDiscontinuity",
         "IMediaSample::GetMediaTime",
+        // Round 39 — slots 18..20 (last IMediaSample method +
+        // IMediaSample2 extension).  Codecs that QI for
+        // IID_IMEDIASAMPLE2 expect these to be live thunks.
+        "IMediaSample::SetMediaTime",
+        "IMediaSample2::GetProperties",
+        "IMediaSample2::SetProperties",
     ];
     for (i, name) in methods.iter().enumerate() {
         let thunk = registry
@@ -1881,7 +1909,15 @@ fn alloc_release_buffer(
 // ---- HostIMediaSample stubs ------------------------------------------
 
 /// `IMediaSample::QueryInterface(this, REFIID, void**)`. Resolves
-/// IUnknown / IMediaSample to `this`; everything else fails.
+/// IUnknown / IMediaSample / IMediaSample2 to `this`; everything
+/// else fails.
+///
+/// Round 39 — accept `IID_IMEDIASAMPLE2` so codecs that QI for
+/// the extended interface (notably `mpg4ds32` from inside its
+/// `CTransformFilter::Transform` at RVA `0x4064f3`) get a usable
+/// pointer.  Slots 19/20 of our host vtable implement
+/// `GetProperties` / `SetProperties` per the public
+/// `AM_SAMPLE2_PROPERTIES` ABI documented in `strmif.h`.
 fn sample_qi(
     cpu: &mut Cpu,
     mmu: &mut Mmu,
@@ -1896,7 +1932,7 @@ fn sample_qi(
     }
     let _ = mmu.write_initializer(ppv, &0u32.to_le_bytes());
     let iid = Guid::load(mmu, piid).map_err(|t| trap("HostIMediaSample::QI", t))?;
-    if iid == IID_IUNKNOWN || iid == IID_IMEDIASAMPLE {
+    if iid == IID_IUNKNOWN || iid == IID_IMEDIASAMPLE || iid == IID_IMEDIASAMPLE2 {
         if let Ok(rc) = mmu.load32(this + 4) {
             let _ = mmu.write_initializer(this + 4, &rc.saturating_add(1).to_le_bytes());
         }
@@ -2110,6 +2146,143 @@ fn sample_returns_s_ok_2(
     _state: &mut HostState,
     _registry: &Registry,
 ) -> Result<u32, Win32Error> {
+    Ok(S_OK)
+}
+
+/// `IMediaSample::SetMediaTime(this, LONGLONG* pStart,
+/// LONGLONG* pEnd)`.
+///
+/// Round 39 — last method of `IMediaSample` (slot 18); accepts
+/// whatever the codec asks but ignores it (we have no consumer
+/// for media-time on host samples).  Also addresses round-38 gap
+/// where slot 18 had been unset on the host vtable, leaving the
+/// codec's cleanup-branch `[ecx+0x48]` call dispatching to NULL
+/// when it followed the `IMediaSample2`-QI-failure path.
+fn sample_set_media_time(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    Ok(S_OK)
+}
+
+/// `IMediaSample2::GetProperties(this, DWORD cb, BYTE* pProps)` —
+/// slot 19.
+///
+/// Fills the first `cb` bytes of `pProps` with an
+/// `AM_SAMPLE2_PROPERTIES` view of `this`.  Layout per the public
+/// `strmif.h`:
+///
+/// ```c
+/// typedef struct {
+///   DWORD             cbData;                  // 0x00
+///   DWORD             dwTypeSpecificFlags;     // 0x04
+///   DWORD             dwSampleFlags;           // 0x08
+///   LONG              lActual;                 // 0x0c
+///   REFERENCE_TIME    tStart;                  // 0x10
+///   REFERENCE_TIME    tStop;                   // 0x18
+///   DWORD             dwStreamId;              // 0x20
+///   AM_MEDIA_TYPE *   pMediaType;              // 0x24
+///   BYTE *            pbBuffer;                // 0x28
+///   LONG              cbBuffer;                // 0x2c
+/// } AM_SAMPLE2_PROPERTIES;                     // sizeof = 0x30
+/// ```
+///
+/// Round 39 — `mpg4ds32`'s `CTransformFilter::Transform` calls
+/// this with `cb = 0x10` (only the first 4 fields).  We therefore
+/// always populate at least those four fields and write up to
+/// `min(cb, 0x30)` bytes total.
+fn sample_get_properties(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let cb = arg(cpu, mmu, 1)?;
+    let p_props = arg(cpu, mmu, 2)?;
+    if p_props == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    // Pull host-sample fields.
+    let actual_len = mmu
+        .load32(this + 16)
+        .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    let sync_flag = mmu
+        .load32(this + 20)
+        .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    let media_type_ptr = mmu
+        .load32(this + 24)
+        .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    let data_region = mmu
+        .load32(this + 8)
+        .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    let cap = mmu
+        .load32(this + 12)
+        .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    // sync_flag → AM_SAMPLE_SPLICEPOINT (0x10) per strmif.h.
+    let sample_flags = if sync_flag != 0 { 0x10u32 } else { 0u32 };
+    // Build the 0x30-byte struct in a stack buffer.
+    let mut props = [0u8; 0x30];
+    let mut put = |off: usize, v: u32| {
+        props[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    put(0x00, 0x30); // cbData
+    put(0x04, 0); // dwTypeSpecificFlags
+    put(0x08, sample_flags); // dwSampleFlags
+    put(0x0c, actual_len); // lActual
+                           // tStart / tStop kept zero — we don't track timestamps on
+                           // the host-sample side.
+    put(0x20, 0); // dwStreamId
+    put(0x24, media_type_ptr); // pMediaType
+    put(0x28, data_region); // pbBuffer
+    put(0x2c, cap); // cbBuffer
+    let n = (cb as usize).min(0x30);
+    for (i, &b) in props.iter().take(n).enumerate() {
+        mmu.store8(p_props + (i as u32), b)
+            .map_err(|t| trap("HostIMediaSample2::GetProperties", t))?;
+    }
+    Ok(S_OK)
+}
+
+/// `IMediaSample2::SetProperties(this, DWORD cb, const BYTE*
+/// pProps)` — slot 20.
+///
+/// Round 39 — accept the round-trip from `GetProperties`.
+/// Mirrors `lActual` (`pProps[+0x0c]`) into the host sample's
+/// actual-data-length field at `obj+16`, and `dwSampleFlags`
+/// (`pProps[+0x08]`)'s `AM_SAMPLE_SPLICEPOINT` bit (0x10) into
+/// the sync-flag at `obj+20`.  Other fields ignored per the
+/// minimal `mpg4ds32` write surface (`cb` = 0x20 in the codec's
+/// success-branch).
+fn sample_set_properties(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let cb = arg(cpu, mmu, 1)?;
+    let p_props = arg(cpu, mmu, 2)?;
+    if p_props == 0 {
+        return Ok(crate::com::E_POINTER);
+    }
+    if cb >= 0x10 {
+        let flags = mmu
+            .load32(p_props + 0x08)
+            .map_err(|t| trap("HostIMediaSample2::SetProperties", t))?;
+        let actual = mmu
+            .load32(p_props + 0x0c)
+            .map_err(|t| trap("HostIMediaSample2::SetProperties", t))?;
+        let cap = mmu
+            .load32(this + 12)
+            .map_err(|t| trap("HostIMediaSample2::SetProperties", t))?;
+        let n = actual.min(cap);
+        let _ = mmu.write_initializer(this + 16, &n.to_le_bytes());
+        let sync = u32::from(flags & 0x10 != 0);
+        let _ = mmu.write_initializer(this + 20, &sync.to_le_bytes());
+    }
     Ok(S_OK)
 }
 

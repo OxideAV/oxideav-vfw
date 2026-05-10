@@ -1869,7 +1869,7 @@ impl Decoder for SandboxedDshowDecoder {
         // object.  Also dump `[filter+0x8c]` (the C++ `m_pInput`
         // field whose NULL we keep crashing on).
         let mut sample_state: Vec<String> = Vec::new();
-        for off in (0..=0x40u32).step_by(4) {
+        for off in (0..=0xa0u32).step_by(4) {
             if let Ok(v) = sb.mmu.load32(sample + off) {
                 sample_state.push(format!("[+{off:#04x}]={v:#010x}"));
             }
@@ -1947,6 +1947,27 @@ impl Decoder for SandboxedDshowDecoder {
             log::debug!("vfw discovery (DShow): r38 post-force [filter_base+0x8c]={now:#010x}");
         }
 
+        // Round 39 — capture the OUTPUT pin's allocator pointer
+        // (`[output_pin+0x98]`) + its vtable head, so we know
+        // whether the codec's `m_pOutput->m_pAllocator` is wired
+        // through to one of our host allocators (vtable in the
+        // `0xfffe...` thunk band).
+        let output_alloc = if filter_pin_out != 0 {
+            sb.mmu.load32(filter_pin_out + 0x98).unwrap_or(0)
+        } else {
+            0
+        };
+        let output_alloc_vtbl0 = if output_alloc != 0 {
+            sb.mmu.load32(output_alloc).unwrap_or(0)
+        } else {
+            0
+        };
+        let output_alloc_qi_thunk = if output_alloc_vtbl0 != 0 {
+            sb.mmu.load32(output_alloc_vtbl0).unwrap_or(0)
+        } else {
+            0
+        };
+
         let r38_pre_receive = format!(
             "sample={sample:#010x} sample_vtbl={sample_vtbl:#010x} \
              sample_vtbl[+0x34]={sample_slot13:#010x} \
@@ -1954,6 +1975,10 @@ impl Decoder for SandboxedDshowDecoder {
              filter_base={filter_base:#010x} \
              [filter_base+0]={filter_primary_vtbl:#010x} \
              [filter_base+0x8c]={filter_pin_in:#010x} \
+             [filter_base+0x90]={filter_pin_out:#010x} \
+             output_alloc={output_alloc:#010x} \
+             output_alloc_vtbl0={output_alloc_vtbl0:#010x} \
+             output_alloc_qi_thunk={output_alloc_qi_thunk:#010x} \
              sample_state={sample_state:?}",
             self.filter,
         );
@@ -2013,12 +2038,45 @@ impl Decoder for SandboxedDshowDecoder {
                     .rev()
                     .map(|e| format!("{e:#010x}"))
                     .collect();
+                // Round 39 — also expose the LAST 64 raw RVAs from
+                // the trace ring, so we can see the per-instruction
+                // path that the heuristic chain compresses.
+                // Round 39 — also expose the LAST 32 raw RVAs from
+                // the trace ring so the heuristic-compressed
+                // `call_chain` can be cross-checked.
+                let raw_tail: Vec<String> = ring
+                    .iter()
+                    .rev()
+                    .take(32)
+                    .rev()
+                    .map(|e| format!("{:#010x}", e.wrapping_sub(module_base)))
+                    .collect();
+                // Round 39 — re-read the input + output pool head
+                // samples' vtable slot 13 RIGHT NOW (post-trap) so
+                // we can see whether the codec mutated them.  We
+                // expect both to remain `0xfffe03a0` (host thunk);
+                // a different value means the codec's transform
+                // wrote through pSample's vtable.
+                let recheck_sample_vtbl = sb.mmu.load32(sample).unwrap_or(0);
+                let recheck_sample_slot13 = if recheck_sample_vtbl != 0 {
+                    sb.mmu
+                        .load32(recheck_sample_vtbl.wrapping_add(0x34))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 // Walk the stack frame: dump esp..esp+32 dwords as
                 // potential return addresses + saved registers, so
                 // a follow-up disasm pass can identify the caller.
                 let esp = sb.cpu.regs.esp();
                 let mut stack_frame: Vec<String> = Vec::new();
-                for i in 0..16u32 {
+                // Round 39 — widened from 16 → 32 dwords so we can
+                // walk both the inner `0x7176` frame and the
+                // outer `0x25a2` frame's locals (`[ebp-0x4]` =
+                // pSampleOut, `[ebp+0x8]` = pInSample).  The first
+                // outer-frame slot of interest sits at ~`esp+0x4c`
+                // (return EIP) and the args at `esp+0x50/0x54`.
+                for i in 0..32u32 {
                     if let Ok(v) = sb.mmu.load32(esp + i * 4) {
                         let v_rva = v.wrapping_sub(module_base);
                         // Filter to values that look like they
@@ -2037,7 +2095,9 @@ impl Decoder for SandboxedDshowDecoder {
                      [trap_eip={trap_eip:#010x} rva={rva:#010x} \
                      eax={:#010x} ecx={:#010x} edx={:#010x} ebx={:#010x} \
                      esp={:#010x} ebp={:#010x} esi={:#010x} edi={:#010x} \
-                     trace_tail={:?} call_chain={:?} stack={:?} \
+                     recheck_sample_vtbl={recheck_sample_vtbl:#010x} \
+                     recheck_sample_slot13={recheck_sample_slot13:#010x} \
+                     trace_tail={:?} call_chain={:?} raw_tail={:?} stack={:?} \
                      mip_state={:?} r38_pre={r38_pre_receive}]",
                     reg(Reg32::Eax),
                     reg(Reg32::Ecx),
@@ -2049,6 +2109,7 @@ impl Decoder for SandboxedDshowDecoder {
                     reg(Reg32::Edi),
                     ring_tail,
                     chain_tail,
+                    raw_tail,
                     stack_frame,
                     mip_state,
                 )));

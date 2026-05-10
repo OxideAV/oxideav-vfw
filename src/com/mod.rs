@@ -382,6 +382,30 @@ pub const IID_IMEDIASAMPLE: Guid = Guid::new(
     [0xB0, 0x3A, 0x00, 0x20, 0xAF, 0x0B, 0xA7, 0x70],
 );
 
+/// `IID_IMediaSample2` (`{36B73884-C2C8-11CF-8B46-00805F6CEF60}`).
+///
+/// Extends [`IID_IMEDIASAMPLE`] with two methods at slots 19 and 20
+/// (after IMediaSample's 19 = 3 IUnknown + 16 IMediaSample):
+/// `19=GetProperties(DWORD cb, BYTE* pProps)`,
+/// `20=SetProperties(DWORD cb, const BYTE* pProps)`.  Both transport
+/// the public `AM_SAMPLE2_PROPERTIES` struct (64 bytes per
+/// `strmif.h`).
+///
+/// Source: Microsoft Platform SDK `strmif.h`.  Reverse-engineered
+/// from the disassembly of MPG4DS32.AX RVA `0x4064f3` (round 39):
+/// `CTransformFilter::Transform` calls `pSampleOut->QueryInterface(
+/// IID_IMediaSample2, &p2)` immediately after fetching the output
+/// buffer; on success it reads the AMT properties via slots 19/20
+/// of the returned interface.  Returning `E_NOINTERFACE` forces the
+/// codec down a fallback branch that ends up trapping in the GUID-
+/// equality helper at RVA `0x7176`.
+pub const IID_IMEDIASAMPLE2: Guid = Guid::new(
+    0x36B7_3884,
+    0xC2C8,
+    0x11CF,
+    [0x8B, 0x46, 0x00, 0x80, 0x5F, 0x6C, 0xEF, 0x60],
+);
+
 /// `IID_IFilterGraph` (`{56A8689F-0AD4-11CE-B03A-0020AF0BA770}`).
 /// Slots beyond IUnknown:
 /// 3=`AddFilter`, 4=`RemoveFilter`, 5=`EnumFilters`,
@@ -527,6 +551,26 @@ pub const SLOT_MEDIASAMPLE_GET_ACTUAL_DATA_LENGTH: u32 = 11;
 /// Caller declares the count of valid bytes the codec should
 /// process from the buffer.  Must be ≤ `GetSize()`.
 pub const SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH: u32 = 12;
+/// `IMediaSample::GetMediaType(AM_MEDIA_TYPE** ppMediaType)` —
+/// slot 13.
+pub const SLOT_MEDIASAMPLE_GET_MEDIA_TYPE: u32 = 13;
+/// `IMediaSample::SetMediaType(AM_MEDIA_TYPE* pMediaType)` —
+/// slot 14.
+pub const SLOT_MEDIASAMPLE_SET_MEDIA_TYPE: u32 = 14;
+/// `IMediaSample::GetMediaTime(LONGLONG* pStart, LONGLONG* pEnd)`
+/// — slot 17.
+pub const SLOT_MEDIASAMPLE_GET_MEDIA_TIME: u32 = 17;
+/// `IMediaSample::SetMediaTime(LONGLONG* pStart, LONGLONG* pEnd)`
+/// — slot 18.  Last method of `IMediaSample`.
+pub const SLOT_MEDIASAMPLE_SET_MEDIA_TIME: u32 = 18;
+
+/// `IMediaSample2::GetProperties(DWORD cb, BYTE* pProps)` — slot 19.
+/// Round 39 — first method beyond `IMediaSample`'s vtable.
+pub const SLOT_MEDIASAMPLE2_GET_PROPERTIES: u32 = 19;
+/// `IMediaSample2::SetProperties(DWORD cb, const BYTE* pProps)` —
+/// slot 20.  Round 39 — second method beyond `IMediaSample`'s
+/// vtable.
+pub const SLOT_MEDIASAMPLE2_SET_PROPERTIES: u32 = 20;
 
 /// `IMemInputPin::GetAllocator(IMemAllocator** ppAllocator)` —
 /// slot 3.  Per MSDN

@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 39 — **`IID_IMediaSample2` host-side QI support; Transform
+  reaches its success-tail at `0x65c0`** (was `0x6560` failure
+  cleanup).  Round-38 disasm of the QI at MPG4DS32.AX RVA
+  `0x4064f3` identified the IID being requested as
+  `{36B73884-C2C8-11CF-8B46-00805F6CEF60}` =
+  `IID_IMediaSample2` (Microsoft Platform SDK `strmif.h`
+  extension of `IMediaSample`, two new methods: `GetProperties`
+  / `SetProperties` of the `AM_SAMPLE2_PROPERTIES` struct).
+  Returning `E_NOINTERFACE` (the round-30..38 baseline) sent
+  the codec down the QI-failure cleanup branch.  Round 39:
+  - New IID constant `IID_IMEDIASAMPLE2` in `crate::com`.
+  - New slot constants `SLOT_MEDIASAMPLE_GET_MEDIA_TYPE` (13),
+    `SLOT_MEDIASAMPLE_SET_MEDIA_TYPE` (14),
+    `SLOT_MEDIASAMPLE_GET_MEDIA_TIME` (17),
+    `SLOT_MEDIASAMPLE_SET_MEDIA_TIME` (18),
+    `SLOT_MEDIASAMPLE2_GET_PROPERTIES` (19),
+    `SLOT_MEDIASAMPLE2_SET_PROPERTIES` (20).
+  - `sample_qi` accepts `IID_IMEDIASAMPLE2`.
+  - Three new host stubs: `sample_set_media_time` (slot 18 —
+    previously NULL on the host vtable, an active footgun
+    because Transform's failure-cleanup `[ecx+0x48]` call at
+    RVA `0x4065bd` would have dispatched to NULL),
+    `sample_get_properties` and `sample_set_properties`
+    (slots 19/20).  Both round-trip the public
+    `AM_SAMPLE2_PROPERTIES` fields the codec writes
+    (`cbData` / `dwSampleFlags` / `lActual` / `pbBuffer` /
+    `cbBuffer` / `pMediaType`).
+  - Host sample vtable resized 18 → 21 entries, header from
+    `64 + 18*4 = 136` → `64 + 21*4 = 148` bytes (rounded to
+    16 = 160).
+  - Pre-Receive diagnostic dump in
+    `discovery::codec::receive_frame` extended with
+    `output_alloc` / `output_alloc_vtbl0` /
+    `output_alloc_qi_thunk` so r40 can see whether the
+    codec's output-pin allocator (set inside its private
+    `CoCreateInstance(CLSID_MemoryAllocator)` call from
+    sub-goal r35) has the host-thunk vtable head.
+  - New `tests/round39_imediasample2_qi.rs` (3 tests):
+    Transform success-tail RVA `0x65c0` reached, helper
+    success RVA `0x5f24` reached, sample slot 13 unchanged
+    after run.
+  - `Receive` trap RVA `0x7184` is unchanged (still
+    `IsEqualGUID(NULL+0x1c, &GUID_NULL)`).  R40 needs to
+    explain why pInSample's slot-13 call at RVA `0x40263b`
+    in `0x25a2` resolves to `0x2da7` (filter primary vtable
+    slot 13 = `JoinFilterGraph`) instead of the host thunk
+    `0xfffe03a0` we wrote at `[obj+0x74]`.
+
 - Round 38 — **identify the codec's C++ class base + prove
   `[filter_base+0x8c]` is NON-NULL pre-Receive**, ruling out
   the round-36/37 hypothesis that the trap at MPG4DS32 RVA

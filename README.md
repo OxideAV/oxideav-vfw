@@ -9,23 +9,35 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 38 — codec C++ class base identified; `[filter_base+0x8c]`
-proven non-NULL pre-Receive, falsifying the r36/r37 hypothesis.**
-Static disasm of MPG4DS32.AX RVAs `0x69ab` / `0x5e34` / `0x25a2` /
-`0x6473` / `0x6560` / `0x2da7` / `0x7176` (via `objdump -d -M intel`)
-maps the `Receive → Transform` call chain to the codec's primary
-C++ vtable at VA `0x1c4269f4` (constructor at `0x24ca` stamps it
-at `[obj+0]`).  Since CoCreateInstance returns the IBaseFilter
-sub-vtable (at `[obj+0xc]`), `filter_base = self.filter - 0xc`,
-and the `m_pInput` field that traps in `0x2da7` is at
-`[filter_base + 0x8c]` = `[self.filter + 0x80]`.  The new
-pre-Receive sanity dump in `discovery::codec::receive_frame`
-reads it on every call: for the MP43 fixture it's `0x60000280`
-(NON-NULL) — input pin IS allocated by EnumPins/Next, so the
-trap is on a DIFFERENT object reached deeper in Transform (likely
-via the QI at `0x4064f3` returning a sub-interface whose vtable
-also has `0x2da7` at slot 13).  Trap RVA `0x7184` unchanged from
-r36 baseline; r39 chases the intermediate object's `+0x8c`.
+**Round 39 — `IID_IMediaSample2` host-side QI support; Transform
+now takes its success-tail at `0x65c0` (was `0x6560` failure
+cleanup).** Round-38 disasm of the QI at MPG4DS32.AX RVA `0x4064f3`
+identified the IID being requested as
+`{36B73884-C2C8-11CF-8B46-00805F6CEF60}` =
+`IID_IMediaSample2` (Microsoft Platform SDK `strmif.h` extension
+of `IMediaSample`).  Returning `E_NOINTERFACE` (the round-30..38
+baseline) sent the codec's `CTransformFilter::Transform` down its
+QI-failure cleanup branch at `0x6560`, where it propagated
+per-sample properties through individual `IMediaSample` slot
+calls.  Round 39 wires the host vtable up to recognise the IID
+in `sample_qi` and adds three new thunks at slots 18..20:
+`IMediaSample::SetMediaTime` (slot 18 — previously NULL on the
+host vtable, an active footgun for the cleanup branch's `[ecx+0x48]`
+call at RVA `0x4065bd`), plus `IMediaSample2::GetProperties` /
+`SetProperties` (slots 19/20).  Both new methods round-trip the
+public `AM_SAMPLE2_PROPERTIES` struct (`cbData` / `dwSampleFlags`
+/ `lActual` / `pbBuffer` / `cbBuffer` / `pMediaType`) so the
+codec's success-branch write-back at RVA `0x6545` accepts our
+sample.  The `Receive` trap at RVA `0x7184` is unchanged (still
+`IsEqualGUID(NULL+0x1c, &GUID_NULL)`) but reached via Transform's
+success tail at `0x65c0` instead of the failure tail at `0x6560`,
+plus the pre-Transform helper at `0x5e34` now completes its
+`IMediaSample2`-using property-snapshot path through `0x5f24`.
+The trap is in `0x25a2`'s post-Transform `pInSample->slot 13`
+call at RVA `0x40263b`; r40 needs to identify why the call's
+target resolves to filter-primary-vtable slot 13 (`0x2da7` =
+`JoinFilterGraph`) instead of the host-thunk we wrote at
+`[obj+0x74]` of pInSample.
 
 **Round 30 — DirectShow IMemAllocator + IMediaSample host stubs
 land; ICM_DECOMPRESS_GET_FORMAT dim probe + Indeo / Cinepak trait
