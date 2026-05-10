@@ -9,6 +9,24 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 42 — first multi-frame DShow decode lands.**  The
+`i-frame-then-p-frame-176x144` MS-MPEG-4 v3 fixture's I-frame
+followed by its P-frame both surface as `Frame::Video` through
+the SAME `SandboxedDshowDecoder` instance (1 → 2 frames
+end-to-end).  Round 41 was the first time ANY Video frame ever
+came out of this pipeline but only ever drove a single packet;
+r42 confirms the codec's internal state machine survives
+back-to-back `Receive` calls against the same filter instance.
+Driving the larger `gop-30-352x288` (6-frame GOP at CIF) surfaces
+1/6 frames Video and identifies two distinct R43 blockers via
+the diagnostic blob: (a) the output-allocator side trap at
+MPG4DS32 RVA `0x4064d4` (parity gap with the input-side r41 fix
+— output-allocator stub is called with `ecx=output_alloc_vtbl`
+rather than a `this` pointer), and (b) sample-release cycle
+gap that exhausts the host pool after 4 unreleased samples
+(`0x80040211 = VFW_E_NOT_COMMITTED`).  See
+`tests/round42_dshow_iframe_then_pframe.rs`.
+
 **Round 41 — first end-to-end MP43 keyframe decode through
 DirectShow lands.**  Round 40 had localised a 4-byte stack
 imbalance to `Transform`'s `pop ebx` at MPG4DS32 RVA `0x4065c4`;

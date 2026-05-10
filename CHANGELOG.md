@@ -6,6 +6,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Round 42 — **multi-frame DShow decode lands**: drives the
+  `i-frame-then-p-frame-176x144` fixture's I-frame followed by
+  its P-frame through the SAME `SandboxedDshowDecoder` instance
+  and surfaces both as `Frame::Video` (1 → 2 frames end-to-end).
+  Round 41 was the first ever Video frame out of the DShow path
+  but only ever drove ONE packet; r42 confirms the codec's
+  internal state machine survives back-to-back `Receive` calls
+  against the same filter instance.
+  - `tests/round42_dshow_iframe_then_pframe.rs` (4 tests):
+    `r42_iframe_then_pframe_through_same_decoder` (the headline
+    I+P run, asserts plane0=176·144·3=76032 bytes per frame),
+    `r42_gop30_six_frame_run_through_dshow` (drives all 6 GOP
+    samples of `gop-30-352x288` and pins per-frame outcomes),
+    `r42_codec_id_reflects_registered_fourcc`,
+    `r42_fixture_extracts_two_video_samples`.
+  - **R43 blockers identified empirically by gop-30 run.**  At
+    352×288 (4× the 176×144 surface), the I-frame still surfaces
+    Video but frames 1..=3 trap with `HostIMemAllocator::GetBuffer:
+    memory fault at 0xffff0223 (page unmapped)` at MPG4DS32 RVA
+    `0x4064d4` — the same instruction r41 fixed for the INPUT
+    allocator, now hitting the OUTPUT side via `output_alloc=
+    0x60200fc0` (`output_alloc_vtbl0=0x60200fd0`,
+    `output_alloc_qi_thunk=0xfffe0240`).  The codec walks slot 7
+    (`call [ecx+0x1c]`) of the output allocator's vtable with
+    `ecx=0x60200fd0` (a vtable address rather than a `this`
+    pointer), which suggests our output-side stub is hit with a
+    different calling convention than the input one.  Frames
+    4+5 then return `0x80040211 (VFW_E_NOT_COMMITTED)` once the
+    pool is exhausted by the unreleased samples from frames
+    1..=3.  Two distinct R43 sub-goals: (a) audit the
+    output-side `IMemAllocator` mint helper for parity with the
+    input side fixed in r41; (b) ensure the host's
+    `media_sample_release` / `IMemAllocator::ReleaseBuffer`
+    cycle returns samples to the pool once the downstream
+    receive callback has surfaced them.
+  - The 176×144 I+P case stays clean: 2/2 frames Video.  The
+    diagnostic blob from the gop-30 run — full register
+    snapshots at five Transform-internal watchpoints, the
+    output-allocator's vtable contents, the trap RVA + esp /
+    ebp / ebx / ecx state — gives r43 immediate handoff data.
+
 ### Fixed
 
 - Round 41 — **`IMemAllocator::GetBuffer` arg-count fix unblocks
