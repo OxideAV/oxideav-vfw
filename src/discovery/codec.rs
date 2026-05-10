@@ -2005,6 +2005,43 @@ impl Decoder for SandboxedDshowDecoder {
         } else {
             0
         };
+        // Round 43 — dump the OUTPUT allocator's first 0x40 bytes
+        // pre-Receive so a future trap can be cross-referenced
+        // against round 42's `cur+36 = 0xffff0223` failure.  Slots
+        // of interest:
+        //   `output_alloc+0`  vtbl_ptr
+        //   `output_alloc+4`  refcount
+        //   `output_alloc+8`  sample_pool_head (the walk start)
+        //   `output_alloc+12` committed flag (0=decommitted, 1=committed)
+        let mut r43_oalloc_state: Vec<String> = Vec::new();
+        if output_alloc != 0 {
+            for off in (0..=0x3cu32).step_by(4) {
+                if let Ok(v) = sb.mmu.load32(output_alloc + off) {
+                    r43_oalloc_state.push(format!("[+{off:#04x}]={v:#010x}"));
+                }
+            }
+        }
+        // Round 43 — also walk the OUTPUT pool's first 4 entries
+        // (head + next-links) to confirm the linked list is intact
+        // before the codec's GetBuffer call.  Each pool entry's
+        // `+32` field links to the next.  A NULL or non-arena
+        // value identifies the pool tail / corruption.
+        let mut r43_oalloc_pool: Vec<String> = Vec::new();
+        if output_alloc != 0 {
+            let mut cur = sb.mmu.load32(output_alloc + 8).unwrap_or(0);
+            for i in 0..6u32 {
+                if cur == 0 {
+                    r43_oalloc_pool.push(format!("[{i}]=NULL"));
+                    break;
+                }
+                let in_use = sb.mmu.load32(cur + 36).unwrap_or(0xDEAD_BEEF);
+                let next = sb.mmu.load32(cur + 32).unwrap_or(0xDEAD_BEEF);
+                r43_oalloc_pool.push(format!(
+                    "[{i}]={cur:#010x} in_use={in_use:#x} next={next:#010x}"
+                ));
+                cur = next;
+            }
+        }
 
         let r38_pre_receive = format!(
             "sample={sample:#010x} sample_vtbl={sample_vtbl:#010x} \
@@ -2017,6 +2054,8 @@ impl Decoder for SandboxedDshowDecoder {
              output_alloc={output_alloc:#010x} \
              output_alloc_vtbl0={output_alloc_vtbl0:#010x} \
              output_alloc_qi_thunk={output_alloc_qi_thunk:#010x} \
+             r43_oalloc_state={r43_oalloc_state:?} \
+             r43_oalloc_pool={r43_oalloc_pool:?} \
              sample_state={sample_state:?}",
             self.filter,
         );
@@ -2232,6 +2271,27 @@ impl Decoder for SandboxedDshowDecoder {
         // they're drained as part of the diagnostic blob.)
         let _ = sb.cpu.take_memory_snapshots();
         let _ = sb.cpu.clear_register_watchpoints();
+
+        // Round 43 — release the INPUT sample back to its allocator
+        // so the next `send_packet` can draw a fresh slot.  Without
+        // this, frame N+1's `GetBuffer` ladders past the (still
+        // marked `in_use=1`) earlier samples until the pool is
+        // exhausted (round 42 hit `0x80040211 = VFW_E_NOT_COMMITTED`
+        // on frame 4 of `gop-30-352x288` for exactly this reason).
+        // We call `IMemAllocator::ReleaseBuffer` on whichever
+        // allocator we drew the sample from — codec's own when
+        // `using_codec_allocator`, else the host fallback.  Errors
+        // are swallowed (best-effort cleanup; the codec may have
+        // already released or refused the sample).
+        let _ = crate::com::call::call_method(
+            &mut sb.cpu,
+            &mut sb.mmu,
+            &sb.registry,
+            &mut sb.host,
+            allocator,
+            crate::com::SLOT_MEMALLOCATOR_RELEASE_BUFFER,
+            &[sample],
+        );
 
         // Round 31 — drain the host-side queue populated by the
         // downstream `HostIMemInputPin::Receive` callback.

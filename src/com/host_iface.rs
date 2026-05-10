@@ -228,7 +228,23 @@ pub fn register(registry: &mut Registry) {
         3,
     );
     registry.register(HOST_DLL, "IMediaSample::AddRef", addref as StubFn, 1);
-    registry.register(HOST_DLL, "IMediaSample::Release", release as StubFn, 1);
+    // Round 43 — dedicated `sample_release` thunk recycles the
+    // sample back into its allocator's pool (clears `in_use` at
+    // `+36`) when the refcount transitions through 1 → 0.  The
+    // generic `release` thunk would floor the refcount at 1 and
+    // never recycle, exhausting the pool after `cBuffers` calls
+    // (round 42 saw `0x80040211 = VFW_E_NOT_COMMITTED` on frame 4
+    // of the gop-30-352x288 fixture for exactly this reason).  Per
+    // the standard `CMediaSample` implementation, the destructor
+    // is the side-effect that returns the buffer to the allocator;
+    // we replicate that contract by recycling on the rc==0
+    // transition.
+    registry.register(
+        HOST_DLL,
+        "IMediaSample::Release",
+        sample_release as StubFn,
+        1,
+    );
     registry.register(
         HOST_DLL,
         "IMediaSample::GetPointer",
@@ -1875,23 +1891,56 @@ fn alloc_get_buffer(
         .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
     let mut steps = 0u32;
     while cur != 0 && steps < 1024 {
-        let in_use = mmu
-            .load32(cur + 36)
-            .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+        // Round 43 — sanity-check the pool pointer before reading
+        // through it.  Without this, a corrupted `next_pool_link`
+        // (e.g. a codec that overwrote a sample's `+32` slot, or a
+        // junk head we never wrote) would surface as a memory-fault
+        // trap inside our stub rather than a clean
+        // `VFW_E_TIMEOUT`.  Round 42 saw exactly this at
+        // `cur+36 = 0xffff0223` (so `cur ≈ 0xffff_01ff`) for the
+        // codec's output allocator on the second `Receive` call;
+        // the trap masked the underlying issue and left no
+        // recovery path.
+        //
+        // The sanity criterion: `cur` plus the sample header
+        // (`+36`) plus the next-link slot (`+32`) MUST be readable.
+        // If either load fails, treat the pool as exhausted and
+        // return `VFW_E_TIMEOUT` — letting the codec react with
+        // the standard "no buffer available" backoff instead of
+        // crashing the entire pipeline.
+        let in_use = match mmu.load32(cur + 36) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupted pool pointer — treat as exhaustion.
+                return Ok(0x8004_0211 /* VFW_E_TIMEOUT */);
+            }
+        };
         if in_use == 0 {
             mmu.write_initializer(cur + 36, &1u32.to_le_bytes())
                 .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
-            // Bump refcount.
-            if let Ok(rc) = mmu.load32(cur + 4) {
-                let _ = mmu.write_initializer(cur + 4, &rc.saturating_add(1).to_le_bytes());
-            }
+            // Round 43 — `IMemAllocator::GetBuffer` returns a
+            // sample with refcount = 1 per the canonical
+            // `CMediaSample::GetBuffer` implementation in the DShow
+            // base classes.  The previous behaviour (bump rc by 1
+            // on every issue) interacted badly with the round-43
+            // recycle-on-Release path: the codec's standard one
+            // AddRef + one Release pattern would only get the rc
+            // back down to 1, never 0, so the sample never
+            // recycled.  We now FORCE the rc to 1 so the cycle
+            // closes deterministically.
+            mmu.write_initializer(cur + 4, &1u32.to_le_bytes())
+                .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
             mmu.write_initializer(pp, &cur.to_le_bytes())
                 .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
             return Ok(S_OK);
         }
-        cur = mmu
-            .load32(cur + 32)
-            .map_err(|t| trap("HostIMemAllocator::GetBuffer", t))?;
+        cur = match mmu.load32(cur + 32) {
+            Ok(v) => v,
+            Err(_) => {
+                // Corrupted next-link — same recovery as above.
+                return Ok(0x8004_0211 /* VFW_E_TIMEOUT */);
+            }
+        };
         steps += 1;
     }
     // Pool exhausted.
@@ -1922,6 +1971,58 @@ fn alloc_release_buffer(
 }
 
 // ---- HostIMediaSample stubs ------------------------------------------
+
+/// `IMediaSample::Release(this)` — round 43 dedicated implementation
+/// that closes the sample-release cycle gap surfaced on the
+/// `gop-30-352x288` fixture.
+///
+/// Per Microsoft's reference `CMediaSample` implementation in
+/// the DirectShow base classes (header references in `strmif.h` /
+/// `wxutil.h`), the canonical destructor flow is:
+///
+/// ```c
+/// ULONG CMediaSample::Release() {
+///     LONG cRef = InterlockedDecrement(&m_cRef);
+///     if (cRef == 0 && m_pAllocator)
+///         m_pAllocator->ReleaseBuffer(this);
+///     return cRef;
+/// }
+/// ```
+///
+/// We replicate that contract: when this `Release` call would have
+/// driven the refcount through `1 → 0`, clear the sample's `in_use`
+/// flag at `+36` (the same field [`alloc_release_buffer`] clears)
+/// so the next `GetBuffer` walk on the owning allocator finds the
+/// slot free.  The sample object itself stays alive in arena
+/// memory; what changes is the pool-availability bit.
+///
+/// Floors the returned refcount at 0 (instead of the round-30
+/// `release` thunk's floor at 1) so the codec's own
+/// `if (cRef == 0)` checks fire correctly.
+fn sample_release(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let this = arg(cpu, mmu, 0)?;
+    let rc = mmu
+        .load32(this + 4)
+        .map_err(|t| trap("HostIMediaSample::Release", t))?;
+    let nrc = rc.saturating_sub(1);
+    mmu.write_initializer(this + 4, &nrc.to_le_bytes())
+        .map_err(|t| trap("HostIMediaSample::Release", t))?;
+    if nrc == 0 {
+        // Refcount transitioned through 1 → 0.  Recycle the
+        // sample to its owning allocator's pool by clearing the
+        // `in_use` flag at `+36`.  The sample's object memory is
+        // not freed (the arena allocator never frees), so the
+        // next `GetBuffer` walk on this allocator can re-issue
+        // it directly.
+        let _ = mmu.write_initializer(this + 36, &0u32.to_le_bytes());
+    }
+    Ok(nrc)
+}
 
 /// `IMediaSample::QueryInterface(this, REFIID, void**)`. Resolves
 /// IUnknown / IMediaSample / IMediaSample2 to `this`; everything

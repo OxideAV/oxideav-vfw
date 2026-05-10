@@ -9,6 +9,27 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 43 — full 6-frame GOP decodes end-to-end at 352×288
+through DirectShow.**  The two blockers round 42 identified via
+the gop-30 diagnostic blob are both fixed: (a) a corrupted
+output-allocator pool pointer no longer surfaces as a memory-fault
+trap inside our `alloc_get_buffer` stub — the walk now sanity-
+checks each `cur+36` / `cur+32` read and treats failures as
+`VFW_E_TIMEOUT`; and (b) the sample-release cycle now closes
+properly via a dedicated `sample_release` thunk that recycles
+the sample to its allocator's pool on the `1 → 0` refcount
+transition (replacing the generic `release` thunk's floor-at-1
+behaviour), `alloc_get_buffer` forcing the issued sample to
+refcount = 1 so the codec's standard one-AddRef + one-Release
+pattern reliably reaches 0, plus an explicit
+`IMemAllocator::ReleaseBuffer` call from `receive_frame` against
+the input allocator after `IMemInputPin::Receive` returns.  Net
+result: `gop-30-352x288` decodes 6/6 frames (was 1/6 in r42), and
+the `r43_pool_recycle_survives_ten_ip_cycles` regression guard
+drives 10× back-to-back I+P pairs (20 frames total, well past the
+4-slot pool) through one decoder with 20/20 Video surfacing.  See
+`tests/round43_full_gop_decode.rs`.
+
 **Round 42 — first multi-frame DShow decode lands.**  The
 `i-frame-then-p-frame-176x144` MS-MPEG-4 v3 fixture's I-frame
 followed by its P-frame both surface as `Frame::Video` through

@@ -8,6 +8,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 43 — **full 6-frame GOP decodes end-to-end at 352×288**:
+  the `gop-30-352x288` MS-MPEG-4 v3 fixture now surfaces 6/6
+  `Frame::Video`s through the same `SandboxedDshowDecoder`
+  instance (round 42: 1/6).  Closes both R43 blockers
+  identified empirically in round 42's diagnostic blob.
+  - **Blocker (a) — output-allocator pool walk traps on
+    P-frame.**  `alloc_get_buffer` now sanity-checks every
+    pool pointer before the `cur+36` / `cur+32` reads — a
+    corrupted next-link surfaces as `VFW_E_TIMEOUT` instead
+    of a memory-fault trap inside our stub.  This was the
+    `cur+36 = 0xffff0223` (i.e. `cur ≈ 0xffff_01ff`) failure
+    that aborted the entire pipeline on round 42's frame 1
+    of the gop-30 run.
+  - **Blocker (b) — sample-release cycle gap.**  Three
+    coordinated changes close the cycle:
+    - New `sample_release` thunk replaces the generic
+      `release` for `IMediaSample::Release`: when refcount
+      transitions `1 → 0`, clears the sample's `in_use`
+      flag at `+36`, mirroring the canonical
+      `CMediaSample::~CMediaSample` destructor's call back
+      into `pAllocator->ReleaseBuffer`.
+    - `alloc_get_buffer` now FORCES the issued sample's
+      refcount to exactly `1` (was: bump-by-1 over whatever
+      the pool entry held), so the codec's standard
+      one-AddRef + one-Release pattern reliably drives it
+      through `1 → 0`.
+    - `receive_frame` calls `IMemAllocator::ReleaseBuffer`
+      on the input allocator after `IMemInputPin::Receive`
+      returns, freeing the just-consumed input slot for
+      the next `send_packet`.
+  - Diagnostic blob in `receive_frame` extended with
+    `r43_oalloc_state` (output allocator's first 0x40
+    bytes) and `r43_oalloc_pool` (linked-list walk of the
+    output pool head + first six entries with `in_use` /
+    `next` per slot) so any future trap on this path
+    arrives with the post-fix recovery telemetry already
+    in hand.
+  - `tests/round43_full_gop_decode.rs` (2 tests):
+    `r43_gop30_full_six_frame_decode` (asserts 6/6 Video
+    frames from the gop-30-352x288 fixture, each with
+    plane0 = 352·288·3 = 304128 bytes), and
+    `r43_pool_recycle_survives_ten_ip_cycles` (drives 10×
+    back-to-back I+P pairs through one decoder = 20 frames
+    total, well past the 4-slot pool, asserts ≥10 Video
+    frames so the recycle path can't silently regress to
+    pool exhaustion).  20/20 frames surface in practice.
+  - Round-42 regression guard preserved: the
+    `r42_iframe_then_pframe_through_same_decoder` test
+    still passes (2/2 Video).
+
 - Round 42 — **multi-frame DShow decode lands**: drives the
   `i-frame-then-p-frame-176x144` fixture's I-frame followed by
   its P-frame through the SAME `SandboxedDshowDecoder` instance
