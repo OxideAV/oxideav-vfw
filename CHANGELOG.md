@@ -6,6 +6,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Round 41 — **`IMemAllocator::GetBuffer` arg-count fix unblocks
+  MP43 keyframe decode end-to-end via DirectShow**.  The
+  bisect dispatched in round 40 (snapshot watchpoints across
+  `Transform`'s ten internal `call dword ptr [...]` sites) showed
+  the 4-byte stack imbalance was introduced at the FIRST site,
+  RVA `0x4064d4 = call [ecx+0x1c]` — `IMemAllocator::GetBuffer`,
+  signature `(this, IMediaSample **ppBuffer, REFERENCE_TIME
+  *pStartTime, REFERENCE_TIME *pStopTime, DWORD dwFlags)` =
+  **5 pushed dwords**.  Our host stub registration in
+  `crate::com::host_iface::register` had `arg_dwords=4`, so
+  the dispatcher's stdcall callee-cleanup
+  (`win32::dispatch_stub`) popped 16 bytes instead of 20,
+  leaving esp 4 bytes too low.  Transform's matched
+  `pop ebx` at `0x4065c4` then read junk (`0x60000110` =
+  filter_base) instead of the correct saved-ebx slot one
+  dword higher (`0x600007a0` = pInSample), causing the
+  downstream slot-13 dispatch at `0x40263b` to land on the
+  filter primary vtable's slot 13 (`0x2da7`) and ultimately
+  fault inside `IsEqualGUID` at RVA `0x7184`.
+  - `arg_dwords` for `IMemAllocator::GetBuffer` bumped 4 → 5.
+  - `alloc_get_buffer` now reads the previously-ignored
+    `dwFlags` arg (per `strmif.h`: `AM_GBF_NOTASYNCPOINT |
+    AM_GBF_PREVFRAMESKIPPED | AM_GBF_NOWAIT`).  The host
+    pool ignores the bits but the read keeps the per-arg
+    trace blob honest.
+  - Receive now returns S_OK for the MP43 keyframe; the
+    downstream `HostIMemInputPin::Receive` callback queues
+    a sample which `surface_received_dshow_frame` flips to
+    top-down BGR24 and surfaces as a `Frame::Video`.
+  - Watchpoint instrumentation is preserved (drained on
+    both success + trap branches now) so any future
+    regression re-traps with the bisect data immediately
+    to hand.
+  - Tests in `tests/round41_getbuffer_arg_count_fix.rs`
+    (renamed from `round40_*`) assert the FIXED behaviour:
+    a Video frame surfaces from the keyframe, and
+    `Registry::resolve(host-com.host, "IMemAllocator::
+    GetBuffer")` returns an entry whose `arg_dwords == 5`.
+  - `tests/round39_imediasample2_qi.rs` updated: the three
+    tests previously anchored to the trap-baseline
+    diagnostic blob now assert the post-r41 fix (Video
+    frame surfaces).
+  - **Receive trap GONE** — first end-to-end MP43 decode
+    via DirectShow.
+
 ### Added
 
 - Round 40 — **register-snapshot + memory-probe watchpoints

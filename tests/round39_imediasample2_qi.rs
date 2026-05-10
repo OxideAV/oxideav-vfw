@@ -103,10 +103,15 @@ fn try_drive_one_keyframe() -> Option<String> {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Test 1 — Transform's success-tail at `0x65c0` is reached (proving
-// the `IID_IMediaSample2` QI inside Transform now returns S_OK).
-// The trap chain previously included `0x6560` (cleanup branch);
-// after r39 it goes through `0x65c0` instead.
+// NOTE — these three tests were originally pinned to the r39-baseline
+// trap signature (`rva=0x00007184` + a specific call-chain shape +
+// the live `recheck_sample_slot13=0xfffe03a0` slot in the diagnostic
+// blob).  Round 41 fixed the underlying `IMemAllocator::GetBuffer`
+// arg-count bug (registered with `arg_dwords=4`, should have been
+// 5) — Receive now returns S_OK and emits a frame, so the trap
+// branch (and the diagnostic blob) is never built.  The tests are
+// rewritten to assert the FIXED behaviour: a Video frame surfaces
+// from the same one-shot keyframe drive.
 // ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -118,31 +123,19 @@ fn r39_transform_success_tail_taken() {
             return;
         }
     };
-    eprintln!("round39 success-tail: {msg}");
-    // Trap site unchanged from r38 baseline (still IsEqualGUID
-    // reading NULL+0x1c at `0x7184`).
+    eprintln!("round39 success-tail (post-r41): {msg}");
+    // The IsEqualGUID read at `0x7184` was the symptom of the
+    // GetBuffer arg-count bug.  Once the dispatcher pops the
+    // right number of bytes, that branch is never entered.
     assert!(
-        msg.contains("rva=0x00007184"),
-        "r39 trap site preserved at 0x7184: {msg}"
-    );
-    // Transform now exits via `0x65c0` (success xor eax, eax) and
-    // NOT via `0x6560` (QI failure cleanup branch).
-    assert!(
-        msg.contains("0x000065c0"),
-        "r39 expected success-tail RVA 0x65c0 in call chain: {msg}"
+        !msg.contains("rva=0x00007184"),
+        "r41 expected the 0x7184 trap to be GONE: {msg}"
     );
     assert!(
-        !msg.contains("0x00006560"),
-        "r39 expected the QI-failure cleanup RVA 0x6560 to be ABSENT \
-         (Transform should now succeed): {msg}"
+        msg.starts_with("ok: Video(VideoFrame"),
+        "r41 expected a Video frame to surface from the keyframe: {msg}"
     );
 }
-
-// ────────────────────────────────────────────────────────────────
-// Test 2 — pre-Transform helper at `0x5e34` ALSO QIs pInSample for
-// IMediaSample2.  Its success-tail at `0x5f24` should appear in the
-// chain after r39 (indicating the helper's QI now succeeds).
-// ────────────────────────────────────────────────────────────────
 
 #[test]
 fn r39_pre_transform_helper_completes_qi() {
@@ -153,24 +146,16 @@ fn r39_pre_transform_helper_completes_qi() {
             return;
         }
     };
-    eprintln!("round39 pre-transform: {msg}");
-    // The pre-Transform helper at `0x5e34` runs `[IsEqualGUID
-    // (this+0x1c, &kStaticGUID)]` then QIs pInSample for
-    // IMediaSample2.  Its success path at `0x5f24` was previously
-    // absent from the chain (the QI returned E_NOINTERFACE so the
-    // helper took an early-exit failure return).  Round 39 wires
-    // the QI to S_OK so the success path runs through.
+    eprintln!("round39 pre-transform (post-r41): {msg}");
+    // The helper at `0x5e34` (which QIed pInSample for
+    // IID_IMediaSample2) now completes through to Transform AND
+    // Transform completes through to the success exit at
+    // `0x65c0` — manifest as a frame surfacing from `Receive`.
     assert!(
-        msg.contains("0x00005f24"),
-        "r39 expected helper success RVA 0x5f24: {msg}"
+        msg.starts_with("ok: Video(VideoFrame"),
+        "r41 expected a Video frame after the helper completes: {msg}"
     );
 }
-
-// ────────────────────────────────────────────────────────────────
-// Test 3 — input sample's vtable slot 13 (GetMediaType) remains the
-// host thunk after the codec runs.  Confirms r39's vtable-resize
-// (18 → 21 slots) didn't relocate the existing slots.
-// ────────────────────────────────────────────────────────────────
 
 #[test]
 fn r39_input_sample_slot_13_unchanged_after_run() {
@@ -181,8 +166,13 @@ fn r39_input_sample_slot_13_unchanged_after_run() {
             return;
         }
     };
+    // Slot stability is intrinsically tested by the keyframe
+    // round-tripping all the way to a Video frame: a corrupted
+    // slot 13 would crash the codec before we got here.  Keep
+    // the smoke test as a frame-emission assertion so any future
+    // vtable-layout regression surfaces immediately.
     assert!(
-        msg.contains("recheck_sample_slot13=0xfffe03a0"),
-        "r39 expected input sample slot 13 to remain the host thunk: {msg}"
+        msg.starts_with("ok: Video(VideoFrame"),
+        "r41 expected slot-13 stability via successful frame emission: {msg}"
     );
 }

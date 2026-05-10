@@ -9,6 +9,31 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 41 — first end-to-end MP43 keyframe decode through
+DirectShow lands.**  Round 40 had localised a 4-byte stack
+imbalance to `Transform`'s `pop ebx` at MPG4DS32 RVA `0x4065c4`;
+round 41 bisected across the ten internal `call dword ptr [...]`
+sites and pinned it to the FIRST one — `0x4064d4 = call [ecx+0x1c]`
+(`IMemAllocator::GetBuffer(this, ppBuffer, pStartTime, pStopTime,
+dwFlags)`).  This is FIVE pushed dwords (this + four args), but
+the host stub registration in `crate::com::host_iface::register`
+had `arg_dwords=4`, so the dispatcher's stdcall callee-cleanup
+in `win32::dispatch_stub` popped 16 bytes instead of 20 and left
+esp 4 bytes too low.  Transform's matched `pop ebx` then read
+`0x60000110` (filter_base, leftover stack) instead of the correct
+saved-ebx slot one dword higher (`0x600007a0` = pInSample); the
+downstream slot-13 call on the wrong `ebx` landed on the codec's
+PRIMARY-vtable internal method `0x2da7`, which expected
+`ecx == filter_base` and faulted on the resulting `IsEqualGUID
+(0x1c, ...)` read.  Bumping `arg_dwords` to 5 (and reading the
+`dwFlags` arg in the stub) made the trap GO AWAY entirely:
+`IMemInputPin::Receive` returns S_OK and the codec emits a
+24bpp BGR sample through the downstream pin which
+`surface_received_dshow_frame` flips top-down and surfaces as
+`Frame::Video`.  The diagnostic watchpoints from round 40
+remain (drained on success + trap branches now) so any
+regression re-traps with the bisect data immediately to hand.
+
 **Round 40 — register-snapshot + memory-probe watchpoints
 identify a stack imbalance inside `CTransformFilter::Transform`
 as the root cause of the r39 trap.** New

@@ -197,11 +197,21 @@ pub fn register(registry: &mut Registry) {
         alloc_decommit as StubFn,
         1,
     );
+    // Round 41 — `IMemAllocator::GetBuffer(this, IMediaSample
+    // **ppBuffer, REFERENCE_TIME *pStartTime, REFERENCE_TIME
+    // *pStopTime, DWORD dwFlags)` is FIVE pushed dwords (this
+    // + four arguments), not four.  The earlier registration
+    // with `arg_dwords=4` left the dispatcher 4 bytes short on
+    // its stdcall callee-cleanup, so every Transform call site
+    // that invoked GetBuffer (`mpg4ds32` RVA `0x4064d4`) ended
+    // with esp 4 bytes too low.  Transform's matched
+    // `pop ebx` at `0x4065c4` then read the wrong slot —
+    // exactly the imbalance round 40's snapshots localised.
     registry.register(
         HOST_DLL,
         "IMemAllocator::GetBuffer",
         alloc_get_buffer as StubFn,
-        4,
+        5,
     );
     registry.register(
         HOST_DLL,
@@ -1844,6 +1854,11 @@ fn alloc_get_buffer(
     let pp = arg(cpu, mmu, 1)?;
     let _p_start = arg(cpu, mmu, 2)?;
     let _p_end = arg(cpu, mmu, 3)?;
+    // Round 41 — `dwFlags` (AM_GBF_NOTASYNCPOINT /
+    // AM_GBF_PREVFRAMESKIPPED / AM_GBF_NOWAIT bits per `strmif.h`).
+    // Read so the dispatcher's per-arg trace surfaces all five
+    // pushed dwords; the host pool ignores the bits.
+    let _dw_flags = arg(cpu, mmu, 4)?;
     if pp == 0 {
         return Ok(crate::com::E_POINTER);
     }

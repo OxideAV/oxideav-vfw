@@ -1789,29 +1789,19 @@ impl Decoder for SandboxedDshowDecoder {
         // the failing function's prolog).
         sb.cpu.enable_trace_ring(4096);
 
-        // Round 40 — arm register-snapshot watchpoints on the
-        // four RVAs that bracket the post-Transform call sequence
-        // in the function whose entry is `0x25a2` (r39 had this
-        // labelled `CTransformFilter::Receive`; r40 watchpoint
-        // data REJECTS that label — see the long comment in the
-        // post-trap branch below for the corrected interpretation).
-        //
-        // The handoff hypothesis was that `ebx` at `0x40263b`
-        // (the slot-13 call) should hold `pInSample = 0x600007a0`,
-        // and that something in either Transform's epilogue
-        // (a) or a SetProperties write (b) was clobbering it
-        // back to `filter_base = 0x60000110`.  These watchpoints
-        // resolve the question definitively.
-        //
-        //   0x002626 — return-from-Transform IP, BEFORE any
-        //              instruction in this BB has run.
-        //   0x002634 — `mov eax, [ebx]`.
-        //   0x00263b — `push ebx` (just before the call).  ebx
-        //              here is what the codec actually passed as
-        //              `this` to the slot-13 call.
-        //   0x0025a2 — `0x25a2` function entry.
-        //   0x0025a4..0x25ae — fan of candidate end-of-prolog
-        //              positions.  We expect exactly one to fire.
+        // Round 40+41 — diagnostic register-snapshot watchpoints
+        // around Transform.  Round 40's snapshots localised a
+        // 4-byte stack imbalance to `pop ebx` at RVA `0x4065c4`;
+        // by walking the per-call ESP delta we determined the
+        // imbalance was introduced by the FIRST call site,
+        // `0x4064d4: call [ecx+0x1c]` — `IMemAllocator::GetBuffer`,
+        // a 5-arg stdcall whose host stub was registered with
+        // `arg_dwords=4`.  The dispatcher's callee-cleanup popped
+        // 16 bytes instead of 20, leaving esp 4 bytes too low and
+        // causing Transform's matched `pop ebx` to read junk.
+        // Round 41 fixed the registration (now `arg_dwords=5`);
+        // the watchpoints below remain so any future regression
+        // re-traps with the bisect data immediately to hand.
         let r40_module_base = sb.host.primary_module_base;
         for off in [
             0x002626u32,
@@ -1822,17 +1812,6 @@ impl Decoder for SandboxedDshowDecoder {
             0x0025a8,
             0x0025ab,
             0x0025ae,
-            // Round 40 bracket: Transform's call site `0x402620`
-            // is the caller's `push ebx`.  Snapshot at
-            // `0x402621` (the `call 0x6473` instr immediately
-            // after `push ebx`) captures esp AFTER the push, so
-            // `[esp]` is the value the caller actually committed
-            // to the stack.  Transform's `push ebx` at
-            // `0x406479` is the FIRST stack write inside
-            // Transform's prolog after `sub esp,0x4c`; here
-            // `[ebp+8]` is the first arg as Transform sees it.
-            // `pop ebx` at `0x4065c4` reveals what ebx is
-            // restored to.
             0x002620,
             0x002621,
             0x006479,
@@ -1846,9 +1825,6 @@ impl Decoder for SandboxedDshowDecoder {
             sb.cpu
                 .add_register_watchpoint(r40_module_base.wrapping_add(off));
         }
-        // Round 40 follow-up: also bump the snapshots cap so we
-        // get all hits (default 16 is too small with 16
-        // watchpoints).
         sb.cpu.register_snapshots_cap = 64;
 
         // Round 36 — dump `[mip+0..0x100]` so the diagnostic carries
@@ -2249,6 +2225,13 @@ impl Decoder for SandboxedDshowDecoder {
                 )));
             }
         };
+
+        // Round 41 — drain the diagnostic watchpoints on the
+        // success path too, so they don't accumulate across
+        // back-to-back Receive calls.  (On the trap branch above
+        // they're drained as part of the diagnostic blob.)
+        let _ = sb.cpu.take_memory_snapshots();
+        let _ = sb.cpu.clear_register_watchpoints();
 
         // Round 31 — drain the host-side queue populated by the
         // downstream `HostIMemInputPin::Receive` callback.
