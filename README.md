@@ -9,6 +9,37 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 40 — register-snapshot + memory-probe watchpoints
+identify a stack imbalance inside `CTransformFilter::Transform`
+as the root cause of the r39 trap.** New
+`Cpu::add_register_watchpoint` instrumentation captures the
+integer register file plus `[esp]` / `[esp+4]` / `[ebp+8]` /
+`[ebp-0x50]` AT WATCHPOINT TIME (not trap time, which masks
+intervening writes).  Sixteen watchpoints arm the post-Transform
+return BB plus Transform's prologue (`0x6479` push ebx) and
+epilogue (`0x65c4` pop ebx).  Findings: (a) the saved-ebx slot
+`[ebp-0x50]@0x900ffe60` holds `0x600007a0` (pInSample) intact
+throughout Transform's body — but at `0x65c4`, esp is FOUR BYTES
+LOWER than `[ebp-0x50]`, so `pop ebx` reads `0x60000110` from
+the wrong stack slot.  (b) Transform's `[ebp+8]@0x900ffeb8` =
+pInSample throughout — hypothesis "SetProperties write-back
+clobbered the arg slot" RULED OUT.  Some intermediate
+`__stdcall` call inside Transform's body either pushed an extra
+arg or returned with a callee-cleanup short by 4 bytes.  R41
+must bisect across each `call dword ptr [...]` site in
+Transform (`0x4064d4`, `0x4064f3`, `0x406505`, `0x406545`,
+`0x40655b`, `0x40656e`, `0x40657f`, `0x406590`, `0x4065a8`,
+`0x4065bd`) tracking esp delta before/after each.  The r39
+disasm interpretation that called `0x2da7` "JoinFilterGraph
+from the IBaseFilter sub-vtable" was wrong: `0x2da7` is slot 13
+of the C++ class's PRIMARY vtable, an internal `__thiscall`
+method that expects `ecx == filter_base` and dereferences
+`[ecx+0x8c] = m_pInput`.  With ebx incorrectly set to filter_base
+(via the stack-imbalance bug) the slot-13 dispatch lands on
+this method with a stack-junk `ecx`, and it traps inside
+`IsEqualGUID` reading `0x1c`.  Receive trap unchanged at
+MPG4DS32 RVA `0x7184`.
+
 **Round 39 — `IID_IMediaSample2` host-side QI support; Transform
 now takes its success-tail at `0x65c0` (was `0x6560` failure
 cleanup).** Round-38 disasm of the QI at MPG4DS32.AX RVA `0x4064f3`
@@ -28,16 +59,7 @@ call at RVA `0x4065bd`), plus `IMediaSample2::GetProperties` /
 public `AM_SAMPLE2_PROPERTIES` struct (`cbData` / `dwSampleFlags`
 / `lActual` / `pbBuffer` / `cbBuffer` / `pMediaType`) so the
 codec's success-branch write-back at RVA `0x6545` accepts our
-sample.  The `Receive` trap at RVA `0x7184` is unchanged (still
-`IsEqualGUID(NULL+0x1c, &GUID_NULL)`) but reached via Transform's
-success tail at `0x65c0` instead of the failure tail at `0x6560`,
-plus the pre-Transform helper at `0x5e34` now completes its
-`IMediaSample2`-using property-snapshot path through `0x5f24`.
-The trap is in `0x25a2`'s post-Transform `pInSample->slot 13`
-call at RVA `0x40263b`; r40 needs to identify why the call's
-target resolves to filter-primary-vtable slot 13 (`0x2da7` =
-`JoinFilterGraph`) instead of the host-thunk we wrote at
-`[obj+0x74]` of pInSample.
+sample.
 
 **Round 30 — DirectShow IMemAllocator + IMediaSample host stubs
 land; ICM_DECOMPRESS_GET_FORMAT dim probe + Indeo / Cinepak trait

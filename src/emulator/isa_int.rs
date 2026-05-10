@@ -146,6 +146,36 @@ pub struct Cpu {
     /// .text section yields at most ~10⁶ unique entries. Cleared
     /// by [`Self::take_visited_eips`].
     pub visited_eips: BTreeSet<u32>,
+    /// Round-40 instrument: when an entry-EIP matches a key in
+    /// this set, [`Self::step`] appends a snapshot of the integer
+    /// register file to [`Self::register_snapshots`].  Lets a
+    /// research test answer "what was `ebx` immediately after
+    /// `Transform` returned to its `0x402626` continuation point?"
+    /// without recompiling the executor or stitching together a
+    /// post-trap register file (which only carries the FAILING
+    /// instruction's state, not arbitrary checkpoints inside the
+    /// run).  Empty by default; populate via
+    /// [`Self::add_register_watchpoint`].
+    pub register_watchpoints: BTreeSet<u32>,
+    /// Round-40 instrument: ordered list of register snapshots
+    /// captured at watchpoint hits.  Each entry is
+    /// `(eip, [eax, ecx, edx, ebx, esp, ebp, esi, edi])` in that
+    /// fixed order.  Keep small (we cap a hot watchpoint at the
+    /// first 8 hits in [`Self::step`]) so a Receive-driven loop
+    /// doesn't accumulate megabytes of state.
+    pub register_snapshots: Vec<(u32, [u32; 8])>,
+    /// Round-40 instrument: parallel list of memory probes
+    /// captured at watchpoint hits.  Each entry is
+    /// `(eip, [(addr, value); 4])` — the four `[addr]` reads
+    /// the watchpoint's host enrichment chose.  Stored as
+    /// (addr, value) so the trap-time post-mortem doesn't have
+    /// to re-load and possibly see a stale value.  Empty
+    /// addr/value tuples (`(0, 0)`) mark unused slots.
+    pub memory_snapshots: Vec<(u32, [(u32, u32); 4])>,
+    /// Round-40: cap on `register_snapshots`.  After this many
+    /// captures, additional watchpoint hits are silently
+    /// dropped to keep the diagnostic compact.  Default 16.
+    pub register_snapshots_cap: usize,
 }
 
 /// Segment-override prefix selector.
@@ -192,7 +222,40 @@ impl Cpu {
             trace_ring_cap: 0,
             track_visited_eips: false,
             visited_eips: BTreeSet::new(),
+            register_watchpoints: BTreeSet::new(),
+            register_snapshots: Vec::new(),
+            memory_snapshots: Vec::new(),
+            register_snapshots_cap: 16,
         }
+    }
+
+    /// Round-40: arm a register-snapshot watchpoint at `eip`.
+    /// On the next [`Self::step`] entry that fires at this
+    /// address, the integer register file is appended to
+    /// [`Self::register_snapshots`] (subject to
+    /// [`Self::register_snapshots_cap`]).  Multiple distinct
+    /// watchpoints can be armed concurrently.  See
+    /// [`Self::clear_register_watchpoints`] to disarm + drain.
+    pub fn add_register_watchpoint(&mut self, eip: u32) {
+        self.register_watchpoints.insert(eip);
+    }
+
+    /// Round-40: drain the captured snapshots and disarm every
+    /// watchpoint.  Returns the captures in fire order.
+    pub fn clear_register_watchpoints(&mut self) -> Vec<(u32, [u32; 8])> {
+        self.register_watchpoints.clear();
+        let _ = std::mem::take(&mut self.memory_snapshots);
+        std::mem::take(&mut self.register_snapshots)
+    }
+
+    /// Round-40: drain memory snapshots captured at watchpoint
+    /// hits.  Mirrors [`Self::clear_register_watchpoints`] but
+    /// returns the per-hit memory probes (addr, value pairs) so
+    /// the post-mortem can inspect the contents at the time the
+    /// snapshot fired (NOT at trap time, which may have been
+    /// overwritten by intervening writes).
+    pub fn take_memory_snapshots(&mut self) -> Vec<(u32, [(u32, u32); 4])> {
+        std::mem::take(&mut self.memory_snapshots)
     }
 
     /// Round-19: enable per-instruction unique-EIP tracking. Every
@@ -402,6 +465,50 @@ impl Cpu {
         // cost is O(log N) over the visited-set size.
         if self.track_visited_eips {
             self.visited_eips.insert(entry_eip);
+        }
+
+        // Round-40: register-snapshot watchpoints.  Captured
+        // BEFORE the instruction at `entry_eip` executes, so the
+        // snapshot reflects the state at the watchpoint's entry
+        // semantics (e.g. a snapshot at `Transform`'s return-to
+        // continuation captures the registers as Transform left
+        // them, before the next instruction mutates them).
+        //
+        // Also captures four parallel memory probes — the
+        // `[esp]`, `[esp+4]`, `[ebp+8]`, `[ebp-0x50]` slots —
+        // resolved at snapshot time, NOT at trap time.  This is
+        // essential when a stack slot is later overwritten by
+        // intervening writes; reading at trap time would mask
+        // the original push.
+        if !self.register_watchpoints.is_empty()
+            && self.register_snapshots.len() < self.register_snapshots_cap
+            && self.register_watchpoints.contains(&entry_eip)
+        {
+            let esp_now = self.regs.esp();
+            let ebp_now = self.regs.get32(Reg32::Ebp);
+            let snap = [
+                self.regs.get32(Reg32::Eax),
+                self.regs.get32(Reg32::Ecx),
+                self.regs.get32(Reg32::Edx),
+                self.regs.get32(Reg32::Ebx),
+                esp_now,
+                ebp_now,
+                self.regs.get32(Reg32::Esi),
+                self.regs.get32(Reg32::Edi),
+            ];
+            self.register_snapshots.push((entry_eip, snap));
+            let probe_addrs = [
+                esp_now,
+                esp_now.wrapping_add(4),
+                ebp_now.wrapping_add(8),
+                ebp_now.wrapping_sub(0x50),
+            ];
+            let mut mem_snap: [(u32, u32); 4] = [(0, 0); 4];
+            for (i, addr) in probe_addrs.iter().enumerate() {
+                let v = mmu.load32(*addr).unwrap_or(0);
+                mem_snap[i] = (*addr, v);
+            }
+            self.memory_snapshots.push((entry_eip, mem_snap));
         }
 
         // Consume legacy prefixes (max ~4; we cap at 8 to avoid

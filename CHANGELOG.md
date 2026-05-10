@@ -8,6 +8,74 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 40 — **register-snapshot + memory-probe watchpoints
+  identify a stack imbalance inside `CTransformFilter::Transform`
+  (RVA `0x6473..0x65c6`) as the root cause of the r39 trap**.
+  - New `Cpu::add_register_watchpoint(eip)` /
+    `clear_register_watchpoints()` /
+    `take_memory_snapshots()` instrumentation.  When an
+    armed eip is hit at `Cpu::step` entry, the integer
+    register file (eax/ecx/edx/ebx/esp/ebp/esi/edi) plus
+    four parallel memory probes (`[esp]`, `[esp+4]`,
+    `[ebp+8]`, `[ebp-0x50]`) are snapshotted BEFORE the
+    instruction executes — so the values reflect the
+    state at the watchpoint, NOT at trap time (which may
+    have been overwritten by intervening writes).  Capped
+    at 64 hits per run.
+  - `discovery::codec::receive_frame` arms 16 watchpoints
+    around the post-Transform call site in the enclosing
+    `0x25a2` function and across Transform's own prologue
+    (`0x6479` push ebx) and epilogue (`0x65c4` pop ebx).
+  - On trap, the `Receive` diagnostic now carries
+    `r40_snaps=[...]` (per-hit register file) and
+    `r40_arg1=[...]` (per-hit `[esp]` / `[esp+4]` /
+    `[ebp+8]@addr` / `[ebp-0x50]@addr`).
+  - **Findings.**  At the post-Transform return site
+    `0x402626`, `ebx == 0x60000110` (filter_base), NOT the
+    expected `0x600007a0` (pInSample).  **Hypothesis (b)
+    ruled out**: throughout Transform's body the arg slot
+    `[ebp+8]@0x900ffeb8 == 0x600007a0` (pInSample intact)
+    and the saved-ebx slot `[ebp-0x50]@0x900ffe60 ==
+    0x600007a0` (correctly preserved).  **Hypothesis (a)
+    confirmed** in a refined form: at Transform's
+    `0x4065c4` `pop ebx`, esp == `0x900ffe5c` — FOUR BYTES
+    LOWER than `[ebp-0x50] == 0x900ffe60`.  pop ebx reads
+    from `[esp]` (= `0x60000110`, a leftover stack value)
+    instead of from the saved-ebx slot one dword higher
+    (which DOES hold `0x600007a0`).  Some intermediate
+    `__stdcall` call inside Transform's body either
+    pushed an extra arg or returned with a callee-cleanup
+    short by 4 bytes.
+  - **Trap site unchanged** at MPG4DS32 RVA `0x7184`
+    (`IsEqualGUID(NULL+0x1c, &kIID)` inside the helper at
+    `0x7176`).  The slot-13 dispatch at `0x40263b` is
+    `(*ebx->vtable[13])(ebx, &arg)` — with the wrong
+    `ebx` it lands on filter primary vtable slot 13 =
+    `0x2da7`, which expects `ecx == this` per `__thiscall`
+    but receives `ecx == 0x900ffee0` (a stack address).
+    `0x2da7` then does `mov ebx, ecx; mov ecx, [ebx+0x8c];
+    add ecx, 0x1c; call 0x7176` — the `[ebx+0x8c]` reads
+    from a stack location (junk), `ecx` becomes `0x1c`,
+    and `IsEqualGUID(0x1c, ...)` faults.
+  - **R41 handoff.** Bisect inside Transform by arming
+    watchpoints at every `call dword ptr [...]` site
+    (`0x4064d4`, `0x4064f3`, `0x406505`, `0x406545`,
+    `0x40655b`, `0x40656e`, `0x40657f`, `0x406590`,
+    `0x4065a8`, `0x4065bd`) and tracking esp delta
+    before/after each.  The first site whose delta differs
+    from args_pushed is the culprit.  Likely candidates:
+    `0x4064d4` (slot 7 of `[ecx]`'s vtable, possibly an
+    `IBaseFilter::EnumPins` or pin-side allocator method)
+    or `0x4064f3` (`call [eax]` = QueryInterface, 3-arg
+    `__stdcall` with `ret 12` callee-cleanup).
+  - 5 new tests in `tests/round40_ebx_origin_at_0x2626.rs`:
+    `r40_ebx_at_post_transform_is_filter_base`,
+    `r40_slot13_call_dispatches_off_filter_vtable`,
+    `r40_arg1_pinsample_intact_across_snapshots`,
+    `r40_function_entry_does_not_bind_ebx_to_arg1`,
+    `r40_stack_imbalance_at_pop_ebx_confirmed`.
+  - Receive trap unchanged at MPG4DS32 RVA `0x7184`.
+
 - Round 39 — **`IID_IMediaSample2` host-side QI support; Transform
   reaches its success-tail at `0x65c0`** (was `0x6560` failure
   cleanup).  Round-38 disasm of the QI at MPG4DS32.AX RVA

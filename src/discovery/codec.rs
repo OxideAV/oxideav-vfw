@@ -1789,6 +1789,68 @@ impl Decoder for SandboxedDshowDecoder {
         // the failing function's prolog).
         sb.cpu.enable_trace_ring(4096);
 
+        // Round 40 — arm register-snapshot watchpoints on the
+        // four RVAs that bracket the post-Transform call sequence
+        // in the function whose entry is `0x25a2` (r39 had this
+        // labelled `CTransformFilter::Receive`; r40 watchpoint
+        // data REJECTS that label — see the long comment in the
+        // post-trap branch below for the corrected interpretation).
+        //
+        // The handoff hypothesis was that `ebx` at `0x40263b`
+        // (the slot-13 call) should hold `pInSample = 0x600007a0`,
+        // and that something in either Transform's epilogue
+        // (a) or a SetProperties write (b) was clobbering it
+        // back to `filter_base = 0x60000110`.  These watchpoints
+        // resolve the question definitively.
+        //
+        //   0x002626 — return-from-Transform IP, BEFORE any
+        //              instruction in this BB has run.
+        //   0x002634 — `mov eax, [ebx]`.
+        //   0x00263b — `push ebx` (just before the call).  ebx
+        //              here is what the codec actually passed as
+        //              `this` to the slot-13 call.
+        //   0x0025a2 — `0x25a2` function entry.
+        //   0x0025a4..0x25ae — fan of candidate end-of-prolog
+        //              positions.  We expect exactly one to fire.
+        let r40_module_base = sb.host.primary_module_base;
+        for off in [
+            0x002626u32,
+            0x002634,
+            0x00263b,
+            0x0025a2,
+            0x0025a4,
+            0x0025a8,
+            0x0025ab,
+            0x0025ae,
+            // Round 40 bracket: Transform's call site `0x402620`
+            // is the caller's `push ebx`.  Snapshot at
+            // `0x402621` (the `call 0x6473` instr immediately
+            // after `push ebx`) captures esp AFTER the push, so
+            // `[esp]` is the value the caller actually committed
+            // to the stack.  Transform's `push ebx` at
+            // `0x406479` is the FIRST stack write inside
+            // Transform's prolog after `sub esp,0x4c`; here
+            // `[ebp+8]` is the first arg as Transform sees it.
+            // `pop ebx` at `0x4065c4` reveals what ebx is
+            // restored to.
+            0x002620,
+            0x002621,
+            0x006479,
+            0x0064a3,
+            0x0064f3,
+            0x006545,
+            0x00655e,
+            0x0065c0,
+            0x0065c4,
+        ] {
+            sb.cpu
+                .add_register_watchpoint(r40_module_base.wrapping_add(off));
+        }
+        // Round 40 follow-up: also bump the snapshots cap so we
+        // get all hits (default 16 is too small with 16
+        // watchpoints).
+        sb.cpu.register_snapshots_cap = 64;
+
         // Round 36 — dump `[mip+0..0x100]` so the diagnostic carries
         // the per-field state of the codec's own IMemInputPin
         // object before the Receive call.  Helps identify which
@@ -2006,7 +2068,17 @@ impl Decoder for SandboxedDshowDecoder {
                 let trap_eip = ring.last().copied().unwrap_or(sb.cpu.regs.eip);
                 let module_base = sb.host.primary_module_base;
                 let rva = trap_eip.wrapping_sub(module_base);
-                let reg = |r: Reg32| sb.cpu.regs.get32(r);
+                // Snapshot the trap-time integer register file
+                // into locals so we can later take a mutable
+                // borrow of `sb.cpu` (Round 40 watchpoint drain)
+                // without a use-after-mut conflict.
+                let trap_eax = sb.cpu.regs.get32(Reg32::Eax);
+                let trap_ecx = sb.cpu.regs.get32(Reg32::Ecx);
+                let trap_edx = sb.cpu.regs.get32(Reg32::Edx);
+                let trap_ebx = sb.cpu.regs.get32(Reg32::Ebx);
+                let trap_ebp = sb.cpu.regs.get32(Reg32::Ebp);
+                let trap_esi = sb.cpu.regs.get32(Reg32::Esi);
+                let trap_edi = sb.cpu.regs.get32(Reg32::Edi);
                 let ring_tail: Vec<String> = ring
                     .iter()
                     .rev()
@@ -2065,6 +2137,75 @@ impl Decoder for SandboxedDshowDecoder {
                 } else {
                     0
                 };
+                // Round 40 — drain the register-snapshot
+                // watchpoints armed before the call.  Each entry
+                // is `(eip, [eax, ecx, edx, ebx, esp, ebp, esi,
+                // edi])`.  The watchpoints fire BEFORE their
+                // instruction executes, so the snapshot at
+                // `0x002626` reflects the registers exactly as
+                // Transform left them; the snapshot at `0x00263b`
+                // is what the codec hands to the slot-13 call.
+                // Drain BOTH the register snapshots AND the
+                // memory probes captured at the same hits.
+                // `take_memory_snapshots` MUST run before
+                // `clear_register_watchpoints` (which clears
+                // the memory snapshots too).
+                let r40_mem_raw = sb.cpu.take_memory_snapshots();
+                let r40_snaps_raw = sb.cpu.clear_register_watchpoints();
+                let r40_snaps: Vec<String> = r40_snaps_raw
+                    .iter()
+                    .map(|(eip, regs)| {
+                        let r_rva = eip.wrapping_sub(module_base);
+                        format!(
+                            "rva={r_rva:#06x} eax={:#010x} ecx={:#010x} \
+                             edx={:#010x} ebx={:#010x} esp={:#010x} \
+                             ebp={:#010x} esi={:#010x} edi={:#010x}",
+                            regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]
+                        )
+                    })
+                    .collect();
+                // Round 40 — when the watchpoints captured ebp at
+                // `0x002626`, also dump `[ebp+8]` (= the function
+                // arg-1 slot, which Receive's prolog uses to bind
+                // its `ebx`).  If `[ebp+8]` here disagrees with
+                // ebx at the same site, hypothesis (b) is
+                // confirmed: something clobbered ebx between
+                // prolog (where `ebx = [ebp+8]`) and the
+                // return-from-Transform IP.  If the two agree but
+                // are 0x60000110 (filter_base), then `[ebp+8]`
+                // itself was overwritten — look for a recent
+                // SetProperties write at that address.
+                // Use the MEMORY SNAPSHOTS captured at watchpoint
+                // time (NOT trap time).  The probe order is fixed
+                // in `Cpu::step`'s watchpoint handler:
+                //   probe[0] = [esp]
+                //   probe[1] = [esp+4]
+                //   probe[2] = [ebp+8]
+                //   probe[3] = [ebp-0x50]   (saved-ebx slot in
+                //                            standard MSVC frame)
+                let mut r40_arg1: Vec<String> = Vec::new();
+                for (eip, mem) in &r40_mem_raw {
+                    let r_rva = eip.wrapping_sub(module_base);
+                    let p_esp = mem[0].1;
+                    let p_esp4 = mem[1].1;
+                    let p_ebp_p8 = mem[2].1;
+                    let p_ebp_m50 = mem[3].1;
+                    let a_ebp_p8 = mem[2].0;
+                    let a_ebp_m50 = mem[3].0;
+                    r40_arg1.push(format!(
+                        "rva={r_rva:#06x} [ebp+8]@{a_ebp_p8:#010x}={p_ebp_p8:#010x} \
+                         [esp]={p_esp:#010x} [esp+4]={p_esp4:#010x} \
+                         [ebp-0x50]@{a_ebp_m50:#010x}={p_ebp_m50:#010x}"
+                    ));
+                }
+                // Round 40 — also expose the input pin's pInSample
+                // we passed in (via the outer Receive call).  The
+                // sandbox's `sample` local is the IMediaSample we
+                // handed to IMemInputPin::Receive; if ebx at
+                // `0x002626` doesn't equal `sample`, something
+                // mid-Receive substituted a different pointer.
+                let r40_expected_pin_sample = sample;
+                let r40_expected_filter_base = self.filter.wrapping_sub(0xc);
                 // Walk the stack frame: dump esp..esp+32 dwords as
                 // potential return addresses + saved registers, so
                 // a follow-up disasm pass can identify the caller.
@@ -2093,25 +2234,18 @@ impl Decoder for SandboxedDshowDecoder {
                 return Err(Error::other(format!(
                     "vfw discovery (DShow): Receive trapped: {e} \
                      [trap_eip={trap_eip:#010x} rva={rva:#010x} \
-                     eax={:#010x} ecx={:#010x} edx={:#010x} ebx={:#010x} \
-                     esp={:#010x} ebp={:#010x} esi={:#010x} edi={:#010x} \
+                     eax={trap_eax:#010x} ecx={trap_ecx:#010x} \
+                     edx={trap_edx:#010x} ebx={trap_ebx:#010x} \
+                     esp={esp:#010x} ebp={trap_ebp:#010x} \
+                     esi={trap_esi:#010x} edi={trap_edi:#010x} \
                      recheck_sample_vtbl={recheck_sample_vtbl:#010x} \
                      recheck_sample_slot13={recheck_sample_slot13:#010x} \
-                     trace_tail={:?} call_chain={:?} raw_tail={:?} stack={:?} \
-                     mip_state={:?} r38_pre={r38_pre_receive}]",
-                    reg(Reg32::Eax),
-                    reg(Reg32::Ecx),
-                    reg(Reg32::Edx),
-                    reg(Reg32::Ebx),
-                    esp,
-                    reg(Reg32::Ebp),
-                    reg(Reg32::Esi),
-                    reg(Reg32::Edi),
-                    ring_tail,
-                    chain_tail,
-                    raw_tail,
-                    stack_frame,
-                    mip_state,
+                     r40_expected_pin_sample={r40_expected_pin_sample:#010x} \
+                     r40_expected_filter_base={r40_expected_filter_base:#010x} \
+                     r40_snaps={r40_snaps:?} r40_arg1={r40_arg1:?} \
+                     trace_tail={ring_tail:?} call_chain={chain_tail:?} \
+                     raw_tail={raw_tail:?} stack={stack_frame:?} \
+                     mip_state={mip_state:?} r38_pre={r38_pre_receive}]"
                 )));
             }
         };
