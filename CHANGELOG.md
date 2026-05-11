@@ -8,6 +8,63 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 44 — **full MS-MPEG-4 v3 fixture corpus exercised
+  through the round-43 DirectShow pipeline**: 16 fixture-runs
+  out of `docs/video/msmpeg4-fixtures/`, all surfacing every
+  expected `Frame::Video` (20/20 frames in aggregate).  Two
+  distinct axes covered:
+  - **FourCC parity (6/6)**.  The corpus's six fourcc-*
+    fixtures (MP43, DIV3, DIV4, DVX3, AP41, COL1) carry a
+    byte-identical MS-MPEG-4-v3 elementary bitstream wrapped
+    in AVI containers tagged with each respective FOURCC.
+    Empirical finding: `MPG4DS32.AX` only accepts the MP43
+    `MEDIASUBTYPE` at `IPin::ReceiveConnection`; every other
+    FOURCC subtype is rejected with `0x8004022a`
+    (`VFW_E_TYPE_NOT_ACCEPTED`).  This is a real codec
+    property — `mpg4ds32` is a single-tag filter — not a
+    host bug.  Real DirectShow stacks delegate FourCC →
+    filter routing to the FilterMapper, which always presents
+    `mpg4ds32` with MP43.  R44 mirrors that policy: each
+    fixture's bytes are driven through a host factory
+    registered with `record.fourcc="MP43"` regardless of the
+    AVI container tag.  All 6 surface a Video frame.
+  - **Harder content fixtures (4/4 + 5/5 + 5/5 single)**.
+    Round 43 only drove `gop-30-352x288` and the round-42
+    I+P pair; R44 adds the remaining seven content fixtures
+    the docs corpus ships:
+    - `motion-pan-352x288` (4 frames at CIF, large
+      mandelbrot pan → big inter-frame MVs): **4/4 Video**.
+    - `with-skip-mbs-352x288` (5 frames at CIF, qscale=16
+      testsrc2 → ~38% SKIP-MB fraction): **5/5 Video**.
+    - `qscale-high-352x288` (qscale=31, sparse coefs):
+      **1/1 Video**.
+    - `qscale-low-352x288` (qscale=2, dense coefs):
+      **1/1 Video**.
+    - `intra-pred-active-352x288` (mandelbrot I-frame,
+      AC-pred direction churn): **1/1 Video**.
+    - `i-only-352x288-cif` (testsrc I-frame at CIF):
+      **1/1 Video**.
+    - `tiny-i-only-176x144` (QCIF I-frame baseline):
+      **1/1 Video**.
+  - `tests/round44_fourcc_parity_and_harder_fixtures.rs`
+    (4 tests; all 4 pass under `MPG4DS32.AX`):
+    `r44_iframe_decodes_through_all_six_fourcc_containers`,
+    `r44_motion_pan_4_frame_decodes_end_to_end`,
+    `r44_with_skip_mbs_5_frame_decodes_end_to_end`,
+    `r44_iframe_corpus_decodes_end_to_end`.  Each helper
+    asserts plane0 = `w·h·3` bytes (24bpp BGR) per Video
+    frame.  Tests gracefully skip when the codec DLL or a
+    fixture is missing (CI safety) and assert the remaining
+    available count, with a floor of ≥4 fixtures so the
+    pass condition can't degenerate.
+  - **No code change required** in `src/`: round 43's
+    sample-release cycle, FourCC-blind subtype negotiation,
+    and pool sanity-checks already supported the entire
+    corpus.  R44 is an empirical confirmation that the R43
+    surface generalises across MV magnitude, SKIP-MB
+    density, qscale extremes, and AC-pred direction churn
+    on real (ffmpeg-encoded) MS-MPEG-4 v3 bitstreams.
+
 - Round 43 — **full 6-frame GOP decodes end-to-end at 352×288**:
   the `gop-30-352x288` MS-MPEG-4 v3 fixture now surfaces 6/6
   `Frame::Video`s through the same `SandboxedDshowDecoder`

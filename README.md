@@ -9,6 +9,28 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 44 — entire MS-MPEG-4 v3 fixture corpus exercised
+through the round-43 DirectShow pipeline.**  Sixteen
+fixture-runs from `docs/video/msmpeg4-fixtures/`, all
+surfacing every expected `Frame::Video` (20/20 frames in
+aggregate).  Two distinct axes covered: **FourCC parity
+(6/6)** — the corpus's six fourcc-* fixtures (MP43, DIV3,
+DIV4, DVX3, AP41, COL1) all decode through the round-43 path
+when registered against the MP43 subtype (empirical finding:
+`MPG4DS32.AX` accepts only `MEDIASUBTYPE_MP43` at
+`IPin::ReceiveConnection`; every other FOURCC subtype is
+rejected with `0x8004022a` `VFW_E_TYPE_NOT_ACCEPTED`, exactly
+mirroring real DirectShow's reliance on the FilterMapper to
+route every MS-MPEG-4-v3 FOURCC to one MP43-tagged filter).
+**Harder content fixtures** — `motion-pan-352x288` 4/4
+(large-magnitude inter-frame MVs at CIF), `with-skip-mbs-352x288`
+5/5 (~38% SKIP-MB fraction), plus single-frame coverage of
+the qscale-31 / qscale-2 / mandelbrot-AC-pred / testsrc-CIF /
+QCIF I-frame edge cases.  No `src/` change required: round
+43's sample-release cycle and FourCC-blind subtype negotiation
+already supported the entire corpus.  See
+`tests/round44_fourcc_parity_and_harder_fixtures.rs`.
+
 **Round 43 — full 6-frame GOP decodes end-to-end at 352×288
 through DirectShow.**  The two blockers round 42 identified via
 the gop-30 diagnostic blob are both fixed: (a) a corrupted
