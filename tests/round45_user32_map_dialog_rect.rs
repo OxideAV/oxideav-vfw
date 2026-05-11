@@ -183,26 +183,22 @@ fn map_dialog_rect_with_null_rect_does_not_trap() {
 }
 
 // ────────────────────────────────────────────────────────────────
-// Test 4 — the headline win.  `Sandbox::load("msadds32.ax")` now
+// Test 4 — the round-45 headline.  `Sandbox::load("msadds32.ax")`
 // makes forward progress past `MapDialogRect` (the round-45
-// blocker) and surfaces the NEXT unresolved user32 import as the
-// new edge — currently `KillTimer`.  We assert the failure mode
-// explicitly so any future user32 stub addition (which would push
-// the edge further forward, e.g. to `SetTimer`) shows up as a
-// test failure that lists the new edge symbol — exactly the
-// "report next blocker for round N+1" loop the workspace runs
-// per round.
-//
-// If/when both `KillTimer` and `SetTimer` are also added (the
-// remaining two `msadds32.ax` user32 imports per the round-45
-// PE-walk in the module docs), this test should be upgraded to
-// assert `Sandbox::load(...).is_ok()`.
+// blocker).  The post-r45 edge symbol was `KillTimer`; round 46
+// added `KillTimer` + `SetTimer` and pushed the edge forward to
+// `gdi32!StretchDIBits` (see `tests/round46_user32_set_kill_timer.rs`
+// for the next-blocker probe).  This test only validates that
+// `MapDialogRect` itself is no longer the edge — i.e. the error
+// message must NOT mention `MapDialogRect` — so the
+// round-45-specific assertion stays meaningful even as later
+// rounds push the IAT-resolve frontier further.
 //
 // Skipped gracefully if the DLL is not present in the docs tree.
 // ────────────────────────────────────────────────────────────────
 
 #[test]
-fn msadds32_ax_pe_load_advances_past_map_dialog_rect_to_kill_timer() {
+fn msadds32_ax_pe_load_advances_past_map_dialog_rect() {
     let Some(p) = msadds32_path() else {
         eprintln!("round45: msadds32.ax missing; skipping");
         return;
@@ -212,8 +208,7 @@ fn msadds32_ax_pe_load_advances_past_map_dialog_rect_to_kill_timer() {
     sb.cpu.set_instr_limit(50_000_000);
     match sb.load("msadds32.ax", &bytes) {
         Ok(img) => {
-            // Future: this is the desired terminal state once
-            // KillTimer + SetTimer are also stubbed.
+            // Desired terminal state (full splitter PE-load).
             eprintln!(
                 "round45: msadds32.ax FULLY PE-loaded — image_base={:#010x}, \
                  entry_point={:#010x}, DllMain={:?}, DllGetClassObject={:?}",
@@ -224,18 +219,17 @@ fn msadds32_ax_pe_load_advances_past_map_dialog_rect_to_kill_timer() {
             );
         }
         Err(e) => {
-            // Pin the exact next-blocker symbol so any silent
-            // forward progress in a sibling round shows up here.
+            // Pin only the round-45-specific invariant: the edge
+            // must have moved forward, off `MapDialogRect`.
             let msg = format!("{e}");
             assert!(
-                msg.contains("KillTimer"),
-                "round 45 expected the next msadds32.ax PE-load blocker after MapDialogRect to be \
-                 user32!KillTimer; got: {msg}"
+                !msg.contains("MapDialogRect"),
+                "round 45 expected msadds32.ax PE-load to advance PAST MapDialogRect; \
+                 got: {msg}"
             );
             eprintln!(
                 "round45: msadds32.ax PE-load advanced past MapDialogRect; \
-                 next blocker is user32!KillTimer (to be addressed in round 46). \
-                 Full error: {msg}"
+                 current next-blocker reported in error: {msg}"
             );
         }
     }

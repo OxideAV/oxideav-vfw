@@ -226,6 +226,34 @@ pub fn register(registry: &mut Registry) {
         2,
     );
 
+    // ---- Round-46 additions: SetTimer + KillTimer (msadds32.ax) ---
+    //
+    // `msadds32.ax` continues its `user32` import-table walk after
+    // the round-45 `MapDialogRect` add-on with two timer-API
+    // entries that gate the splitter's window-pump path.  The
+    // codec sandbox never actually fires a timer — we never enter
+    // the message-loop branch that would let the TIMERPROC
+    // callback run — but each named import must resolve to a
+    // thunk before `Sandbox::load` returns the [`Image`].
+    //
+    // Both stubs are fail-soft per the round-24 / round-45 user32
+    // playbook:
+    //
+    //   * `SetTimer` returns the caller's `nIDEvent` if non-zero,
+    //     else a synthetic id (`1`).  No actual timer is
+    //     scheduled; the codec only inspects the return for
+    //     "non-zero == success".
+    //   * `KillTimer` returns `TRUE` (1) — the documented
+    //     "function found and destroyed the timer" reply.
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-settimer
+    // UINT_PTR SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT
+    //   uElapse, TIMERPROC lpTimerFunc) — 4 args.
+    registry.register("user32.dll", "SetTimer", stub_set_timer as StubFn, 4);
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-killtimer
+    // BOOL KillTimer(HWND hWnd, UINT_PTR uIDEvent) — 2 args.
+    registry.register("user32.dll", "KillTimer", stub_kill_timer as StubFn, 2);
+
     // ---- Round-26 additions: CreateWindowExA cascade --------------
     //
     // DirectShow filters and several legacy MS codecs expect a
@@ -337,6 +365,59 @@ fn stub_map_dialog_rect(
     let _lprect = arg_dword(cpu, mmu, 1)
         .map_err(|t| crate::win32::trap_to_win32_local("MapDialogRect", t))?;
     // Identity: leave the RECT untouched, report success (TRUE = 1).
+    Ok(1)
+}
+
+/// `UINT_PTR SetTimer(HWND hWnd, UINT_PTR nIDEvent, UINT uElapse,
+/// TIMERPROC lpTimerFunc)` — fail-soft.
+///
+/// Per MSDN the function installs a timer and returns its non-zero
+/// id (the caller's `nIDEvent` if non-NULL `hWnd`, else a fresh
+/// system-allocated id).  The codec sandbox never runs the timer
+/// callback because we never enter the codec's message-pump path,
+/// so no scheduling is performed host-side.  We return `nIDEvent`
+/// when the caller picked a non-zero id (the documented
+/// hWnd!=NULL contract) and a synthetic `1` otherwise — both
+/// satisfy the "non-zero == success" probe at the call site.
+fn stub_set_timer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
+    let nid_event =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
+    let _uelapse =
+        arg_dword(cpu, mmu, 2).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
+    let _timer_proc =
+        arg_dword(cpu, mmu, 3).map_err(|t| crate::win32::trap_to_win32_local("SetTimer", t))?;
+    if nid_event != 0 {
+        Ok(nid_event)
+    } else {
+        Ok(1)
+    }
+}
+
+/// `BOOL KillTimer(HWND hWnd, UINT_PTR uIDEvent)` — fail-soft TRUE.
+///
+/// Per MSDN this returns nonzero iff a registered timer with the
+/// matching id was found and destroyed.  Since `SetTimer`
+/// host-side never actually schedules a timer (see the comment
+/// on `stub_set_timer`), there is also nothing to destroy on the
+/// `KillTimer` side; reporting success is the canonical
+/// fail-soft answer that lets the codec's teardown path complete.
+fn stub_kill_timer(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hwnd =
+        arg_dword(cpu, mmu, 0).map_err(|t| crate::win32::trap_to_win32_local("KillTimer", t))?;
+    let _uid_event =
+        arg_dword(cpu, mmu, 1).map_err(|t| crate::win32::trap_to_win32_local("KillTimer", t))?;
     Ok(1)
 }
 

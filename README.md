@@ -9,6 +9,25 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 46 — `user32!{SetTimer, KillTimer}` stubs advance
+`msadds32.ax` PE-load past the entire timer-API surface.**
+Round 45 unblocked `MapDialogRect` and pinned the next
+splitter blocker as `KillTimer`; round 46 wires both
+`SetTimer` (returns the caller's `nIDEvent` if non-zero,
+else a synthetic `1`) and `KillTimer` (returns `TRUE` per
+MSDN's "destroyed" contract) as fail-soft stubs in one
+commit.  The codec sandbox never enters the message-loop
+branch that would let a TIMERPROC actually fire, so
+no scheduling is performed host-side — the IAT slots just
+need to resolve at PE-load time.  After round 46,
+`Sandbox::load("msadds32.ax")` advances past both timer
+imports and now stops at the next unresolved import:
+`gdi32!StretchDIBits`.  No DirectShow / VfW decode metric
+changes — `MPG4DS32.AX` (the round-44 critical path) does
+not import `SetTimer` / `KillTimer`; the win is
+exclusively in the audio splitter's PE-load surface.  See
+`tests/round46_user32_set_kill_timer.rs`.
+
 **Round 45 — `user32!MapDialogRect` stub unblocks `msadds32.ax`
 PE-load past the round-24 user32 surface gap.**  The
 MS-MPEG-4-v3 reference bundle's audio-splitter half

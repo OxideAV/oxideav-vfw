@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 46 — **`user32!{SetTimer, KillTimer}` stubs advance
+  `msadds32.ax` PE-load past the entire timer-API surface.**
+  Round 45 unblocked `MapDialogRect` and pinned the next
+  splitter blocker as `KillTimer`; round 46 wires both
+  timer-API entries in one commit.  Both stubs are
+  fail-soft per the round-24 / round-45 user32 playbook —
+  the codec sandbox never enters the message-loop branch
+  that would let a `TIMERPROC` callback actually fire, so
+  no scheduling is performed host-side; the IAT slots just
+  need to resolve at PE-load time.
+  - `SetTimer(hWnd, nIDEvent, uElapse, lpTimerFunc)` —
+    return `nIDEvent` if non-zero, else a synthetic `1`.
+    Both satisfy the documented "non-zero == success"
+    probe.
+  - `KillTimer(hWnd, uIDEvent)` — return `TRUE` (1) per
+    MSDN's "found and destroyed" contract.
+  - `src/win32/user32.rs` — `stub_set_timer` +
+    `stub_kill_timer` + registry entries under the
+    round-46 msadds32 PE-load surface section.
+  - `tests/round46_user32_set_kill_timer.rs` — 5 tests:
+    both stubs registered; `SetTimer` echoes a non-zero
+    `nIDEvent`; `SetTimer` returns the synthetic `1` for
+    `nIDEvent == 0`; `KillTimer` returns `TRUE`;
+    `Sandbox::load("msadds32.ax")` advances past both
+    `KillTimer` and `SetTimer`, with the failure path
+    pinned by negated-substring asserts so any silent
+    forward progress in a sibling round shows up as a
+    failure here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow
+    MS-MPEG-4-v3 decoder filter; the round-44 critical
+    path) does NOT import either timer API — only
+    `msadds32.ax` does — so no DirectShow / VfW decode
+    metric changes.  The win is exclusively in the
+    splitter's PE-load surface, which moves from "stuck
+    at KillTimer" to "stuck at gdi32!StretchDIBits".
+  - **Next-round blocker.**  Round 47 should add
+    `gdi32!StretchDIBits` (the splitter's render-out
+    surface — fail-soft return per MSDN's
+    GDI_ERROR/scanline-count contract is the natural
+    starting point).
+  - Stubs documented from MSDN signature pages only
+    (`docs.microsoft.com/.../nf-winuser-settimer`,
+    `nf-winuser-killtimer`); no ReactOS/Wine source
+    consulted.
+
 - Round 45 — **`user32!MapDialogRect` stub unblocks `msadds32.ax`
   PE-load past the round-24 user32 surface gap.**  The
   MS-MPEG-4-v3 reference bundle's audio-splitter half
