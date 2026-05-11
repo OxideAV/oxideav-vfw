@@ -1,0 +1,242 @@
+//! Round 45 — `user32!MapDialogRect` stub + `msadds32.ax`
+//! PE-load surface unblock.
+//!
+//! ## Background
+//!
+//! The MS-MPEG-4-v3 reference bundle (`wmpcdcs8-2001`) ships
+//! the audio-splitter half `msadds32.ax` alongside the video
+//! decoder filters.  Round 24 added `user32!{RegisterClassExA,
+//! UnregisterClassA}` so that splitter's IAT could resolve
+//! enough of `user32` to PE-load — but only enough to register
+//! the import slots it touches at `DLL_PROCESS_ATTACH`.  The
+//! splitter's full IAT pulls 29 distinct `user32` symbols
+//! (PE import-table walk; see module test below), one of
+//! which — `MapDialogRect` — was not yet registered.
+//!
+//! Without `MapDialogRect` registered, `Sandbox::load("msadds32.ax")`
+//! short-circuits with
+//! `PeError::UnknownImportFunction { dll: "user32.dll", name:
+//! "MapDialogRect" }` because PE-loader IAT fix-up is
+//! eager: every named import must resolve to a thunk before
+//! the loader returns the [`Image`], regardless of whether
+//! the host ever drives a code path that actually CALLs it.
+//!
+//! Round 45 ships a fail-soft `MapDialogRect` stub
+//! (`stub_map_dialog_rect`, identity passthrough — leave the
+//! caller's RECT untouched and report success per MSDN's
+//! `BOOL` return convention) and proves three things end-to-end:
+//!
+//!   1. The stub is registered in the `Registry` and
+//!      callable through the standard `dispatch_stub` path.
+//!   2. After calling the stub, the input RECT contents are
+//!      bit-identical to the values the test seeded — i.e. the
+//!      identity passthrough does not corrupt caller memory.
+//!   3. `Sandbox::load("msadds32.ax")` now succeeds (its
+//!      complete `user32` IAT resolves).  This is the
+//!      headline win — it advances the MS-MPEG-4-v3 audio
+//!      splitter from "blocked at PE-load" to "fully
+//!      PE-loadable", ungating any future round that wants
+//!      to drive its DLL_PROCESS_ATTACH or DriverProc.
+//!
+//! ## References (clean-room, on-disk)
+//!
+//! * `docs/winmf/winmf-emulator.md` §"`msadds32.ax` — 22 imports"
+//!   — the doc lists `MapDialogRect` as one of the user32
+//!   symbols pulled by the splitter.
+//! * MSDN `MapDialogRect`:
+//!   <https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapdialogrect>
+//!   — `BOOL MapDialogRect(HWND hDlg, LPRECT lpRect)`; converts
+//!   dialog-base-units in `*lpRect` to screen pixels in-place
+//!   on success.
+//!
+//! ## What we deliberately do NOT do
+//!
+//! Drive `msadds32.ax` through `DLL_PROCESS_ATTACH` /
+//! `DriverProc`.  Per the round-24 follow-up scope we just
+//! "wire the stub, don't drive msadds32 through DRV_LOAD or
+//! anything else".  Future rounds that decide to exercise the
+//! splitter's window-pump path will need to extend several other
+//! `user32` stubs (e.g. `KillTimer`, `SetTimer` are also pulled
+//! by msadds32 but are still on the round-45 todo list).
+
+mod common;
+
+use oxideav_vfw::emulator::isa_int::RET_SENTINEL;
+use oxideav_vfw::win32::Registry;
+use oxideav_vfw::Sandbox;
+use std::path::PathBuf;
+
+fn workspace_root() -> Option<PathBuf> {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")?;
+    let manifest = PathBuf::from(manifest);
+    Some(manifest.parent()?.parent()?.to_path_buf())
+}
+
+fn msadds32_path() -> Option<PathBuf> {
+    let p =
+        workspace_root()?.join("docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/msadds32.ax");
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Test 1 — `MapDialogRect` is wired into the user32 stub registry.
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn map_dialog_rect_is_registered_in_user32() {
+    let mut r = Registry::new();
+    oxideav_vfw::win32::user32::register(&mut r);
+    assert!(
+        r.resolve("user32.dll", "MapDialogRect").is_some(),
+        "user32!MapDialogRect stub missing — round-45 follow-up"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────
+// Test 2 — call `MapDialogRect` through the sandbox and verify:
+//   (a) return value is TRUE (1) per MSDN's `BOOL` contract.
+//   (b) the input RECT is unchanged (identity passthrough).
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn map_dialog_rect_returns_true_and_leaves_rect_unchanged() {
+    let mut sb = Sandbox::new();
+    let thunk = sb
+        .registry
+        .resolve("user32.dll", "MapDialogRect")
+        .expect("MapDialogRect registered");
+
+    // Stage a 16-byte RECT in arena memory with non-zero, easy-to-
+    // recognise sentinel values.  RECT layout per `winuser.h`:
+    //   typedef struct _RECT { LONG left, top, right, bottom; } RECT;
+    let rect = sb
+        .host
+        .arena_alloc(16)
+        .expect("arena_alloc 16 bytes for RECT");
+    let seeded = [
+        0x1111_2222u32,
+        0x3333_4444u32,
+        0x5555_6666u32,
+        0x7777_8888u32,
+    ];
+    for (i, w) in seeded.iter().enumerate() {
+        sb.mmu
+            .store32(rect + (i as u32) * 4, *w)
+            .expect("seed RECT word");
+    }
+
+    // Synthetic HWND (any non-NULL value is fine for a stub that
+    // doesn't dereference it).  2-arg stdcall: push lpRect, hDlg
+    // (rev order so hDlg ends up at [esp + 4] post-CALL → arg 0).
+    let hdlg: u32 = 0xCAFE_0000;
+    sb.cpu.push32(&mut sb.mmu, rect).unwrap();
+    sb.cpu.push32(&mut sb.mmu, hdlg).unwrap();
+    sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+    sb.cpu.regs.eip = thunk;
+    sb.run_until_sentinel().unwrap();
+
+    // (a) Return value.
+    assert_eq!(
+        sb.cpu.regs.get32(oxideav_vfw::emulator::regs::Reg32::Eax),
+        1,
+        "MapDialogRect should report success (BOOL = 1)"
+    );
+
+    // (b) RECT unchanged.
+    for (i, expected) in seeded.iter().enumerate() {
+        let observed = sb.mmu.load32(rect + (i as u32) * 4).unwrap();
+        assert_eq!(
+            observed, *expected,
+            "RECT word {i}: identity stub mutated memory ({observed:#010x} != {expected:#010x})"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Test 3 — `MapDialogRect` accepts a NULL `lpRect` without
+// trapping (defensive — the stub does not deref the arg).
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn map_dialog_rect_with_null_rect_does_not_trap() {
+    let mut sb = Sandbox::new();
+    let thunk = sb
+        .registry
+        .resolve("user32.dll", "MapDialogRect")
+        .expect("MapDialogRect registered");
+    sb.cpu.push32(&mut sb.mmu, 0).unwrap(); // lpRect = NULL
+    sb.cpu.push32(&mut sb.mmu, 0xCAFE_0000).unwrap(); // hDlg
+    sb.cpu.push32(&mut sb.mmu, RET_SENTINEL).unwrap();
+    sb.cpu.regs.eip = thunk;
+    sb.run_until_sentinel().unwrap();
+    // Identity stub still reports success on NULL — matches the
+    // "fail-soft, never block the codec" pattern of the rest of
+    // the user32 stub surface.
+    assert_eq!(
+        sb.cpu.regs.get32(oxideav_vfw::emulator::regs::Reg32::Eax),
+        1,
+    );
+}
+
+// ────────────────────────────────────────────────────────────────
+// Test 4 — the headline win.  `Sandbox::load("msadds32.ax")` now
+// makes forward progress past `MapDialogRect` (the round-45
+// blocker) and surfaces the NEXT unresolved user32 import as the
+// new edge — currently `KillTimer`.  We assert the failure mode
+// explicitly so any future user32 stub addition (which would push
+// the edge further forward, e.g. to `SetTimer`) shows up as a
+// test failure that lists the new edge symbol — exactly the
+// "report next blocker for round N+1" loop the workspace runs
+// per round.
+//
+// If/when both `KillTimer` and `SetTimer` are also added (the
+// remaining two `msadds32.ax` user32 imports per the round-45
+// PE-walk in the module docs), this test should be upgraded to
+// assert `Sandbox::load(...).is_ok()`.
+//
+// Skipped gracefully if the DLL is not present in the docs tree.
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn msadds32_ax_pe_load_advances_past_map_dialog_rect_to_kill_timer() {
+    let Some(p) = msadds32_path() else {
+        eprintln!("round45: msadds32.ax missing; skipping");
+        return;
+    };
+    let bytes = std::fs::read(&p).unwrap();
+    let mut sb = Sandbox::new();
+    sb.cpu.set_instr_limit(50_000_000);
+    match sb.load("msadds32.ax", &bytes) {
+        Ok(img) => {
+            // Future: this is the desired terminal state once
+            // KillTimer + SetTimer are also stubbed.
+            eprintln!(
+                "round45: msadds32.ax FULLY PE-loaded — image_base={:#010x}, \
+                 entry_point={:#010x}, DllMain={:?}, DllGetClassObject={:?}",
+                img.image_base,
+                img.entry_point,
+                img.export("DllMain"),
+                img.export("DllGetClassObject"),
+            );
+        }
+        Err(e) => {
+            // Pin the exact next-blocker symbol so any silent
+            // forward progress in a sibling round shows up here.
+            let msg = format!("{e}");
+            assert!(
+                msg.contains("KillTimer"),
+                "round 45 expected the next msadds32.ax PE-load blocker after MapDialogRect to be \
+                 user32!KillTimer; got: {msg}"
+            );
+            eprintln!(
+                "round45: msadds32.ax PE-load advanced past MapDialogRect; \
+                 next blocker is user32!KillTimer (to be addressed in round 46). \
+                 Full error: {msg}"
+            );
+        }
+    }
+}

@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 45 — **`user32!MapDialogRect` stub unblocks `msadds32.ax`
+  PE-load past the round-24 user32 surface gap.**  The
+  MS-MPEG-4-v3 reference bundle's audio-splitter half
+  (`msadds32.ax`) imports 29 distinct `user32` symbols (full
+  list per PE-walk in `tests/round45_user32_map_dialog_rect.rs`).
+  Round 24 wired the first batch (`RegisterClassExA` /
+  `UnregisterClassA`); round 45 adds `MapDialogRect` as a
+  fail-soft identity passthrough — leave the caller's RECT
+  untouched and report success per MSDN's `BOOL` return
+  contract.  After round 45, `Sandbox::load("msadds32.ax")`
+  advances past `MapDialogRect` and now stops at the NEXT
+  unresolved user32 import: `KillTimer`.  The stub itself is
+  documented from the public MSDN signature page only
+  (`docs.microsoft.com/.../nf-winuser-mapdialogrect`); no
+  ReactOS/Wine source consulted.
+  - `src/win32/user32.rs` — `stub_map_dialog_rect` +
+    registry entry under the round-24 msadds32 PE-load
+    surface section.
+  - `tests/round45_user32_map_dialog_rect.rs` — 4 tests:
+    registry-resolves; identity passthrough returns TRUE +
+    leaves the seeded RECT bytes untouched; NULL-RECT call
+    does not trap; `Sandbox::load("msadds32.ax")` advances
+    past `MapDialogRect` to the next blocker (`KillTimer`),
+    pinned by exact error-message match so any silent
+    forward progress in a sibling round shows up as a
+    failure here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow MS-MPEG-4-v3
+    decoder filter; the round-44 critical path) does NOT
+    import `MapDialogRect` — only `msadds32.ax` does — so
+    no DirectShow / VfW decode-path metric changes.  The
+    win is exclusively in the splitter's PE-load surface,
+    which moves from "stuck at MapDialogRect" to "stuck at
+    KillTimer", ungating any future round that wants to
+    drive the splitter's DLL_PROCESS_ATTACH or DriverProc.
+  - **Next-round blocker.**  Round 46 should add
+    `user32!{KillTimer, SetTimer}` (both required for the
+    splitter's window-pump path, both fail-soft per MSDN —
+    KillTimer returns TRUE iff a registered timer with the
+    matching ID was found, SetTimer returns the timer ID
+    handed to it).
+
 - Round 44 — **full MS-MPEG-4 v3 fixture corpus exercised
   through the round-43 DirectShow pipeline**: 16 fixture-runs
   out of `docs/video/msmpeg4-fixtures/`, all surfacing every

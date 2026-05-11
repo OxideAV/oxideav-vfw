@@ -9,6 +9,25 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 45 — `user32!MapDialogRect` stub unblocks `msadds32.ax`
+PE-load past the round-24 user32 surface gap.**  The
+MS-MPEG-4-v3 reference bundle's audio-splitter half
+(`msadds32.ax`) imports 29 distinct `user32` symbols; round
+24 wired the first batch (`RegisterClassExA` /
+`UnregisterClassA`), and round 45 adds `MapDialogRect` as a
+fail-soft identity passthrough (leave the caller's RECT
+untouched, return TRUE per MSDN's `BOOL` contract).  After
+round 45, `Sandbox::load("msadds32.ax")` advances past
+`MapDialogRect` and now stops at the next unresolved
+`user32` import: `KillTimer`.  No DirectShow / VfW decode
+metric changes — `MPG4DS32.AX` (the round-44 critical
+path) does not import `MapDialogRect`; the win is
+exclusively in the audio splitter's PE-load surface, which
+moves from "stuck at MapDialogRect" to "stuck at
+KillTimer", ungating any future round that wants to drive
+its `DLL_PROCESS_ATTACH` or DriverProc.  See
+`tests/round45_user32_map_dialog_rect.rs`.
+
 **Round 44 — entire MS-MPEG-4 v3 fixture corpus exercised
 through the round-43 DirectShow pipeline.**  Sixteen
 fixture-runs from `docs/video/msmpeg4-fixtures/`, all

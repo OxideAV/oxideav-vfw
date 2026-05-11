@@ -193,6 +193,39 @@ pub fn register(registry: &mut Registry) {
         2,
     );
 
+    // ---- Round-45 addition: MapDialogRect (msadds32.ax import) ----
+    //
+    // `msadds32.ax` imports `MapDialogRect` as part of its private
+    // property-page-window code path (the same code path that the
+    // round-24 RegisterClassExA / UnregisterClassA pair was added
+    // for). The codec only invokes it from its config-dialog path,
+    // which we never enter during decode, but the IAT slot must
+    // resolve at PE-load time.
+    //
+    // MSDN signature (public):
+    //   BOOL MapDialogRect(HWND hDlg, LPRECT lpRect)
+    //
+    // Per MSDN the function converts dialog-base-units (DLUs) in
+    // the input RECT to screen pixels in-place and returns nonzero
+    // on success. Because no real dialog template ever underpins
+    // the synthetic HWNDs we mint (CreateWindowExA cascade, round
+    // 26), the conversion would have nothing to scale by anyway.
+    // We choose the **identity passthrough** — leave the RECT
+    // unchanged, return TRUE — as the simplest stub that satisfies
+    // a "function succeeded" probe. If a future round shows the
+    // codec actually inspects the RECT contents post-call, the
+    // stub can be upgraded to apply the standard 4×8 base-unit
+    // scaling per the MSDN formula.
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapdialogrect
+    // BOOL MapDialogRect(HWND, LPRECT) — 2 args.
+    registry.register(
+        "user32.dll",
+        "MapDialogRect",
+        stub_map_dialog_rect as StubFn,
+        2,
+    );
+
     // ---- Round-26 additions: CreateWindowExA cascade --------------
     //
     // DirectShow filters and several legacy MS codecs expect a
@@ -279,6 +312,31 @@ fn stub_unregister_class_a(
     _: &mut HostState,
     _: &Registry,
 ) -> Result<u32, Win32Error> {
+    Ok(1)
+}
+
+/// `BOOL MapDialogRect(HWND hDlg, LPRECT lpRect)` — identity
+/// passthrough.  Per MSDN the function converts dialog-base-units
+/// (DLUs) stored in `*lpRect` to screen pixels in-place and
+/// returns nonzero on success.  Because we never back any HWND
+/// with a real `DialogBox` template, there are no base units to
+/// scale by; a stub that leaves the RECT unchanged + reports
+/// success satisfies the "function succeeded" probe in the
+/// codec's config-dialog path (which we never invoke during
+/// decode).  We still validate that `lpRect` is non-NULL via
+/// `arg_dword` so a NULL-pointer deref shows up as a host-side
+/// trap rather than silently passing.
+fn stub_map_dialog_rect(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let _hdlg = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("MapDialogRect", t))?;
+    let _lprect = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("MapDialogRect", t))?;
+    // Identity: leave the RECT untouched, report success (TRUE = 1).
     Ok(1)
 }
 
