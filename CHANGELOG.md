@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 48 — **`msvcrt!_endthreadex` stub advances `msadds32.ax`
+  PE-load past the splitter's thread-teardown edge.**  Round 47
+  wired `gdi32!StretchDIBits` and pinned the next splitter
+  blocker as `msvcrt!_endthreadex`; round 48 wires the 1-arg
+  cdecl `_endthreadex` (`void __cdecl _endthreadex(unsigned
+  retval)`) as a fail-soft stub that returns 0.  MSDN documents
+  the function as `__declspec(noreturn)` — in the real CRT
+  control never returns to the caller after `_endthreadex`
+  runs — but the codec sandbox never actually spawns the
+  splitter's worker thread on the decode path we drive (we only
+  exercise `DLL_PROCESS_ATTACH` / `DriverProc` /
+  `IPin::ReceiveConnection`); the IAT slot just needs to
+  resolve at PE-load time, and if the codec ever did reach the
+  stub we'd want to fall back to the caller's return-address
+  rather than terminate the host process, which is exactly what
+  a cdecl `Ok(0)` stub does (the dispatcher pops nothing for
+  cdecl, the codec's RET picks up the saved return-address from
+  the stack).
+  - `src/win32/msvcrt.rs` — `stub_end_thread_ex` + registry
+    entry under a new "Round-48 addition: msadds32.ax PE-load
+    surface" section.  The `retval` arg is pulled through
+    `arg_dword` so a stack-bounds trap surfaces as a proper
+    `Win32Error` rather than a silent under-read; the value
+    itself is never surfaced back to the caller (per the MSDN
+    noreturn contract).
+  - `tests/round48_msvcrt_endthreadex.rs` — 4 tests: stub
+    registered in the msvcrt registry; non-zero `retval`
+    returns 0 end-to-end through the dispatcher; degenerate
+    `retval == 0` also returns 0; and the headline
+    `Sandbox::load("msadds32.ax")` advances past
+    `_endthreadex`, with negated-substring assert on the
+    error message so any silent forward progress in a sibling
+    round shows up as a failure here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow
+    MS-MPEG-4-v3 decoder filter; the round-44 critical
+    path) does NOT import `_endthreadex` — only
+    `msadds32.ax` does — so no DirectShow / VfW decode
+    metric changes.  The win is exclusively in the
+    splitter's PE-load surface, which moves from "stuck at
+    `_endthreadex`" to "stuck at `msvcrt!_strnicmp`".
+  - **Next-round blocker.**  Round 49 should add
+    `msvcrt!_strnicmp` (the splitter's case-insensitive
+    bounded string compare — documented as `int _strnicmp
+    (const char *string1, const char *string2, size_t
+    count)` returning `< 0` / `0` / `> 0`; the codec
+    presumably uses it for FOURCC / header-magic compares
+    during initialisation, so a real ASCII case-insensitive
+    `memcmp`-shaped implementation is required, not a
+    no-op).
+  - Stub documented from the MSDN signature page only
+    (`learn.microsoft.com/.../endthread-endthreadex`); no
+    ReactOS/Wine/MinGW msvcrt source consulted.
+
 - Round 47 — **`gdi32!StretchDIBits` stub advances `msadds32.ax`
   PE-load past the splitter's render-out edge.**  Round 46 wired
   `user32!{SetTimer, KillTimer}` and pinned the next splitter

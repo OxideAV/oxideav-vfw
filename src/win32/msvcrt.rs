@@ -93,6 +93,26 @@ pub fn register(registry: &mut Registry) {
     // C heap.
     registry.register("msvcrt.dll", "malloc", stub_malloc as StubFn, 0);
     registry.register("msvcrt.dll", "free", stub_free as StubFn, 0);
+
+    // ---- Round-48 addition: msadds32.ax PE-load surface --------
+    //
+    // After r47 (gdi32!StretchDIBits) the splitter (`msadds32.ax`)
+    // advances its msvcrt import-table walk to `_endthreadex` —
+    // the CRT thread-teardown terminator.  The codec sandbox never
+    // actually spawns the splitter's worker thread on the decode
+    // path we drive (we only exercise `DLL_PROCESS_ATTACH` /
+    // `DriverProc` / `IPin::ReceiveConnection`); the named import
+    // just needs to resolve to a thunk before `Sandbox::load`
+    // returns the [`Image`].
+    //
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/endthread-endthreadex
+    // void __cdecl _endthreadex(unsigned retval) — caller-cleanup.
+    registry.register(
+        "msvcrt.dll",
+        "_endthreadex",
+        stub_end_thread_ex as StubFn,
+        0,
+    );
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -444,6 +464,40 @@ fn stub_sprintf(
             .map_err(|t| trap("sprintf", t))?;
     }
     Ok((out.len() as u32).saturating_sub(1))
+}
+
+/// `void __cdecl _endthreadex(unsigned retval)` — fail-soft.
+///
+/// Per MSDN (`_endthread`, `_endthreadex`): "Ends a thread; …
+/// `_endthreadex` is more flexible … `retval` is the exit code
+/// for the thread.  `_endthreadex` does not call `_endthread`
+/// and does not close the thread handle".  Documented as
+/// `__declspec(noreturn)`; in the real CRT control never returns
+/// to the caller after `_endthreadex` runs.
+///
+/// The codec sandbox never spawns the splitter's worker thread
+/// on the decode path we drive — we only exercise
+/// `DLL_PROCESS_ATTACH` / `DriverProc` / `IPin::ReceiveConnection`.
+/// The IAT slot just needs to resolve at PE-load time; if the
+/// codec ever did reach `_endthreadex` we'd want to fall back to
+/// the caller's return-address rather than terminate the host
+/// process, so a no-op stub returning 0 (`eax` = `retval`'s
+/// numeric width truncated to a `DWORD`, never actually
+/// inspected by the codec since the documented contract says
+/// the function doesn't return) is the natural fail-soft
+/// shape.  cdecl: caller cleans up `retval`, so `arg_dwords = 0`.
+fn stub_end_thread_ex(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Pull `retval` defensively so a stack-bounds trap surfaces
+    // as a proper `Win32Error` rather than a silent under-read;
+    // we don't actually surface it to the caller (the MSDN
+    // contract is `__declspec(noreturn)`).
+    let _retval = arg_dword(cpu, mmu, 0).map_err(|t| trap("_endthreadex", t))?;
+    Ok(0)
 }
 
 fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {

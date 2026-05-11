@@ -9,6 +9,27 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 48 — `msvcrt!_endthreadex` stub advances `msadds32.ax`
+PE-load past the splitter's thread-teardown edge.**  Round 47
+unblocked `gdi32!StretchDIBits` and pinned the next splitter
+blocker as `msvcrt!_endthreadex`; round 48 wires the 1-arg
+cdecl `_endthreadex` (`void __cdecl _endthreadex(unsigned
+retval)`) as a fail-soft no-op returning 0.  MSDN documents
+the function as `__declspec(noreturn)` — in the real CRT
+control never returns to the caller — but the codec sandbox
+never actually spawns the splitter's worker thread on the
+decode path we drive (we only exercise `DLL_PROCESS_ATTACH` /
+`DriverProc` / `IPin::ReceiveConnection`); the IAT slot just
+needs to resolve at PE-load time, and the cdecl `Ok(0)` stub
+falls back to the caller's saved return-address rather than
+terminate the host process.  After round 48, `Sandbox::load
+("msadds32.ax")` advances past `_endthreadex` and now stops
+at the next unresolved import: `msvcrt!_strnicmp`.  No
+DirectShow / VfW decode metric changes — `MPG4DS32.AX` (the
+round-44 critical path) does not import `_endthreadex`; the
+win is exclusively in the audio splitter's PE-load surface.
+See `tests/round48_msvcrt_endthreadex.rs`.
+
 **Round 47 — `gdi32!StretchDIBits` stub advances `msadds32.ax`
 PE-load past the splitter's render-out edge.**  Round 46
 unblocked `user32!{SetTimer, KillTimer}` and pinned the next
