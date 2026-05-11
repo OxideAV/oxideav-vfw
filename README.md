@@ -9,6 +9,27 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 47 — `gdi32!StretchDIBits` stub advances `msadds32.ax`
+PE-load past the splitter's render-out edge.**  Round 46
+unblocked `user32!{SetTimer, KillTimer}` and pinned the next
+splitter blocker as `gdi32!StretchDIBits`; round 47 wires the
+13-arg `StretchDIBits` (`int StretchDIBits(HDC, int xDest, int
+yDest, int DestWidth, int DestHeight, int xSrc, int ySrc, int
+SrcWidth, int SrcHeight, const VOID *lpBits, const BITMAPINFO
+*lpbmi, UINT iUsage, DWORD rop)`) as a fail-soft stub that
+returns the caller's `DestHeight` as the "scanlines copied"
+count per MSDN's success contract.  The codec sandbox never
+actually paints; `msadds32.ax` is the MS-MPEG-4-v3 audio
+splitter and only pulls this import as part of its
+statically-linked render-out surface, never invokes it on the
+decode path we drive.  After round 47, `Sandbox::load
+("msadds32.ax")` advances past `StretchDIBits` and now stops
+at the next unresolved import: `msvcrt!_endthreadex`.  No
+DirectShow / VfW decode metric changes — `MPG4DS32.AX` (the
+round-44 critical path) does not import `StretchDIBits`; the
+win is exclusively in the audio splitter's PE-load surface.
+See `tests/round47_gdi32_stretch_dibits.rs`.
+
 **Round 46 — `user32!{SetTimer, KillTimer}` stubs advance
 `msadds32.ax` PE-load past the entire timer-API surface.**
 Round 45 unblocked `MapDialogRect` and pinned the next

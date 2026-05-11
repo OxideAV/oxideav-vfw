@@ -71,6 +71,27 @@ pub fn register(registry: &mut Registry) {
     );
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject
     registry.register("gdi32.dll", "SelectObject", stub_select_object as StubFn, 2);
+
+    // ---- Round-47 additions: msadds32.ax PE-load surface --------
+    //
+    // After r46 (user32!{SetTimer, KillTimer}) the splitter
+    // (`msadds32.ax`) advances its `gdi32` import-table walk to
+    // `StretchDIBits` — the splitter's headless render-out path.
+    // The codec sandbox never actually paints a pixel; the named
+    // import just needs to resolve to a thunk before
+    // `Sandbox::load` returns the [`Image`].
+    //
+    // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchdibits
+    // int StretchDIBits(HDC hdc, int xDest, int yDest, int
+    //   DestWidth, int DestHeight, int xSrc, int ySrc, int
+    //   SrcWidth, int SrcHeight, const VOID *lpBits, const
+    //   BITMAPINFO *lpbmi, UINT iUsage, DWORD rop) — 13 args.
+    registry.register(
+        "gdi32.dll",
+        "StretchDIBits",
+        stub_stretch_dibits as StubFn,
+        13,
+    );
 }
 
 /// `BOOL BitBlt(HDC, int, int, int, int, HDC, int, int, DWORD)`.
@@ -221,6 +242,64 @@ fn stub_select_object(
     Ok(h)
 }
 
+/// `int StretchDIBits(HDC hdc, int xDest, int yDest, int DestWidth,
+/// int DestHeight, int xSrc, int ySrc, int SrcWidth, int SrcHeight,
+/// const VOID *lpBits, const BITMAPINFO *lpbmi, UINT iUsage,
+/// DWORD rop)` — fail-soft.
+///
+/// Per MSDN the call copies colour data from a source DIB to a
+/// destination rectangle and returns the number of scanlines
+/// copied (`GDI_ERROR` on failure).  The codec sandbox never owns
+/// a real DC and never composites a final frame — `msadds32.ax`
+/// is the audio splitter and only pulls this import as part of
+/// its statically-linked render-out surface, never invokes it on
+/// the decode path we drive.  We therefore return the caller's
+/// `DestHeight` so any "scanlines > 0 == success" probe sees a
+/// satisfied contract.
+fn stub_stretch_dibits(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // We touch only the args we care about; the rest are pulled
+    // through `arg_dword` so a stack-bounds trap surfaces as a
+    // proper Win32Error rather than a silent under-read.
+    let _hdc = arg_dword(cpu, mmu, 0)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _x_dest = arg_dword(cpu, mmu, 1)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _y_dest = arg_dword(cpu, mmu, 2)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _dest_width = arg_dword(cpu, mmu, 3)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let dest_height = arg_dword(cpu, mmu, 4)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _x_src = arg_dword(cpu, mmu, 5)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _y_src = arg_dword(cpu, mmu, 6)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _src_width = arg_dword(cpu, mmu, 7)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _src_height = arg_dword(cpu, mmu, 8)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _lp_bits = arg_dword(cpu, mmu, 9)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _lpbmi = arg_dword(cpu, mmu, 10)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _i_usage = arg_dword(cpu, mmu, 11)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    let _rop = arg_dword(cpu, mmu, 12)
+        .map_err(|t| crate::win32::trap_to_win32_local("StretchDIBits", t))?;
+    // MSDN: "the return value is the number of scanlines copied".
+    // Reporting the caller's `DestHeight` satisfies any
+    // "scanlines > 0 == success" probe at the call site.  If the
+    // caller passed 0 (degenerate), echo 0 — still a non-error
+    // outcome, since `GDI_ERROR` is the explicit failure marker
+    // and we never want to surface that from a fail-soft stub.
+    Ok(dest_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +425,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cpu.regs.get32(Reg32::Eax), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn stretch_dibits_returns_dest_height() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        // 13 args: hdc, xDest, yDest, DestWidth, DestHeight,
+        //          xSrc, ySrc, SrcWidth, SrcHeight,
+        //          lpBits, lpbmi, iUsage, rop.
+        call(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            "gdi32.dll",
+            "StretchDIBits",
+            &[
+                SENTINEL_HDC,
+                0,
+                0,
+                352,
+                288,
+                0,
+                0,
+                352,
+                288,
+                0,
+                0,
+                0,
+                0x00CC_0020,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            cpu.regs.get32(Reg32::Eax),
+            288,
+            "StretchDIBits should echo DestHeight as the scanline count"
+        );
     }
 }

@@ -8,6 +8,57 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 47 — **`gdi32!StretchDIBits` stub advances `msadds32.ax`
+  PE-load past the splitter's render-out edge.**  Round 46 wired
+  `user32!{SetTimer, KillTimer}` and pinned the next splitter
+  blocker as `gdi32!StretchDIBits`; round 47 wires the 13-arg
+  `StretchDIBits` (`int StretchDIBits(HDC, int xDest, int yDest,
+  int DestWidth, int DestHeight, int xSrc, int ySrc, int
+  SrcWidth, int SrcHeight, const VOID *lpBits, const BITMAPINFO
+  *lpbmi, UINT iUsage, DWORD rop)`) as a fail-soft stub that
+  returns the caller's `DestHeight` as the "scanlines copied"
+  count per MSDN's success contract.  The codec sandbox never
+  enters the splitter's render-out path (we drive only the
+  PE-load + DLL_PROCESS_ATTACH surface, not the paint cycle
+  that would invoke `StretchDIBits`); the IAT slot just needs
+  to resolve at PE-load time.  Reporting `DestHeight` rather
+  than `GDI_ERROR` satisfies any "scanlines > 0 == success"
+  probe at the call site without ever surfacing the explicit
+  failure marker from a fail-soft stub.
+  - `src/win32/gdi32.rs` — `stub_stretch_dibits` + registry
+    entry under a new "Round-47 additions: msadds32.ax
+    PE-load surface" section.  All 13 stdcall args are
+    pulled through `arg_dword` so a stack-bounds trap
+    surfaces as a proper `Win32Error` rather than a silent
+    under-read; only `DestHeight` is actually inspected for
+    the return value.
+  - `tests/round47_gdi32_stretch_dibits.rs` — 4 tests:
+    stub registered in the gdi32 registry; `DestHeight` is
+    echoed end-to-end through the dispatcher with a 352×288
+    canonical-call probe; degenerate `DestHeight == 0`
+    echoes 0 (never surfaces `GDI_ERROR`); and the headline
+    `Sandbox::load("msadds32.ax")` advances past
+    `StretchDIBits`, with negated-substring assert on the
+    error message so any silent forward progress in a
+    sibling round shows up as a failure here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow
+    MS-MPEG-4-v3 decoder filter; the round-44 critical
+    path) does NOT import `StretchDIBits` — only
+    `msadds32.ax` does — so no DirectShow / VfW decode
+    metric changes.  The win is exclusively in the
+    splitter's PE-load surface, which moves from "stuck at
+    StretchDIBits" to "stuck at `msvcrt!_endthreadex`".
+  - **Next-round blocker.**  Round 48 should add
+    `msvcrt!_endthreadex` (the splitter's thread-teardown
+    edge — documented as a `void __cdecl` terminator that
+    never returns, but in a PE-load context only the IAT
+    slot needs to resolve, so a no-op stub returning 0 is
+    the natural starting point; the codec never spawns the
+    thread on the decode path we drive).
+  - Stub documented from the MSDN signature page only
+    (`docs.microsoft.com/.../nf-wingdi-stretchdibits`); no
+    ReactOS/Wine source consulted.
+
 - Round 46 — **`user32!{SetTimer, KillTimer}` stubs advance
   `msadds32.ax` PE-load past the entire timer-API surface.**
   Round 45 unblocked `MapDialogRect` and pinned the next
