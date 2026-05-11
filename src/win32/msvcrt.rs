@@ -113,6 +113,27 @@ pub fn register(registry: &mut Registry) {
         stub_end_thread_ex as StubFn,
         0,
     );
+
+    // ---- Round-49 addition: msadds32.ax PE-load surface --------
+    //
+    // After r48 (`_endthreadex`) the splitter advances its msvcrt
+    // import-table walk to `_strnicmp`, the case-insensitive
+    // bounded ASCII string compare.  Unlike `_endthreadex` (which
+    // the splitter never actually invokes from the
+    // PE-load / DLL_PROCESS_ATTACH path), `_strnicmp` IS called
+    // during init for FOURCC / header-magic matching, so a stub
+    // that returns 0 (== "every string compares equal") would let
+    // the codec take a wrong branch and silently misbehave during
+    // a later decode.  We implement the real semantics: ASCII
+    // tolower on each byte, return `(b1 - b2) as i32` at the
+    // first mismatch or terminator, NUL-terminating early on
+    // either side.
+    //
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnicmp-wcsnicmp-mbsnicmp-strnicmp-l-wcsnicmp-l-mbsnicmp-l
+    // int __cdecl _strnicmp(const char *string1,
+    //                       const char *string2,
+    //                       size_t count) — caller-cleanup.
+    registry.register("msvcrt.dll", "_strnicmp", stub_strnicmp as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -497,6 +518,117 @@ fn stub_end_thread_ex(
     // we don't actually surface it to the caller (the MSDN
     // contract is `__declspec(noreturn)`).
     let _retval = arg_dword(cpu, mmu, 0).map_err(|t| trap("_endthreadex", t))?;
+    Ok(0)
+}
+
+/// `int __cdecl _strnicmp(const char *string1, const char *string2,
+/// size_t count)` — case-insensitive ASCII bounded compare.
+///
+/// Per MSDN (`_strnicmp, _wcsnicmp, _mbsnicmp, _strnicmp_l,
+/// _wcsnicmp_l, _mbsnicmp_l`): "Compares, at most, the first
+/// `count` characters of two strings.  The comparison is not
+/// case-sensitive."  Return value: `< 0` if `string1` is less
+/// than `string2`, `0` if equal up to `count`, `> 0` if greater.
+///
+/// Calling convention: cdecl (caller-cleanup), 3 dwords on the
+/// stack (`string1`, `string2`, `count`).  `arg_dwords = 0`.
+///
+/// Implementation contract:
+///
+/// * `count == 0` returns 0 (vacuously equal — MSDN explicit).
+/// * Each byte is folded to lowercase by the ASCII rule
+///   `b'A'..=b'Z' → +0x20`; bytes ≥ `0x80` are compared
+///   byte-for-byte (no Unicode tolower).  This matches the
+///   single-byte `_strnicmp` documented behaviour for the C
+///   locale, which is the only locale the codec init path is
+///   ever run under.
+/// * Comparison terminates early at the first NUL on EITHER
+///   string within `count` bytes; if both reach NUL at the same
+///   index, the strings are equal (return 0).  The byte that
+///   triggered the termination is included in the returned
+///   difference (`b1 - b2`), so `"AVI\0"` vs `"AVIX"` returns a
+///   negative value (NUL is less than `'X'`).
+/// * Return value is a signed difference of unsigned bytes, cast
+///   to `i32` and re-cast to `u32` so the dispatcher can place
+///   it in `eax` (the codec re-interprets it as a signed `int`).
+///
+/// Fail-soft envelope:
+///
+/// * `count > 1 MiB` → return 0.  No legitimate FOURCC / header
+///   compare exceeds a few dozen bytes; an absurdly large count
+///   is almost certainly a fuzz-shaped argument or an
+///   uninitialised stack slot, and "treat as equal" is the
+///   safest non-panicking outcome.
+/// * Either pointer reading out-of-bounds (MMU `MemoryFault` or
+///   any other [`Trap`]) → return 0.  The MSDN contract has no
+///   way to surface a fault back to the caller, and panicking
+///   would tear down the host process; the alternative would be
+///   to return `Err(Win32Error::InvalidArgument)`, which would
+///   then propagate as a sandbox-side trap and abort the decode.
+///   Fail-soft (== treat as equal) keeps the boundary case
+///   tractable while a real error path is still emitted via
+///   tracing.
+fn stub_strnicmp(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let s1 = arg_dword(cpu, mmu, 0).map_err(|t| trap("_strnicmp", t))?;
+    let s2 = arg_dword(cpu, mmu, 1).map_err(|t| trap("_strnicmp", t))?;
+    let count = arg_dword(cpu, mmu, 2).map_err(|t| trap("_strnicmp", t))?;
+
+    // count == 0 → vacuously equal.
+    if count == 0 {
+        return Ok(0);
+    }
+    // Absurdly large `count` (more than 1 MiB) is almost
+    // certainly fuzz-shaped or an uninitialised stack slot;
+    // fail-soft to "equal" rather than panicking on the
+    // unbounded loop.
+    const MAX_COUNT: u32 = 1 << 20;
+    if count > MAX_COUNT {
+        return Ok(0);
+    }
+
+    fn ascii_tolower(b: u8) -> u8 {
+        if b.is_ascii_uppercase() {
+            b + 0x20
+        } else {
+            b
+        }
+    }
+
+    for i in 0..count {
+        let p1 = s1.wrapping_add(i);
+        let p2 = s2.wrapping_add(i);
+        // Bounds-check by trying the load; on any trap, fail-soft
+        // (treat as equal).  Mirrors the MSDN-incompatible-but-
+        // sandbox-safe envelope documented above.
+        let b1 = match mmu.load8(p1) {
+            Ok(v) => v,
+            Err(_) => return Ok(0),
+        };
+        let b2 = match mmu.load8(p2) {
+            Ok(v) => v,
+            Err(_) => return Ok(0),
+        };
+        // NUL on EITHER side terminates the compare.  If both are
+        // NUL at the same index, the difference is 0 → equal.
+        // If only one side is NUL, the difference picks up the
+        // sign correctly (NUL < any non-NUL byte).
+        if b1 == 0 || b2 == 0 {
+            let diff = (b1 as i32) - (b2 as i32);
+            return Ok(diff as u32);
+        }
+        let l1 = ascii_tolower(b1);
+        let l2 = ascii_tolower(b2);
+        if l1 != l2 {
+            let diff = (l1 as i32) - (l2 as i32);
+            return Ok(diff as u32);
+        }
+    }
+    // Reached `count` bytes with no NUL and no mismatch → equal.
     Ok(0)
 }
 

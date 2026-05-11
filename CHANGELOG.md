@@ -8,6 +8,85 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 49 — **`msvcrt!_strnicmp` stub advances `msadds32.ax`
+  PE-load past the splitter's case-insensitive bounded-compare
+  edge.**  Round 48 wired `_endthreadex` and pinned the next
+  splitter blocker as `_strnicmp`; round 49 implements the
+  3-arg cdecl `_strnicmp` (`int __cdecl _strnicmp(const char
+  *string1, const char *string2, size_t count)` returning
+  `< 0` / `0` / `> 0`) as a real ASCII-tolower bounded
+  compare.  Unlike the previous PE-load IAT-stub family
+  (`SetTimer`, `KillTimer`, `StretchDIBits`, `_endthreadex`),
+  `_strnicmp` is NOT a no-op candidate — the splitter calls
+  it during init for FOURCC / header-magic matching, so a
+  stub that returns a constant 0 (== "every string compares
+  equal") would let the codec take a wrong branch and
+  silently misbehave on a later decode.  Each byte is folded
+  to lowercase by the ASCII rule `b'A'..=b'Z' → +0x20`; bytes
+  ≥ `0x80` are compared byte-for-byte (no Unicode tolower);
+  the compare terminates early on the first NUL on EITHER
+  side within `count` bytes; the return value is the byte
+  difference of the first mismatch (or terminator) cast to
+  `i32`, then re-cast to `u32` for `eax`.
+  - `src/win32/msvcrt.rs` — `stub_strnicmp` + registry entry
+    under a new "Round-49 addition: msadds32.ax PE-load
+    surface" section.  All three cdecl args are pulled
+    through `arg_dword` so a stack-bounds trap surfaces as a
+    proper `Win32Error::InvalidArgument` rather than a
+    silent under-read.
+  - **Fail-soft envelope.**  Either pointer reading OOB
+    (`mmu.load8` returning a [`Trap`]) or an absurdly large
+    `count` (`> 1 MiB`) returns 0 ("treat as equal") rather
+    than propagating an error.  The MSDN contract has no way
+    to surface a fault back to the caller, and the
+    alternative — bubbling `Win32Error::InvalidArgument` up
+    through the dispatcher — would tear down the decode on
+    fuzz-shaped boundary cases that the codec's own use site
+    never actually hits.  All "real" call sites
+    (3-to-4-byte FOURCC compares against staged const-arena
+    strings) are well inside the envelope.
+  - `tests/round49_msvcrt_strnicmp.rs` — 13 tests:
+    registration probe; the canonical equal-prefix
+    case-insensitive compare (`"AVI " == "avi "`); the
+    differing-prefix sign check (`"MP43" > "MP42"` → +1); a
+    shorter-count probe (`"MP43"` vs `"MP42"` count=3 → 0);
+    a NUL-terminator-within-count probe (`"AVI\0"` vs
+    `"AVI\0XYZ"` count=7 → 0); a high-byte byte-for-byte
+    probe (`0xC0` vs `0xE0` → -32, no Unicode fold); two
+    fail-soft probes (OOB pointer + `u32::MAX` count); the
+    `count == 0` MSDN-vacuous-equal probe; both-empty;
+    one-side-NUL sign pickup (`"AVI\0"` < `"AVIX"`); the
+    canonical `"riff"` vs `"RIFF"` use-site echo; and the
+    headline `Sandbox::load("msadds32.ax")` PE-load advance
+    with negated-substring assert on the error message so
+    any silent forward progress in a sibling round shows up
+    here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow
+    MS-MPEG-4-v3 decoder filter; the round-44 critical
+    path) does NOT import `_strnicmp` — only `msadds32.ax`
+    does — so no DirectShow / VfW decode metric changes.
+    The win is exclusively in the splitter's PE-load
+    surface, which moves from "stuck at `_strnicmp`" to
+    "stuck at `msvcrt!_beginthreadex`".
+  - **Next-round blocker.**  Round 50 should add
+    `msvcrt!_beginthreadex` (the splitter's CRT
+    thread-creation entry — documented as `uintptr_t
+    _beginthreadex(void *security, unsigned stack_size,
+    unsigned (__stdcall *start_address)(void *), void
+    *arglist, unsigned initflag, unsigned *thrdaddr)`
+    returning the new thread handle on success, 0 on
+    failure).  The codec sandbox never actually needs a
+    real worker thread on the decode path we drive, so a
+    fail-soft stub returning 0 (== "thread creation
+    failed", which is a normal failure mode the splitter is
+    documented to handle) is the natural shape — paired
+    with the round-48 `_endthreadex` no-op, this closes the
+    entire CRT thread-lifecycle surface for `msadds32.ax`'s
+    PE-load.
+  - Stub documented from the MSDN signature page only
+    (`learn.microsoft.com/.../strnicmp-wcsnicmp-mbsnicmp-strnicmp-l-wcsnicmp-l-mbsnicmp-l`);
+    no ReactOS / Wine / MinGW msvcrt source consulted.
+
 - Round 48 — **`msvcrt!_endthreadex` stub advances `msadds32.ax`
   PE-load past the splitter's thread-teardown edge.**  Round 47
   wired `gdi32!StretchDIBits` and pinned the next splitter

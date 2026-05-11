@@ -9,6 +9,30 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 49 — `msvcrt!_strnicmp` stub advances `msadds32.ax`
+PE-load past the splitter's case-insensitive bounded-compare
+edge.**  Round 48 wired `_endthreadex` and pinned the next
+splitter blocker as `_strnicmp`; round 49 implements the real
+ASCII-tolower bounded compare (`int __cdecl _strnicmp(const
+char *string1, const char *string2, size_t count)` returning
+`< 0` / `0` / `> 0`).  Unlike the previous IAT-stub family,
+`_strnicmp` is NOT a no-op candidate — the splitter calls it
+during init for FOURCC / header-magic matching, so a stub
+returning a constant 0 (== "every string compares equal")
+would let the codec take a wrong branch and silently misbehave
+on a later decode.  The implementation folds each byte to
+lowercase by the ASCII rule `b'A'..=b'Z' → +0x20`, terminates
+early on the first NUL on either side, returns the byte
+difference cast to `i32`, and fail-softs to 0 (treat as equal)
+when either pointer reads OOB or `count > 1 MiB`.  After round
+49, `Sandbox::load("msadds32.ax")` advances past `_strnicmp`
+and now stops at the next unresolved import:
+`msvcrt!_beginthreadex`.  No DirectShow / VfW decode metric
+changes — `MPG4DS32.AX` (the round-44 critical path) does not
+import `_strnicmp`; the win is exclusively in the audio
+splitter's PE-load surface.  See
+`tests/round49_msvcrt_strnicmp.rs`.
+
 **Round 48 — `msvcrt!_endthreadex` stub advances `msadds32.ax`
 PE-load past the splitter's thread-teardown edge.**  Round 47
 unblocked `gdi32!StretchDIBits` and pinned the next splitter
