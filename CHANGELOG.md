@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 52 — **`msvcrt!_ftol` real impl + `msadds32.ax` PE-load
+  surface advance past the CRT FP-truncation edge.**  The MSMPEG4
+  audio-side splitter's import walk reached `msvcrt!_ftol` after
+  r50 (`_beginthreadex`).  Unlike the r48/r50 fail-soft no-op pair,
+  `_ftol` is actively called from filter-coefficient init paths and
+  needed a real implementation — a constant 0 or wrong-sign
+  truncation would scramble every conversion of a precomputed float
+  coefficient back to the i32 the splitter's FIR loops expect.
+  - `src/win32/msvcrt.rs` — new `stub_ftol`:
+    `long __cdecl _ftol(double)`.  Per the MSVC ABI the `double`
+    argument is on the x87 stack (caller emits `FLD qword ptr [arg]`
+    before the CALL); the stub reads `ST(0)`, truncates toward zero
+    via `f as i32` (Rust 2018+ semantics), pops the x87 slot, and
+    returns the i32 in `eax`.  Saturation: NaN → `i32::MIN`
+    (the MSVC "indefinite integer" sentinel `0x8000_0000`),
+    `f >= 2^31` → `i32::MAX`, `f <= -2^31-1` → `i32::MIN`.  Registered
+    with `arg_dwords = 0`: the *argument* is on the x87 stack and not
+    on the regular cdecl stack at all.
+  - `tests/round52_msvcrt_ftol.rs` — 14 integration tests pinning
+    truncation toward zero (positive & negative fractions),
+    sub-unit fractions rounding toward zero (`0.5 → 0`,
+    `-0.5 → 0`), the saturation envelope (`±∞`, `±1e20`, NaN), the
+    exact `i32::MAX` boundary, exact-integer passthrough, and the
+    "x87 stack depth decreases by exactly 1" contract.  Headline:
+    `Sandbox::load("msadds32.ax")` advances past `_ftol` to surface
+    the **next blocker — `msvcrt!rand`**.
+
 - Round 51 — **Encode side of the IC* surface lands end-to-end
   against `mpg4c32.dll`; `quality=5000` BGR24 → MP43 → BGR24
   self-roundtrip at 27.83 dB PSNR.** Previous rounds (21..44)

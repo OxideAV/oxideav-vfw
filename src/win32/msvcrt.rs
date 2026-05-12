@@ -169,6 +169,38 @@ pub fn register(registry: &mut Registry) {
         stub_begin_thread_ex as StubFn,
         0,
     );
+
+    // ---- Round-52 addition: msadds32.ax PE-load surface --------
+    //
+    // After r50 (`_beginthreadex`) the splitter advances its msvcrt
+    // import-table walk to `_ftol` — the MSVC x87-to-i32 truncate
+    // helper used by code compiled without `/QIfist`.  Unlike the
+    // r48/r50 fail-soft no-op pair (`_endthreadex` / `_beginthreadex`),
+    // `_ftol` is actively called from filter-coefficient init paths
+    // and MUST be a real implementation: returning a constant 0 (or
+    // a wrong-sign truncation) would scramble every conversion of
+    // a precomputed float coefficient back to the i32 the splitter's
+    // FIR loops expect.
+    //
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/ftol
+    // long __cdecl _ftol(double)
+    //
+    // ABI: cdecl from the C source's perspective, but the IA-32
+    // calling convention puts the `double` argument on the x87
+    // stack (the caller emits `FLD qword ptr [arg]` before the
+    // CALL).  The function pops `ST(0)`, truncates toward zero,
+    // and returns the i32 in `eax`.  cdecl means caller-cleanup
+    // on the regular cdecl stack — but in this special case the
+    // caller didn't push any args there, so `arg_dwords = 0` is
+    // correct.
+    //
+    // Saturation: outside the i32 representable range
+    // (`[-2^31, 2^31 - 1]`) and on NaN, return `i32::MIN` (matches
+    // the MSVC runtime's documented "indefinite integer" sentinel,
+    // `0x8000_0000`).  Rust's `f64 as i32` already saturates per
+    // 2018-edition semantics; we still range-check explicitly so
+    // the NaN branch returns `i32::MIN` deterministically.
+    registry.register("msvcrt.dll", "_ftol", stub_ftol as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -727,6 +759,64 @@ fn stub_begin_thread_ex(
 
     // Return 0 = MSDN "thread creation failed" sentinel.
     Ok(0)
+}
+
+/// `long __cdecl _ftol(double)` — MSVC's "convert double to long
+/// (i32) with truncation toward zero" helper for code compiled
+/// without `/QIfist`.
+///
+/// Per the MSVC ABI the `double` argument is passed on the x87
+/// stack: the caller emits `FLD qword ptr [arg]` immediately before
+/// the CALL, leaving the value as `ST(0)`.  `_ftol` then:
+///
+///  1. Reads `ST(0)`.
+///  2. Truncates toward zero (i.e. `f64 as i32` semantics in Rust,
+///     NOT `floor`).
+///  3. Pops `ST(0)` off the x87 stack.
+///  4. Returns the i32 in `eax`.
+///
+/// Saturation contract:
+///
+///  * `f.is_nan()`            → `i32::MIN` (the MSVC "indefinite
+///    integer" sentinel, `0x8000_0000`).
+///  * `f >= 2_147_483_648.0`  → `i32::MAX`.
+///  * `f <= -2_147_483_649.0` → `i32::MIN`.
+///  * Otherwise               → `f as i32` (truncation toward zero).
+///
+/// (Rust's `f64 as i32` already saturates the over/underflow cases
+/// and maps NaN to 0 per RFC 3324, but we want the deterministic
+/// `i32::MIN` sentinel for NaN since that matches the contract real
+/// MSVC programs occasionally inspect; explicit range-check sorts
+/// both concerns out.)
+///
+/// `cdecl` from the C source's perspective: caller-cleanup on the
+/// regular cdecl stack, but the *argument* is on the x87 stack and
+/// not on the regular stack at all — so `arg_dwords = 0` is the
+/// right registration shape (no dwords to clean).
+fn stub_ftol(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Read ST(0) and pop the x87 stack.  The pop is mandatory:
+    // codecs that follow the documented ABI rely on the post-call
+    // stack depth being one less than the pre-call depth.
+    let f = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+
+    // Truncate toward zero with saturation envelope.
+    let v: i32 = if f.is_nan() {
+        i32::MIN
+    } else if f >= 2_147_483_648.0_f64 {
+        i32::MAX
+    } else if f <= -2_147_483_649.0_f64 {
+        i32::MIN
+    } else {
+        // `f as i32` truncates toward zero in Rust 2018+ semantics.
+        f as i32
+    };
+    Ok(v as u32)
 }
 
 fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {

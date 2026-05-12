@@ -9,6 +9,30 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 52 — `msvcrt!_ftol` real impl advances `msadds32.ax`
+PE-load past the splitter's CRT FP-truncation edge.**  Round 50
+wired `_beginthreadex` and pinned the next splitter blocker as
+`_ftol`; round 52 implements the real x87-to-i32 truncate helper
+(`long __cdecl _ftol(double)` — caller emits `FLD qword ptr [arg]`
+before the CALL, the stub reads `ST(0)`, truncates toward zero,
+pops the x87 slot, and returns the i32 in `eax`).  Unlike the
+r48/r50 fail-soft pair (`_endthreadex` / `_beginthreadex`, both
+never actually invoked on the decode path we drive), `_ftol` IS
+called from filter-coefficient init paths and needed a real impl
+— a constant 0 or wrong-sign truncation would scramble every
+conversion of a precomputed float coefficient back to the i32 the
+splitter's FIR loops expect.  Saturation: NaN → `i32::MIN` (the
+MSVC "indefinite integer" sentinel `0x8000_0000`), `f >= 2^31` →
+`i32::MAX`, `f <= -2^31-1` → `i32::MIN`.  Registered with
+`arg_dwords = 0` — the *argument* is on the x87 stack and not on
+the regular cdecl stack at all.  After round 52,
+`Sandbox::load("msadds32.ax")` advances past `_ftol` and now
+stops at the next unresolved import: `msvcrt!rand`.  No
+DirectShow / VfW decode metric changes — `MPG4DS32.AX` (the
+round-44 critical path) does not import `_ftol`; the win is
+exclusively in the audio splitter's PE-load surface.  See
+`tests/round52_msvcrt_ftol.rs`.
+
 **Round 51 — Encode side of the IC* surface lands end-to-end
 against `mpg4c32.dll`; `quality=5000` BGR24 → MP43 → BGR24
 self-roundtrip at 27.83 dB PSNR.**  The decode pipeline
