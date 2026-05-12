@@ -9,6 +9,31 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 59 — real `WAVEFORMATEX` + extradata lifted from a 1-s
+440 Hz ffmpeg-generated ASF/WMA fixture; `IPin::ReceiveConnection`
+still returns `E_FAIL` against `msadds32.ax`'s input pin, but now
+with empirically-grounded codec headers rather than synthetic
+zeros.**  The new `oxideav_vfw::com::asf_amt` module walks the
+ASF Header Object (`{75B22630-668E-11CF-A6D9-00AA0062CE6C}` per
+ASF spec §11.1), locates the Stream Properties Object
+(`{B7DC0791-A9B7-11CF-8EE6-00C00C205365}`, §3.3) whose Stream Type
+GUID equals `ASF_Audio_Media`
+(`{F8699E40-5B4D-11CF-A8FD-00805F5C442B}`), and lifts the
+`WAVEFORMATEX` + `cbSize`-bytes-of-extradata trailer from the
+Type-Specific Data field into an `AmtBlueprint`.  Round 58's
+synthetic AMTs are now restaged from the blueprint; the splitter
+still rejects WMA1 (`wFormatTag=0x0160`, cbSize=4,
+extradata=`00 00 01 00`) and WMA2 (`wFormatTag=0x0161`, cbSize=10,
+extradata=`00 00 00 00 01 00 00 00 00 00`) with HRESULT
+`0x80004005` (E_FAIL), so the bitstream-class-byte that the
+splitter's `QueryAccept` validates against is still wrong — likely
+the codec wants a specific encoder-class header that ffmpeg's
+trivial 1-s fixture does not emit.  Fixtures land at
+`tests/fixtures/audio/wma{1,2}_440hz_mono_1s.wma` (< 8 KiB each;
+ffmpeg invocation documented in `tests/fixtures/audio/HOWTO.md`).
+See `tests/round59_msadds32_wma_real_fixture.rs` (6 tests across
+4 phases).
+
 **Round 58 — `msadds32.ax` audio splitter walks
 `IBaseFilter::EnumPins → IPin::QueryDirection` (2 pins: INPUT +
 OUTPUT) and drives `IMediaFilter::Pause + Run(0) + GetState` into

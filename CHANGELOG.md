@@ -8,6 +8,64 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 59 — **real `WAVEFORMATEX` + extradata lifted from a 1-s
+  440 Hz ffmpeg-generated ASF/WMA fixture; `IPin::ReceiveConnection`
+  still returns `E_FAIL` against `msadds32.ax`'s input pin but
+  with empirically-grounded codec headers rather than synthetic
+  zeros, surfacing the next splitter blocker.**  New
+  `oxideav_vfw::com::asf_amt` module walks the ASF Header Object
+  (`{75B22630-668E-11CF-A6D9-00AA0062CE6C}`, ASF spec §11.1),
+  locates the Stream Properties Object
+  (`{B7DC0791-A9B7-11CF-8EE6-00C00C205365}`, §3.3) whose Stream
+  Type GUID equals `ASF_Audio_Media`
+  (`{F8699E40-5B4D-11CF-A8FD-00805F5C442B}`), and decodes the
+  Type-Specific Data field — for an audio stream this IS the
+  `WAVEFORMATEX` struct followed by `cbSize` bytes of
+  codec-specific extradata — into the new
+  `oxideav_vfw::com::AmtBlueprint`.  Test fixtures
+  `tests/fixtures/audio/wma1_440hz_mono_1s.wma` (6904 B,
+  `wFormatTag=0x0160` / cbSize=4 / extradata=`00 00 01 00`) and
+  `tests/fixtures/audio/wma2_440hz_mono_1s.wma` (6944 B,
+  `wFormatTag=0x0161` / cbSize=10 /
+  extradata=`00 00 00 00 01 00 00 00 00 00`) are checked in;
+  ffmpeg 8.1 invocation command documented in
+  `tests/fixtures/audio/HOWTO.md`.  Both fixtures encode at
+  44 100 Hz mono / 32 kbit/s / `nBlockAlign=185` /
+  `wBitsPerSample=16`.
+  - **Phase 1 result — ASF-spec parser surfaces canonical WMA1 /
+    WMA2 headers.**  `extract_wma_amt_from_asf` returns the
+    correct `wFormatTag` (`0x0160` / `0x0161`), `nChannels`,
+    `nSamplesPerSec`, `nAvgBytesPerSec`, `nBlockAlign`,
+    `wBitsPerSample`, and the full `cbSize`-bytes extradata
+    blob for each fixture.  The blueprint round-trips into a
+    guest-staged AM_MEDIA_TYPE (Phase 2 test).
+  - **Phase 3 result — `IPin::ReceiveConnection` still returns
+    `E_FAIL` (`0x80004005`) for both WMA1 and WMA2 even with
+    REAL fixture extradata.**  Splitter's `QueryAccept` is
+    validating against something more specific than the
+    standard ffmpeg-emitted bootstrap header — likely the
+    encoder-class byte / bitstream-version byte that the
+    Microsoft WMA encoder embeds.  Next blocker is to either
+    (a) probe the splitter's QueryAccept disassembly at the
+    AMT-check site to identify the exact byte(s) it validates,
+    or (b) source a Microsoft-encoded WMA fixture rather than
+    ffmpeg's wmav1/wmav2 output.  Phase 4 (push first ASF data
+    packet through `IMemInputPin::Receive`) is gated on
+    Phase 3 acceptance and skips cleanly when E_FAIL is
+    returned.
+  - **`com::asf_amt` is clean-room from the public ASF
+    specification only — no Wine / ReactOS / MinGW / Microsoft
+    DShow / ffmpeg WMA source consulted.**  ffmpeg is used as
+    an opaque byte-stream generator (it writes the bytes we
+    read); we do not read any line of its source.  The parser
+    refuses non-ASF inputs (`AsfParseError::NotAnAsfFile`),
+    truncated buffers (`TruncatedHeader`), inconsistent
+    sub-object sizes (`InvalidSubObjectSize`,
+    `SubObjectOverflowsHeader`), audio-stream-less files
+    (`NoAudioStream`), and malformed `WAVEFORMATEX::cbSize`
+    relative to Type-Specific Data Length
+    (`WaveFormatExtraOverflow`).
+
 - Round 58 — **`msadds32.ax` audio splitter walks `EnumPins` +
   `Pause` + `Run(0)` cleanly into `FILTER_STATE_RUNNING`; full
   encoded-audio AMT staging surface (WAVEFORMATEX) lands; only

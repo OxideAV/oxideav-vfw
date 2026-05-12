@@ -52,10 +52,15 @@
 
 use crate::emulator::{Cpu, Mmu};
 
+pub mod asf_amt;
 pub mod call;
 pub mod host_iface;
 pub mod host_iface_r31;
 
+pub use asf_amt::{
+    extract_wma_amt_from_asf, locate_first_data_packet, AmtBlueprint, AsfParseError,
+    ASF_AUDIO_MEDIA, ASF_HEADER_OBJECT, ASF_STREAM_PROPERTIES_OBJECT,
+};
 pub use call::{add_ref, call_method, query_interface, release};
 pub use host_iface::{
     all_set_properties, clear_query_info_log, clear_set_properties_log, last_set_properties,
