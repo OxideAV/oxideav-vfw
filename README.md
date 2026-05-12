@@ -9,6 +9,31 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 60 — `IPin::ReceiveConnection` now returns `S_OK` against
+the real `msadds32.ax` audio splitter for criteria-passing WMA1
+and WMA2 `AM_MEDIA_TYPE`s.**  Round 59 closed by observing
+`msadds32.ax` rejects every ffmpeg-encoded WMA1 / WMA2 fixture
+with `HRESULT 0x80004005`.  Round 60 disassembled the input
+pin's full validator chain from raw byte inspection against
+Intel SDM Vol. 2 opcode tables (no Wine / ReactOS / Microsoft
+DShow / ffmpeg source consulted) and pinned the rejection to a
+single gate inside `CompleteConnect` (inner.vtable[12] at RVA
+`0x2057`): the splitter requires a 37-byte ASCII CLSID
+`"1A0F78F0-EC8A-11d2-BBBE-006008320064\0"` embedded inside the
+`WAVEFORMATEX` extradata at offset `+4` (WMA1) or `+10` (WMA2),
+with `cbSize >= 41` (WMA1) or `>= 47` (WMA2).  The new
+`AmtBlueprint::wma_criteria_passing` constructor builds an AMT
+that passes every gate; `phase4_criteria_passing_*` tests
+confirm both `0x0160` and `0x0161` land `HRESULT 0x00000000`.
+Phase 5 stretch advances one step further: with
+`ReceiveConnection` accepting, pushing 4 KiB of real WMA2 bytes
+through `IMemInputPin::Receive` now returns `VFW_E_NOT_COMMITTED`
+(`0x80040209`) — the allocator-commit handshake is the next
+blocker.  Full validator decoding in
+`docs/codec/msadds32-query-accept-validation.md`; 16-test
+disassembly harness in
+`tests/round60_msadds32_query_accept_disasm.rs`.
+
 **Round 59 — real `WAVEFORMATEX` + extradata lifted from a 1-s
 440 Hz ffmpeg-generated ASF/WMA fixture; `IPin::ReceiveConnection`
 still returns `E_FAIL` against `msadds32.ax`'s input pin, but now

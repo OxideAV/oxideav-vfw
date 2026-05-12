@@ -8,6 +8,87 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 60 — **`IPin::ReceiveConnection` now returns `S_OK` against
+  the real `msadds32.ax` audio splitter for criteria-passing
+  WMA1 and WMA2 `AM_MEDIA_TYPE`s.**  Round 59 closed by observing
+  the splitter rejects every ffmpeg-encoded WMA1 / WMA2 fixture
+  with `HRESULT 0x80004005` (`E_FAIL`).  Round 60 disassembled
+  the input-pin validator chain end-to-end from raw byte
+  inspection of `msadds32.ax` against Intel SDM Vol. 2 opcode
+  tables (no Wine / ReactOS / Microsoft DShow / ffmpeg source
+  consulted) and pinned the rejection to a single gate inside
+  `CompleteConnect` (inner.vtable[12] at RVA `0x2057`):
+  - `IPin::ReceiveConnection` (vtable[4] @ RVA `0x476f`) walks
+    four pre-gates (`pmt`/`pConnector` NULL → `E_POINTER`;
+    `m_pConnected` non-NULL → `VFW_E_ALREADY_CONNECTED`; not
+    `State_Stopped` → `VFW_E_NOT_STOPPED`; same-direction pin →
+    `VFW_E_INVALID_DIRECTION`).
+  - Calls `inner.CheckConnect(pConnector)` (vtable[10] @ RVA
+    `0x5623` → helper at RVA `0x4743` which only verifies
+    opposite-direction connectivity via
+    `pConnector->QueryDirection()`).
+  - Calls `inner.CheckMediaType(pmt)` (vtable[8] @ RVA `0x568a`)
+    — a near-no-op that returns `S_OK` after delegating to a
+    stub on the BaseFilter at RVA `0x4a19`
+    (`xor eax, eax; ret 8`).
+  - Calls `inner.SetMediaType(pmt)` then
+    `inner.CompleteConnect(pConnector)` (vtable[12] @ RVA
+    `0x2057`).  This is where the real validation runs: the
+    callee re-fetches the AMT via
+    `pConnector->ConnectionMediaType(&amt)`, inspects
+    `pbFormat`'s `wFormatTag`, and runs a `memcmp` of a fixed
+    37-byte ASCII CLSID string against `extradata[4..41]` (WMA1)
+    or `extradata[10..47]` (WMA2).
+  - The 37-byte magic string lives at `.rdata` RVA `0x11138`
+    and decodes as `"1A0F78F0-EC8A-11d2-BBBE-006008320064\0"` —
+    the Microsoft Windows Media Audio Decoder's own component
+    CLSID.  The splitter requires this exact string to be
+    embedded in every accepted stream's `WAVEFORMATEX`
+    extradata.  ffmpeg's WMA encoders have no reason to emit
+    it, which is why every round-58 / round-59 fixture failed.
+  - `wFormatTag` constraint: `0x0160` (WMA1) or `0x0161` (WMA2);
+    any other tag returns `E_UNEXPECTED` (`0x8000FFFF`).
+  - `cbSize` constraint: `>= 0x29` (41) for WMA1 or `>= 0x2F`
+    (47) for WMA2.  Falling below either threshold returns the
+    raw `E_FAIL` round 59 observed (the
+    `E_FAIL→VFW_E_TYPE_NOT_ACCEPTED` remap in
+    `ReceiveConnection` is bypassed because `CompleteConnect`'s
+    failure path jumps directly to the function exit, skipping
+    the remap block).
+  - New `oxideav_vfw::com::AmtBlueprint::wma_criteria_passing`
+    constructor builds a criteria-satisfying AMT in one call:
+    populates the `WAVEFORMATEX` with caller-supplied codec
+    parameters, sets `cbSize` to the exact minimum threshold
+    for the requested format tag (41 for WMA1, 47 for WMA2),
+    and appends the 37-byte magic CLSID at the correct
+    in-extradata offset.  The `phase4_criteria_passing_*` tests
+    verify both WMA1 (`0x0160`, 41-byte extradata) and WMA2
+    (`0x0161`, 47-byte extradata) variants land `HRESULT
+    0x00000000` (S_OK) on the live splitter.
+  - **Phase 5 stretch** — after criteria-passing
+    `ReceiveConnection` lands `S_OK`, pushing 4 KiB of the WMA2
+    fixture's first ASF data packet through
+    `IMemInputPin::Receive` (with `IMediaFilter::Pause + Run(0)`
+    in between) returns `HRESULT 0x80040209`
+    (`VFW_E_NOT_COMMITTED`).  The codec's internal
+    `IMemAllocator` has not been committed via the
+    `GetAllocator → SetProperties → Commit → NotifyAllocator`
+    handshake; that is round 61's anchor task.  No PCM bytes
+    surface on the host sink in round 60.
+  - 16-test disassembly + validator-passing harness:
+    `tests/round60_msadds32_query_accept_disasm.rs` (phases 1,
+    1b, 2, 2b–2i, 3, 4 ×3, 5).  Every phase is replayable
+    against the live splitter and records its empirical
+    reaction on stderr for r61 baselining.
+  - Clean-room documentation: new
+    `docs/codec/msadds32-query-accept-validation.md` captures
+    the full validator decoding (RVAs, opcode trace,
+    magic-string extraction, recipe for a passing AMT).
+  - New public constant `oxideav_vfw::com::SLOT_PIN_QUERY_ACCEPT
+    = 11` (the vtable slot the round-60 reverse-engineering
+    pass initially targeted before tracing the rejection to
+    `CompleteConnect`).
+
 - Round 59 — **real `WAVEFORMATEX` + extradata lifted from a 1-s
   440 Hz ffmpeg-generated ASF/WMA fixture; `IPin::ReceiveConnection`
   still returns `E_FAIL` against `msadds32.ax`'s input pin but

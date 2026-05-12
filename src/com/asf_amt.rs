@@ -200,6 +200,72 @@ impl AmtBlueprint {
     pub fn wfx_total_len(&self) -> u32 {
         18 + self.extradata.len() as u32
     }
+
+    /// Build an AMT blueprint shaped so `msadds32.ax`'s WMA
+    /// splitter's `CompleteConnect` (`inner.vtable[12]` at RVA
+    /// `0x2057` in the wmpcdcs8-2001 build) accepts it.  Round 60
+    /// reverse-engineered that callee:
+    ///
+    /// ```text
+    /// CompleteConnect(pConnector):
+    ///   pConnector->ConnectionMediaType(&amt);
+    ///   pbFormat = amt.pbFormat;
+    ///   switch (wFormatTag at [pbFormat]) {
+    ///     case 0x0160 (WMA1):
+    ///       if (cbSize < 0x29) goto fail;
+    ///       if (memcmp(pbFormat + 0x16, "1A0F78F0-EC8A-11d2-BBBE-006008320064\0", 0x25) != 0)
+    ///         goto fail;
+    ///     case 0x0161 (WMA2):
+    ///       if (cbSize < 0x2F) goto fail;
+    ///       if (memcmp(pbFormat + 0x1C, "1A0F78F0-EC8A-11d2-BBBE-006008320064\0", 0x25) != 0)
+    ///         goto fail;
+    ///     default: return E_UNEXPECTED;
+    ///   }
+    /// ```
+    ///
+    /// The "magic CLSID" is the codec's expected
+    /// `WindowsMediaAudioDecoder` registration GUID.  It is the
+    /// SAME 37-byte ASCII string for both WMA1 and WMA2; only
+    /// the in-extradata offset differs (4 for WMA1, 10 for WMA2)
+    /// because the extradata preamble itself differs in size.
+    ///
+    /// On success the WAVEFORMATEX has:
+    ///   - `wFormatTag = tag` (must be 0x0160 or 0x0161)
+    ///   - `cbSize = 0x29` (WMA1) or `0x2F` (WMA2)
+    ///   - `extradata = <preamble> ++ "1A0F78F0-EC8A-11d2-BBBE-006008320064\0"`
+    ///
+    /// The preamble bytes (4 for WMA1, 10 for WMA2) are zeroed
+    /// here — the validator does not constrain them; the codec's
+    /// internal decoder reads them as `SamplesPerBlock` /
+    /// `EncodeOptions`, but [`AmtBlueprint::wma_criteria_passing`]
+    /// is for the AMT-acceptance gate only.  Callers driving real
+    /// decode should populate the preamble with values matching
+    /// the bitstream's actual codec parameters.
+    pub fn wma_criteria_passing(
+        format_tag: u16,
+        n_channels: u16,
+        n_samples_per_sec: u32,
+        n_avg_bytes_per_sec: u32,
+        n_block_align: u16,
+    ) -> Self {
+        const MAGIC_CLSID: &[u8; 37] = b"1A0F78F0-EC8A-11d2-BBBE-006008320064\0";
+        let preamble_len = match format_tag {
+            0x0160 => 4,
+            0x0161 => 10,
+            _ => 10, // best-effort default; non-WMA tag will fail anyway
+        };
+        let mut extradata = vec![0u8; preamble_len];
+        extradata.extend_from_slice(MAGIC_CLSID);
+        AmtBlueprint {
+            format_tag,
+            n_channels,
+            n_samples_per_sec,
+            n_avg_bytes_per_sec,
+            n_block_align,
+            w_bits_per_sample: 16,
+            extradata,
+        }
+    }
 }
 
 /// Walk the ASF byte stream `bytes`, find the audio Stream

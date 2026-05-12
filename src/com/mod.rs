@@ -642,6 +642,13 @@ pub const SLOT_PIN_RECEIVE_CONNECTION: u32 = 4;
 /// `IPin::QueryDirection(PIN_DIRECTION*)` — slot 9. Codec-side
 /// pins return `PIN_INPUT (0)` or `PIN_OUTPUT (1)`.
 pub const SLOT_PIN_QUERY_DIRECTION: u32 = 9;
+/// `IPin::QueryAccept(AM_MEDIA_TYPE* pmt)` — slot 11.  Returns
+/// `S_OK` if the pin will accept a connection with the given
+/// media type, `S_FALSE` or an error HRESULT otherwise.  Round 60
+/// disassembles this method on `msadds32.ax`'s audio splitter
+/// input pin to identify the AMT validation criteria its
+/// internal decoder enforces.
+pub const SLOT_PIN_QUERY_ACCEPT: u32 = 11;
 /// `IPin::EnumMediaTypes(IEnumMediaTypes**)` — slot 12.
 pub const SLOT_PIN_ENUM_MEDIA_TYPES: u32 = 12;
 
