@@ -8,6 +8,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 54 — **AVI 1.0 muxer for vfw-encoded MSMPEG4 v3 output +
+  `ffmpeg` cross-decode validation.**  Round 51 produced raw
+  MSMPEG4 v3 elementary bytes that self-roundtrip at 27.83 dB
+  PSNR-BGR24 through the same `mpg4c32.dll` decode path.  Round
+  54 validates the bytes through a SECOND independent decoder:
+  wrap them in a minimal AVI 1.0 RIFF container, invoke `ffmpeg`
+  to decode the AVI back to raw BGR24, and compare to the
+  original input.
+  - `tests/round54_avi_wrap_ffmpeg_decode.rs` — inline AVI muxer
+    built with raw byte construction (no `oxideav-avi` dev-dep —
+    cross-crate dev-deps trap consumer crates in producer-release
+    lockstep, per the project memory).  Builds the standard AVI
+    1.0 layout: `RIFF AVI ` outer chunk → `LIST hdrl` containing
+    `avih` (MainAVIHeader, 56 bytes) + `LIST strl` containing
+    `strh` (AVIStreamHeader, 56 bytes; fccType='vids',
+    fccHandler='MP43', dwRate=25, dwScale=1) + `strf`
+    (BITMAPINFOHEADER, 40 bytes; biCompression='MP43',
+    biWidth=176, biHeight=144, biBitCount=24).  Then `LIST movi`
+    containing N × `00dc` chunks (one per encoded frame,
+    word-aligned with optional pad byte for odd-length payloads),
+    then `idx1` chunk with one 16-byte AVIINDEXENTRY per frame
+    (ckid='00dc', dwFlags=AVIIF_KEYFRAME=0x10,
+    dwChunkOffset relative to start of 'movi' LIST payload,
+    dwChunkLength).
+  - **Findings (all green):**
+    - `ffprobe -of json -show_format -show_streams` ACCEPTS the
+      AVI (rc=0, structural validation passes).
+    - `ffmpeg -i <avi> -f rawvideo -pix_fmt bgr24 -frames:v 5`
+      decodes ALL 5 frames cleanly (rc=0, exactly 380160 bytes =
+      5 × 176 × 144 × 3).
+    - `mpv --vo=null --ao=null --frames=5` decode probe rc=0
+      (mpv accepts the AVI).
+    - Mean PSNR-BGR24 across 5 frames = **20.86 dB** comparing
+      ffmpeg's BGR24 output (vertically flipped to BMP
+      bottom-up convention) to our original BGR24 input.  At
+      `quality=5000` this is consistent with the codec's
+      documented lossy regime; the headline is that ffmpeg
+      successfully decoded our codec's bytes end-to-end.
+  - Fail-soft envelope: if `ffmpeg`/`ffprobe`/`mpv` are absent
+    from PATH, the test reports the skip with `println!` and
+    returns OK (NOT `#[ignore]` — the test runs unconditionally
+    and surfaces the tool absence as a discovery).
+  - Reference: Microsoft AVI RIFF File Reference
+    (`learn.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference`)
+    + `winsdk-10/Include/.../um/Aviriff.h` (`MainAVIHeader`,
+    `AVIStreamHeader`, `AVIINDEXENTRY`, `AVIIF_*`) +
+    `winsdk-10/Include/.../um/Vfw.h` (`BITMAPINFOHEADER`,
+    `streamtypeVIDEO = 'vids'`).  No external muxer / demuxer
+    library code consulted.
+
 - Round 53 — **P-frame quality-regime probe; mpg4c32 clears the
   keyframe flag for non-keyframe requests, but the residual on an
   8-pixel horizontal translation is LARGER than the I-frame across

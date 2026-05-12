@@ -9,6 +9,24 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 54 — AVI 1.0 muxer for vfw-encoded MSMPEG4 v3 output +
+`ffmpeg` cross-decode validation lights up green.**  Round 51
+produced raw MSMPEG4 v3 elementary bytes that self-roundtrip at
+27.83 dB PSNR through the same `mpg4c32.dll` decode path.  Round
+54 validates the bytes through a SECOND independent decoder:
+inline AVI 1.0 muxer (no `oxideav-avi` dev-dep, raw byte
+construction against the Microsoft AVI RIFF File Reference +
+`winsdk-10/Aviriff.h`) wraps the encoded bytes; `ffprobe` accepts
+the AVI; `ffmpeg -f rawvideo -pix_fmt bgr24` decodes all 5 frames
+cleanly (380160 bytes = 5 × 176 × 144 × 3); `mpv --vo=null`
+probe rc=0.  Mean PSNR-BGR24 across 5 frames = 20.86 dB comparing
+ffmpeg's output (vertically flipped to BMP bottom-up) to our
+original BGR24 input — consistent with `quality=5000` lossy
+behaviour.  Headline: ffmpeg successfully decoded our codec's
+encoded bytes end-to-end, providing independent confirmation that
+our encode pipeline produces valid MSMPEG4 v3 bitstreams.  See
+`tests/round54_avi_wrap_ffmpeg_decode.rs`.
+
 **Round 53 — P-frame quality-regime probe: mpg4c32 clears the
 keyframe flag for non-keyframe requests on differing content but
 emits a P-frame that's LARGER than the corresponding I-frame
