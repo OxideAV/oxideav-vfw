@@ -8,6 +8,88 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 57 — **`msadds32.ax` audio splitter spawns through
+  `DllGetClassObject` + `IClassFactory::CreateInstance` —
+  IUnknown/IPersist/IMediaFilter/IBaseFilter all QI cleanly with
+  ZERO new ole32/oleaut32 stubs.**  Round 56 closed by FULLY
+  PE-loading `msadds32.ax`; round 57 drives the audio splitter
+  through the same DirectShow co-create scaffolding the round-25
+  video splitter already exercised, and discovers the existing
+  COM / DirectShow surface is RICH ENOUGH to spawn an IBaseFilter
+  instance from the audio decoder out-of-the-box.  No new ole32
+  (`CoTaskMemAlloc` / `CoCreateInstance` / `StringFromGUID2`) or
+  oleaut32 (`SysAllocString` / `VariantInit`) stubs were needed —
+  the audio splitter shares the `CBaseFilter` / `CTransformFilter`
+  scaffolding shape with the video splitter rounds 25-44 already
+  drove through `IBaseFilter::Run` + `IPin::ReceiveConnection`.
+  - **Audio decoder CLSID discovered** —
+    `MSADDS_AUDIO_DECODER_CLSID = {22E24591-49D0-11D2-BB50-006008320064}`
+    (Data4 suffix `006008320064` is in the Windows Media Audio
+    family).  Reverse-engineered from `msadds32.ax`'s
+    `DllGetClassObject` prologue at RVA `0x3635`: prologue
+    contains a `repe cmpsd` loop walking a 20-byte-stride CLSID
+    table at RVA `0x11000` (count word at RVA `0x11028`, value
+    = 2).  Entry 0's CLSID pointer (RVA `0xf248`) decodes to the
+    audio decoder CLSID; entry 1's (RVA `0xf298`) decodes to
+    `MSADDS_AUDIO_PROPERTY_PAGE_CLSID =
+    {8FE7E181-BB96-11D2-A1CB-00609778EA66}` — the audio
+    decompressor control property page (UI vestige, not on the
+    decode path).  Clean-room: disassembled from raw opcode bytes
+    against Intel SDM Vol. 2A; no Wine / ReactOS / MinGW
+    consulted.  The CLSIDs themselves are public installation
+    metadata that the splitter's `DllRegisterServer` writes to
+    `HKCR\CLSID\{...}\InprocServer32`.
+  - `src/com/mod.rs` — new public `pub const
+    MSADDS_AUDIO_DECODER_CLSID: Guid` + `pub const
+    MSADDS_AUDIO_PROPERTY_PAGE_CLSID: Guid`.  Both are pinned
+    against their canonical braced-string forms by unit tests
+    `msadds_audio_decoder_clsid_round_trips` and
+    `msadds_audio_property_page_clsid_round_trips`.
+  - `src/lib.rs` — re-exports the two new CLSID constants
+    alongside the existing IID family so consumer crates can
+    name them without reaching into `com::`.
+  - `src/discovery/probe.rs` — `DSHOW_CLSID_CANDIDATES` grows
+    from 1 to 2: the audio decoder CLSID lands as a probe
+    candidate so `oxideav_vfw::discovery` lights up `msadds32.ax`
+    as `Kind::DirectShow` on auto-discovery.  New companion test
+    `guid_from_le_bytes_matches_msadds_audio_clsid` pins the
+    little-endian wire form against the high-level `Guid`
+    constant.
+  - `tests/round57_msadds32_dll_get_class_object.rs` — 7
+    integration tests across 4 phases:
+    1. **Phase 1** — pins both CLSID constants round-trip
+       through their MIDL braced strings.
+    2. **Phase 2** — drives
+       `Sandbox::dll_get_class_object(img,
+       MSADDS_AUDIO_DECODER_CLSID, IID_IClassFactory)` →
+       `Ok(factory)` at `0x6000_0060` with plausible vtable.
+       Companion: same path for `MSADDS_AUDIO_PROPERTY_PAGE_CLSID`
+       also succeeds (informational stretch); and a bogus
+       random CLSID surfaces `CLASS_E_CLASSNOTAVAILABLE` cleanly
+       rather than crashing.
+    3. **Phase 3** — drives
+       `Sandbox::co_create_instance(MSADDS_AUDIO_DECODER_CLSID,
+       IID_IUNKNOWN)` → `Ok(0x6000_0090)`.  The audio splitter's
+       internal CBaseFilter constructor runs to completion
+       without surfacing any unresolved imports.
+    4. **Phase 4 (stretch)** — `QueryInterface` for IUnknown /
+       IPersist / IMediaFilter / IBaseFilter ALL return non-NULL
+       interface pointers with plausible vtables; the splitter
+       satisfies the IBaseFilter contract out of the box.
+  - **Next critical-path target (round 58):**  drive the audio
+    splitter through `IBaseFilter::Run` + `IPin::ReceiveConnection`
+    against an audio AMT.  The shape will diverge from the
+    video path because audio uses different `MEDIASUBTYPE_*`
+    GUIDs (`MEDIASUBTYPE_MSAUDIO1` / `MEDIASUBTYPE_WMAUDIO2` —
+    discovered identically by walking the splitter's output-pin
+    `EnumMediaTypes` enumeration), `WAVEFORMATEX` instead of
+    `VIDEOINFOHEADER` for the format block, and PCM/S16 output
+    buffer shape rather than YV12.  Round 58 will surface a new
+    set of host stubs gated on the audio-format-block layout
+    (likely `msacm32!acmStream*` if the splitter delegates
+    bitstream-to-PCM through the ACM, or first-class PCM output
+    if the splitter is fully self-contained).
+
 - Round 56 — **`msvcrt!_CIpow` real impl drains the final
   `msadds32.ax` PE-load blocker — the audio splitter is now FULLY
   PE-loaded.**  Round 55 pinned the next blocker as

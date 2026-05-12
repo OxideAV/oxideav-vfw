@@ -418,6 +418,49 @@ pub const IID_IFILTERGRAPH: Guid = Guid::new(
     [0xB0, 0x3A, 0x00, 0x20, 0xAF, 0x0B, 0xA7, 0x70],
 );
 
+/// `MSADDS_AUDIO_DECODER_CLSID` (`{22E24591-49D0-11D2-BB50-006008320064}`).
+///
+/// The CLSID under which `msadds32.ax`'s "Windows Media Audio
+/// Decoder" DirectShow filter is registered.  Discovered by
+/// reverse-engineering the splitter's `DllGetClassObject`
+/// prologue (RVA `0x3635` in the wmpcdcs8-2001 bundle) — the
+/// prologue compares `*rclsid` against an in-`.rdata` table at
+/// RVA `0x11000`, count word at RVA `0x11028`.  Entry 0 of that
+/// table (count = 2, stride = 20 bytes) points to the GUID
+/// literal at `.rdata` offset `0xf248`, which decodes to this
+/// value.
+///
+/// The companion "Microsoft MS Audio Decompressor Control Property
+/// page" CLSID is [`MSADDS_AUDIO_PROPERTY_PAGE_CLSID`] below.
+///
+/// Clean-room reverse engineering only: prologue disassembled
+/// from raw bytes against Intel SDM Vol. 2A opcode encodings; no
+/// Wine / ReactOS / MinGW source consulted.  The CLSID itself is
+/// public installation metadata (the splitter's `DllRegisterServer`
+/// writes it to `HKCR\CLSID\{...}\InprocServer32` at install).
+pub const MSADDS_AUDIO_DECODER_CLSID: Guid = Guid::new(
+    0x22E2_4591,
+    0x49D0,
+    0x11D2,
+    [0xBB, 0x50, 0x00, 0x60, 0x08, 0x32, 0x00, 0x64],
+);
+
+/// `MSADDS_AUDIO_PROPERTY_PAGE_CLSID`
+/// (`{8FE7E181-BB96-11D2-A1CB-00609778EA66}`).
+///
+/// Entry 1 of the `msadds32.ax` `DllGetClassObject` CLSID table —
+/// the property-page UI vestige for "Microsoft MS Audio
+/// Decompressor Control".  Not exercised on the audio-decode
+/// path; pinned here so a probe that lands on it (e.g. dynamic
+/// `DllRegisterServer` walk in a future round) can identify
+/// what it found.
+pub const MSADDS_AUDIO_PROPERTY_PAGE_CLSID: Guid = Guid::new(
+    0x8FE7_E181,
+    0xBB96,
+    0x11D2,
+    [0xA1, 0xCB, 0x00, 0x60, 0x97, 0x78, 0xEA, 0x66],
+);
+
 /// `CLSID_MemoryAllocator` (`{1E651CC0-B199-11D0-8212-00C04FC32C45}`).
 ///
 /// Source: Windows SDK header `axextend.h`.  This is the canonical
@@ -836,6 +879,30 @@ mod tests {
     fn parse_ibasefilter_braced_form() {
         let g = Guid::parse("{56A86895-0AD4-11CE-B03A-0020AF0BA770}").unwrap();
         assert_eq!(g, IID_IBASEFILTER);
+    }
+
+    #[test]
+    fn msadds_audio_decoder_clsid_round_trips() {
+        // Pinned by round 57 — reverse-engineered from the
+        // splitter's `DllGetClassObject` CLSID table at RVA
+        // `0x11000`, entry 0 → CLSID pointer at `.rdata`
+        // offset `0xf248`.  See [`MSADDS_AUDIO_DECODER_CLSID`].
+        let g = Guid::parse("{22E24591-49D0-11D2-BB50-006008320064}").unwrap();
+        assert_eq!(g, MSADDS_AUDIO_DECODER_CLSID);
+        assert_eq!(
+            MSADDS_AUDIO_DECODER_CLSID.to_braced_string(),
+            "{22E24591-49D0-11D2-BB50-006008320064}"
+        );
+    }
+
+    #[test]
+    fn msadds_audio_property_page_clsid_round_trips() {
+        let g = Guid::parse("{8FE7E181-BB96-11D2-A1CB-00609778EA66}").unwrap();
+        assert_eq!(g, MSADDS_AUDIO_PROPERTY_PAGE_CLSID);
+        assert_eq!(
+            MSADDS_AUDIO_PROPERTY_PAGE_CLSID.to_braced_string(),
+            "{8FE7E181-BB96-11D2-A1CB-00609778EA66}"
+        );
     }
 
     #[test]

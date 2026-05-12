@@ -9,6 +9,40 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 57 — `msadds32.ax` audio splitter spawns through
+`DllGetClassObject` + `IClassFactory::CreateInstance`; IUnknown /
+IPersist / IMediaFilter / IBaseFilter all `QueryInterface` cleanly
+with ZERO new ole32/oleaut32 stubs.**  Round 56 closed by FULLY
+PE-loading `msadds32.ax`; round 57 drives the audio splitter
+through the same DirectShow co-create scaffolding the round-25
+video splitter already exercised, and discovers the existing
+COM / DirectShow surface is rich enough to spawn an `IBaseFilter`
+out-of-the-box — no new ole32 (`CoTaskMemAlloc` /
+`StringFromGUID2`) or oleaut32 (`SysAllocString` / `VariantInit`)
+stubs were needed.  The audio splitter shares the
+`CBaseFilter` / `CTransformFilter` scaffolding shape with the
+video splitter rounds 25-44 already drove through
+`IBaseFilter::Run` + `IPin::ReceiveConnection`.  The audio
+decoder's CLSID was discovered by reverse-engineering the
+splitter's `DllGetClassObject` prologue at RVA `0x3635`
+(clean-room from raw opcode bytes against Intel SDM Vol. 2A; no
+Wine / ReactOS / MinGW consulted) — a `repe cmpsd` loop walks a
+20-byte-stride CLSID table at RVA `0x11000` (count = 2).  Entry 0
+points to `MSADDS_AUDIO_DECODER_CLSID =
+{22E24591-49D0-11D2-BB50-006008320064}` (the audio decoder
+itself); entry 1 to `MSADDS_AUDIO_PROPERTY_PAGE_CLSID =
+{8FE7E181-BB96-11D2-A1CB-00609778EA66}` (UI vestige).  The
+`DllGetClassObject` call returns a class factory at `0x6000_0060`;
+`IClassFactory::CreateInstance(IID_IUnknown)` spawns an
+`IBaseFilter` instance at `0x6000_0090`; QI for every documented
+base interface lands successfully.  See
+`tests/round57_msadds32_dll_get_class_object.rs` (7 tests across 4
+phases).  Next critical-path target: drive
+`IBaseFilter::Run` / `IPin::ReceiveConnection` against an audio
+AMT (`MEDIASUBTYPE_MSAUDIO1` / `MEDIASUBTYPE_WMAUDIO2` discovered
+by walking `EnumMediaTypes`; `WAVEFORMATEX` format block instead
+of `VIDEOINFOHEADER`; PCM/S16 output buffer shape).
+
 **Round 56 — `msvcrt!_CIpow` real impl drains the final
 `msadds32.ax` PE-load blocker — the audio splitter is now FULLY
 PE-loaded.**  Round 55 pinned the next blocker as `msvcrt!_CIpow`

@@ -30,19 +30,33 @@ const VFW_FOURCC_CANDIDATES: &[&[u8; 4]] = &[
 const FCC_TYPE_VIDC: u32 = u32::from_le_bytes(*b"VIDC");
 
 /// Static list of CLSIDs we try with `DllGetClassObject` when the
-/// VfW probe fails. Round-28 keeps this tiny — wmpcdcs8-2001's
-/// `MPG4DS32.AX`. WMVDS32 constructs its CLSID dynamically inside
-/// `DllRegisterServer`; static lookup will miss it, and that's OK
-/// for round 28 (we record those as [`Kind::Unsupported`] so we
+/// VfW probe fails. Round-28 seeded this with wmpcdcs8-2001's
+/// `MPG4DS32.AX`; round 57 adds `msadds32.ax`'s audio decoder
+/// CLSID alongside.  WMVDS32 constructs its CLSID dynamically
+/// inside `DllRegisterServer`; static lookup will miss it, and
+/// that's OK (we record those as [`Kind::Unsupported`] so we
 /// don't re-probe). Round 29+ reverses the dynamic
 /// `DllRegisterServer` path to recover the missing CLSIDs.
-const DSHOW_CLSID_CANDIDATES: &[(&str, [u8; 16])] = &[(
-    "{82CCD3E0-F71A-11D0-9FE5-00609778EA66}",
-    [
-        0xE0, 0xD3, 0xCC, 0x82, 0x1A, 0xF7, 0xD0, 0x11, 0x9F, 0xE5, 0x00, 0x60, 0x97, 0x78, 0xEA,
-        0x66,
-    ],
-)];
+const DSHOW_CLSID_CANDIDATES: &[(&str, [u8; 16])] = &[
+    (
+        // MPG4DS32.AX — Microsoft MPEG-4 v3 decoder filter.
+        "{82CCD3E0-F71A-11D0-9FE5-00609778EA66}",
+        [
+            0xE0, 0xD3, 0xCC, 0x82, 0x1A, 0xF7, 0xD0, 0x11, 0x9F, 0xE5, 0x00, 0x60, 0x97, 0x78,
+            0xEA, 0x66,
+        ],
+    ),
+    (
+        // MSADDS32.AX — Windows Media Audio Decoder filter
+        // (round 57).  Reverse-engineered from the splitter's
+        // `DllGetClassObject` CLSID table (RVA 0x11000, entry 0).
+        "{22E24591-49D0-11D2-BB50-006008320064}",
+        [
+            0x91, 0x45, 0xE2, 0x22, 0xD0, 0x49, 0xD2, 0x11, 0xBB, 0x50, 0x00, 0x60, 0x08, 0x32,
+            0x00, 0x64,
+        ],
+    ),
+];
 
 /// Discovery classification for one probed DLL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,5 +255,17 @@ mod tests {
         assert_eq!(g.data2, 0xF71A);
         assert_eq!(g.data3, 0x11D0);
         assert_eq!(g.data4, [0x9F, 0xE5, 0x00, 0x60, 0x97, 0x78, 0xEA, 0x66]);
+    }
+
+    #[test]
+    fn guid_from_le_bytes_matches_msadds_audio_clsid() {
+        // Round 57 — {22E24591-49D0-11D2-BB50-006008320064}.
+        let bytes = DSHOW_CLSID_CANDIDATES[1].1;
+        let g = guid_from_le_bytes(&bytes);
+        assert_eq!(g.data1, 0x22E2_4591);
+        assert_eq!(g.data2, 0x49D0);
+        assert_eq!(g.data3, 0x11D2);
+        assert_eq!(g.data4, [0xBB, 0x50, 0x00, 0x60, 0x08, 0x32, 0x00, 0x64]);
+        assert_eq!(g, crate::com::MSADDS_AUDIO_DECODER_CLSID);
     }
 }
