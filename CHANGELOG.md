@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 56 — **`msvcrt!_CIpow` real impl drains the final
+  `msadds32.ax` PE-load blocker — the audio splitter is now FULLY
+  PE-loaded.**  Round 55 pinned the next blocker as
+  `msvcrt!_CIpow` — MSVC's compiler-intrinsic
+  `pow(double, double)` helper.  Like `_ftol` (r52), the `_CI*`
+  family passes args on the **x87 stack** (not the cdecl integer
+  stack) and returns the result on the x87 stack as the new
+  `ST(0)`: `arg_dwords = 0`.
+  - `src/win32/msvcrt.rs` — new `stub_ci_pow`.
+    `double __cdecl _CIpow(double base, double exp)` pops `exp`
+    (top of stack) then `base` (was `ST(1)`) off the x87 stack,
+    computes `base.powf(exp)` via Rust's `f64::powf` (bit-correct
+    by construction per IEEE 754), and pushes the result back
+    onto the x87 stack as the new `ST(0)`.  Returns 0 in `eax`
+    per the documented `_CI*` convention (the result lives in
+    `ST(0)`, not `eax`).  Clean-room references: MSDN `pow`
+    function page; Intel SDM Vol. 1 §8 + Vol. 2A "FLD" / "FSTP"
+    for x87 stack semantics; IEEE 754-2008 for corner cases.  No
+    Wine / ReactOS / MinGW / Microsoft CRT source consulted.
+  - `tests/round56_msvcrt_cipow.rs` — 13 integration tests
+    pinning: stub registered; canonical `2 ** 10 = 1024`;
+    fractional exponent matches `sqrt(2)` within 1e-10; negative
+    base with integer exp returns real `9.0`; negative base with
+    non-integer exp returns NaN; zero base with positive exp
+    returns 0.0; IEEE 754 `0.0 ** 0.0 = 1.0`; NaN propagation;
+    `NaN ** 0.0 = 1.0` (IEEE 754 powf-of-NaN exception);
+    `∞ ** 0.0 = 1.0`; `1.0 ** NaN = 1.0` (the other powf-of-NaN
+    exception); x87 stack invariant (2 in, 1 out, net -1 depth);
+    and the round-56 headline asserting `Sandbox::load
+    ("msadds32.ax")` advances past `_CIpow`.
+  - `tests/round56_msadds32_pe_load_complete.rs` — milestone
+    reproducibility check.  After r56 the audio splitter PE-load
+    surface has **every named import resolved**: this test
+    asserts `Sandbox::load("msadds32.ax")` returns `Ok(_)`
+    cleanly with `DllGetClassObject` exported.  Image base
+    `0x1c40_0000`, entry point `0x1c40_233d`.  Pins the milestone
+    so any regression that re-introduces an unresolved-import
+    blocker on this codec surfaces loudly.
+  - `README.md` — round counter bumped to 56; status block
+    re-written to announce the PE-load milestone.
+  - **Next critical-path target:** drive `msadds32.ax` through
+    `DllGetClassObject` to instantiate the DirectShow filter
+    factory, then exercise `DriverProc(DRV_LOAD)` /
+    `IPin::ReceiveConnection` to start an actual audio decode.
+    Those will surface a new round of stubs in the COM /
+    DirectShow surface (`ole32!CoTaskMemAlloc`,
+    `oleaut32!SysAllocString`, audio pin negotiation, …) — NOT
+    more `msvcrt!_CI*` math helpers.
+
 - Round 55 — **`msvcrt!{rand, srand}` real impl + seedable
   `Sandbox` PRNG API for reproducible encode output.**  Round 52
   pinned the next `msadds32.ax` PE-load blocker as `msvcrt!rand`;

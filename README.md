@@ -9,35 +9,26 @@ through a software-interpreter sandbox.
 
 ## Status
 
-**Round 55 — `msvcrt!{rand, srand}` + seedable `Sandbox` PRNG
-API for reproducible encode output.**  Round 52 wired the real
-`msvcrt!_ftol` and pinned the next `msadds32.ax` PE-load blocker
-as `msvcrt!rand`; round 55 wires `rand` (MSVC's documented LCG:
-`state = state * 214013 + 2531011 (mod 2^32)`, output =
-`(state >> 16) & 0x7FFF` — public number-theory constants, no
-Microsoft CRT source consulted) plus the seed companion
-`srand`.  The headline architectural addition: a host-side
-seedable PRNG API on `Sandbox` —
-`with_rand_seed(seed) -> Self` (builder),
-`set_rand_seed(&mut self, seed)` (runtime setter), and
-`rand_seed(&self) -> u32` (reader).  Both the host API and the
-guest's own `msvcrt!srand` write to the same
-`HostState::rand_state` field, so the host can pin
-reproducibility before driving a codec while still observing
-whatever state the codec re-seeds itself to.  Default state is
-`1` (MSVC's documented "no `srand` called yet" initial value).
-**Round-55 encode-determinism finding:** at the SAME seed two
-sandboxes produce byte-for-byte identical encoded MP43 streams
-(architectural contract verified), AND at DIFFERENT seeds the
-encoded streams are STILL identical — `mpg4c32`'s VfW encode
-path does not consult `msvcrt!rand`, so the seedable API is
-protection-only on this codec today (pins reproducibility
-vacuously, pre-empts any future codec path that introduces
-randomness).  After round 55, `Sandbox::load("msadds32.ax")`
-advances past `rand` and now stops at the next unresolved
-import: `msvcrt!_CIpow`.  See
-`tests/round55_msvcrt_rand_seedable.rs` +
-`tests/round55_encode_determinism.rs`.
+**Round 56 — `msvcrt!_CIpow` real impl drains the final
+`msadds32.ax` PE-load blocker — the audio splitter is now FULLY
+PE-loaded.**  Round 55 pinned the next blocker as `msvcrt!_CIpow`
+— MSVC's compiler-intrinsic `pow(double, double)` helper.  Like
+`_ftol` (r52), the `_CI*` family passes args on the **x87 stack**
+(not the cdecl integer stack) and returns the result on the x87
+stack as the new `ST(0)`: `arg_dwords = 0`.  The implementation
+pops `exp` then `base` off the x87 stack, computes
+`base.powf(exp)` (Rust's `f64::powf` is bit-correct by
+construction and handles every IEEE 754 corner case —
+`0.0_f64.powf(0.0) = 1.0`, `f64::NAN.powf(0.0) = 1.0`,
+`1.0_f64.powf(NaN) = 1.0`, `(-2.0_f64).powf(0.5) = NaN`,
+`f64::INFINITY.powf(0.0) = 1.0`), and pushes the result back onto
+the x87 stack.  After round 56, `Sandbox::load("msadds32.ax")`
+**completes cleanly** — every named import resolved, `image_base
+= 0x1c40_0000`, `DllGetClassObject` exported.  The audio splitter
+is unblocked for the next round's `DriverProc` / `DllGetClassObject`
+DirectShow co-create exercise.  See
+`tests/round56_msvcrt_cipow.rs` +
+`tests/round56_msadds32_pe_load_complete.rs`.
 
 **Round 54 — AVI 1.0 muxer for vfw-encoded MSMPEG4 v3 output +
 `ffmpeg` cross-decode validation lights up green.**  Round 51

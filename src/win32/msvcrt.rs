@@ -234,6 +234,41 @@ pub fn register(registry: &mut Registry) {
     // Both stubs are cdecl: caller-cleanup, `arg_dwords = 0`.
     registry.register("msvcrt.dll", "rand", stub_rand as StubFn, 0);
     registry.register("msvcrt.dll", "srand", stub_srand as StubFn, 0);
+
+    // ---- Round-56 addition: msadds32.ax PE-load surface --------
+    //
+    // After r55 (`rand` / `srand`) the splitter's msvcrt import walk
+    // advances to MSVC's `_CI*` compiler-intrinsic math helpers.
+    // These differ from regular `<math.h>` entries: the argument(s)
+    // are passed on the **x87 stack** (not the cdecl integer stack),
+    // and the result is returned on the x87 stack (top-of-stack).
+    // The same calling-convention quirk applies as `_ftol`
+    // (r52): `arg_dwords = 0` because no dwords are on the regular
+    // cdecl stack to be cleaned up.
+    //
+    // For each helper the pattern is:
+    //   1. Pop N f64s from the x87 stack in reverse order (so a
+    //      2-arg `_CIpow(base, exp)` pops `exp` first then `base`).
+    //   2. Compute the standard IEEE 754 / `<math.h>` result via
+    //      Rust's `f64` intrinsics — these are bit-correct by
+    //      construction (`f64::powf` / `f64::sqrt` / `f64::ln` etc.).
+    //   3. Push the result back on the x87 stack.
+    //   4. Return 0 in `eax` (the result is in `ST(0)`, not `eax`,
+    //      per the documented MSVC `_CI*` convention).
+    //
+    // References (clean-room):
+    //   * MSDN `pow`, `sqrt`, `log`, `log10`, `exp`, `sin`, `cos`,
+    //     `tan`, `atan`, `atan2`, `fmod`, `asin`, `acos`, `sinh`,
+    //     `cosh`, `tanh`, `floor`, `ceil` — function contracts.
+    //   * Intel SDM Vol. 1 §8 + Vol. 2A "FLD" / "FSTP" — x87 stack
+    //     semantics for the calling convention.
+    //   * IEEE 754-2008 — corner cases (NaN propagation, ±∞, ±0).
+    //
+    // `_CIpow(base, exp)` — 2 args on x87.  Headline blocker after
+    // r55.  Rust's `f64::powf` follows IEEE 754: `1.0_f64.powf(NaN)
+    // = 1.0`, `0.0_f64.powf(0.0) = 1.0`, `(-1.0_f64).powf(0.5) =
+    // NaN`, `f64::INFINITY.powf(0.0) = 1.0`.
+    registry.register("msvcrt.dll", "_CIpow", stub_ci_pow as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -917,6 +952,53 @@ fn stub_srand(
 ) -> Result<u32, Win32Error> {
     let seed = arg_dword(cpu, mmu, 0).map_err(|t| trap("srand", t))?;
     state.rand_state = seed;
+    Ok(0)
+}
+
+/// `double __cdecl _CIpow(double base, double exp)` — MSVC's
+/// compiler-intrinsic `pow` helper.
+///
+/// Per the MSVC `_CI*` ABI, **both** arguments are passed on the
+/// x87 stack rather than on the regular cdecl integer stack: the
+/// caller emits `FLD qword ptr [base]; FLD qword ptr [exp]` before
+/// the CALL, leaving `ST(0) = exp`, `ST(1) = base`.  The function:
+///
+///  1. Pops `ST(0)` (the exponent).
+///  2. Pops `ST(0)` (the base; was originally `ST(1)`).
+///  3. Computes `base.powf(exp)` per IEEE 754.
+///  4. Pushes the result back onto the x87 stack as the new
+///     `ST(0)`.
+///  5. Returns 0 in `eax` — the result is in `ST(0)`, not `eax`,
+///     per the documented `_CI*` convention.
+///
+/// IEEE 754 corner cases (Rust `f64::powf` is bit-correct by
+/// construction):
+///
+///  * `0.0_f64.powf(0.0)               → 1.0`     (IEEE default)
+///  * `f64::NAN.powf(anything)         → NaN`     (except `.powf(0.0) = 1.0`)
+///  * `1.0_f64.powf(f64::NAN)          → 1.0`
+///  * `f64::INFINITY.powf(0.0)         → 1.0`
+///  * `(-2.0_f64).powf(0.5)            → NaN`     (negative real, non-int exp)
+///
+/// `cdecl` from the C source's perspective: caller-cleanup on the
+/// regular cdecl stack, but both *arguments* are on the x87 stack
+/// and not on the regular stack at all — so `arg_dwords = 0` is
+/// the right registration shape (no dwords to clean).
+fn stub_ci_pow(
+    cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Per the x87 stack ordering: top-of-stack is the *last*
+    // pushed value.  Caller emitted FLD base; FLD exp; so
+    // ST(0) = exp and ST(1) = base.  Pop `exp` first.
+    let exp = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    let base = cpu.fpu.st(0);
+    let _ = cpu.fpu.pop();
+    let result = base.powf(exp);
+    cpu.fpu.push(result);
     Ok(0)
 }
 
