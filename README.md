@@ -9,6 +9,23 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 53 — P-frame quality-regime probe: mpg4c32 clears the
+keyframe flag for non-keyframe requests on differing content but
+emits a P-frame that's LARGER than the corresponding I-frame
+(P/I = 1.386 invariant across `quality ∈ {1000, 2000, 3000, 5000,
+8000}`) under the bare VfW path.**  Round 51 found that at
+`quality=5000` the codec emits keyframes for both I and P-tagged
+frames when content is *identical* (frame 0 == frame 1).  Round
+53 probes truly differing content (frame 1 = frame 0 shifted
+right by 8 pixels) across a quality sweep.  Finding: the codec
+DOES clear the keyframe flag for every P-frame request (so it
+acknowledges the request) but the residual + new-content cost
+together exceed the intra-only I-frame cost at every quality
+level we probed.  Real P-frame compression (P < I) under this
+codec build may require richer motion estimation (DirectShow
+encode path) or a fixture with greater temporal redundancy.  See
+`tests/round53_pframe_quality_probe.rs`.
+
 **Round 52 — `msvcrt!_ftol` real impl advances `msadds32.ax`
 PE-load past the splitter's CRT FP-truncation edge.**  Round 50
 wired `_beginthreadex` and pinned the next splitter blocker as

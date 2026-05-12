@@ -8,6 +8,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 53 — **P-frame quality-regime probe; mpg4c32 clears the
+  keyframe flag for non-keyframe requests, but the residual on an
+  8-pixel horizontal translation is LARGER than the I-frame across
+  the probed quality range (P/I ratio = 1.386 at all five quality
+  levels).**  Round 51 found that at `quality=5000` the codec
+  emits keyframes for both I and P-tagged frames when content is
+  *identical* (frame 0 == frame 1).  Round 53 probes whether
+  truly differing content (frame 1 = frame 0 shifted right by 8
+  pixels) + a sweep of quality settings `{1000, 2000, 3000, 5000,
+  8000}` changes that.
+  - `tests/round53_pframe_quality_probe.rs` — for each quality
+    level open a fresh encoder HIC, encode frame 0 with
+    `ICCOMPRESS_KEYFRAME`, encode frame 1 with `flags = 0` and
+    `prev_bih` / `prev_bytes` pointing at frame 0's input bytes,
+    then record `(I-size, P-size, returned_flags &
+    ICCOMPRESS_KEYFRAME, P/I ratio)`.
+  - **Finding:** the codec DOES clear the keyframe flag for every
+    P-frame request in the range (so it acknowledges the
+    non-keyframe request) — but the actual P-frame bytes are
+    LARGER than the corresponding I-frame (P = 1344 bytes vs
+    I = 970 bytes), invariant across all five quality settings.
+    Per-quality breakdown:
+    `q=1000` I=970 P=1344 P/I=1.386 codec_cleared_keyframe=true;
+    `q=2000` I=970 P=1344 P/I=1.386 codec_cleared_keyframe=true;
+    `q=3000` I=970 P=1344 P/I=1.386 codec_cleared_keyframe=true;
+    `q=5000` I=970 P=1344 P/I=1.386 codec_cleared_keyframe=true;
+    `q=8000` I=970 P=1344 P/I=1.386 codec_cleared_keyframe=true.
+    The codec's motion compensation under the bare VfW path does
+    not shrink the residual below the I-frame size on an 8-pixel
+    horizontal translation at any quality regime we probed; the
+    motion residual + new-content cost together exceed the
+    intra-only I-frame cost.  This is the round's reportable
+    finding — real P-frame *compression* (P < I) may require
+    either richer motion estimation (DirectShow encode path) or a
+    fixture with greater temporal redundancy (less spatial
+    content, more zero motion).
+
 - Round 52 — **`msvcrt!_ftol` real impl + `msadds32.ax` PE-load
   surface advance past the CRT FP-truncation edge.**  The MSMPEG4
   audio-side splitter's import walk reached `msvcrt!_ftol` after
