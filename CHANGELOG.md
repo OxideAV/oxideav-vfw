@@ -8,6 +8,96 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 58 — **`msadds32.ax` audio splitter walks `EnumPins` +
+  `Pause` + `Run(0)` cleanly into `FILTER_STATE_RUNNING`; full
+  encoded-audio AMT staging surface (WAVEFORMATEX) lands; only
+  the codec-specific extradata blob remains as the r59
+  blocker.**  Round 57 closed by demonstrating the splitter spawns
+  out-of-the-box (DllGetClassObject + CoCreateInstance + QI for
+  every documented base interface).  Round 58 takes the next step
+  on the audio decode path: discover what media-type families
+  the splitter advertises, build a `WAVEFORMATEX`-shaped
+  `AM_MEDIA_TYPE`, and drive the splitter through
+  `ReceiveConnection + Pause + Run(0)`.
+  - **Phase 1 result — splitter exposes 2 pins.**
+    `IBaseFilter::EnumPins → IEnumPins::Next` discovers a
+    matched pair: INPUT pin at `0x6000_027c` (encoded-audio
+    receive side), OUTPUT pin at `0x6000_038c` (PCM emit side).
+    `IPin::QueryDirection` confirms `PIN_INPUT (0)` and
+    `PIN_OUTPUT (1)` respectively.  `IPin::EnumMediaTypes` on
+    the input pin returns ZERO offered AMTs — the splitter
+    negotiates purely through `IPin::QueryAccept` rather than
+    pre-enumerating.  The supported subtype pair was instead
+    extracted by reading the splitter's `.rdata` AMT
+    registration table at RVA `0xf268..0xf288` (clean-room
+    inspection of raw bytes): TWO consecutive
+    `MEDIASUBTYPE` GUIDs in audio fourcc-base family —
+    `{00000160-0000-0010-8000-00AA00389B71}` (`WMAUDIO1`,
+    `wFormatTag=0x0160`) and
+    `{00000161-0000-0010-8000-00AA00389B71}` (`WMAUDIO2`,
+    `wFormatTag=0x0161`).  Output pin's PCM subtype is
+    `{00000001-0000-0010-8000-00AA00389B71}` (`WAVE_FORMAT_PCM`).
+  - **Phase 2 result — full `WAVEFORMATEX` AMT staging
+    surface.**  `stage_audio_am_media_type` lays out a 72-byte
+    `AM_MEDIA_TYPE` at one arena address and an 18+extradata
+    `WAVEFORMATEX` immediately after, with all the canonical
+    field offsets (`majortype=MEDIATYPE_Audio` @ +0;
+    `subtype=MEDIASUBTYPE_<format_tag>` @ +16;
+    `bTemporalCompression=1` @ +36;
+    `formattype=FORMAT_WaveFormatEx` @ +44; `cbFormat` @ +64;
+    `pbFormat` @ +68; `wFormatTag` @ +0; `nChannels` @ +2;
+    `nSamplesPerSec` @ +4; `nAvgBytesPerSec` @ +8;
+    `nBlockAlign` @ +12; `wBitsPerSample` @ +14; `cbSize` @ +16;
+    extradata @ +18).  Every field round-trips through guest
+    memory.
+  - **Phase 3 result — `IPin::ReceiveConnection` reachable but
+    rejects synth AMT.**  Both synthesized `MSAUDIO1` and
+    `WMAUDIO2` AMTs (carrying 2-channel / 44_100 Hz / 16-bit /
+    10-byte zero extradata) are rejected with HRESULT
+    `E_FAIL (0x80004005)`.  No new ole32 / msacm32 / msvcrt
+    stubs surfaced — the splitter's rejection happens entirely
+    in its own validation path, not in any unresolved import.
+    The likely r59 blocker is the `cbSize` extradata blob:
+    `MSAUDIO1` typically expects a 4-or-10-byte codec-specific
+    initialisation header (sample-rate-class index, denoise
+    table seeds, etc.) that the codec uses to bootstrap its
+    internal decoder state.  Real WMA1-encoded fixtures pin
+    those bytes; a synthetic zero block fails the splitter's
+    `AVI/ASF`-header replay check.
+  - **Phase 4 result — full state machine works.**
+    `IMediaFilter::Pause()` → `S_OK`;
+    `IMediaFilter::Run(0)` → `S_OK`;
+    `IMediaFilter::GetState(1000ms)` → `S_OK` with
+    `FILTER_STATE=2` (`FILTER_STATE_RUNNING`).  The splitter's
+    state machine is fully functional regardless of whether
+    ReceiveConnection has succeeded.
+  - **Phase 5 result — push-sample path blocked by Phase 3.**
+    `IMemInputPin::Receive` is reachable (`QueryInterface(input_pin,
+    IID_IMEMINPUTPIN)` succeeds), but no encoded sample can be
+    pushed until ReceiveConnection accepts an AMT.  Smoke test
+    skips gracefully.
+  - **Zero new host stubs needed.**  The audio splitter's
+    EnumPins / EnumMediaTypes / ReceiveConnection / Pause / Run
+    / GetState surface is fully satisfied by the round-25..40
+    DirectShow scaffolding the video path already established.
+    No new ole32, msacm32, or msvcrt entries were drained — the
+    splitter's decoding stays self-contained (does NOT delegate
+    to `msacm32!acmStream*` as some speculation suggested).
+  - `tests/round58_msadds32_audio_amt_walk_and_connect.rs` —
+    six integration tests across the four phases.  `phase1` +
+    `phase3` + `phase4` + `phase5` are gracefully-skipping on
+    fixture absence; `phase2` is unconditional unit-tests of
+    the AMT staging helper + the `mmreg`-compatible audio
+    subtype constructor.
+  - **Next critical-path target (round 59):**  the `MSAUDIO1`
+    AMT extradata blob.  Two approaches: (a) capture a real
+    WMA1-encoded `.asf` fixture and replay the splitter's
+    AMT-build sequence against it to extract the byte pattern;
+    (b) reverse-engineer the splitter's `IPin::QueryAccept`
+    validation path (presumably a bytewise compare against an
+    expected header signature in `.rdata`) and derive the
+    minimum acceptable extradata content from the spec.
+
 - Round 57 — **`msadds32.ax` audio splitter spawns through
   `DllGetClassObject` + `IClassFactory::CreateInstance` —
   IUnknown/IPersist/IMediaFilter/IBaseFilter all QI cleanly with

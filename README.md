@@ -9,6 +9,33 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 58 — `msadds32.ax` audio splitter walks
+`IBaseFilter::EnumPins → IPin::QueryDirection` (2 pins: INPUT +
+OUTPUT) and drives `IMediaFilter::Pause + Run(0) + GetState` into
+`FILTER_STATE_RUNNING` cleanly; full `WAVEFORMATEX`-shaped
+`AM_MEDIA_TYPE` staging surface lands; `IPin::ReceiveConnection`
+returns `E_FAIL` against synthetic `MSAUDIO1` / `WMAUDIO2` AMTs,
+with codec-specific extradata bytes as the r59 blocker.**  The
+splitter's pin pair is INPUT @ `0x6000_027c` + OUTPUT @
+`0x6000_038c`.  `EnumMediaTypes` on the input pin returns zero
+(splitter negotiates through `QueryAccept`); the two encoded
+subtypes the splitter accepts were instead extracted from the
+`.rdata` AMT-registration table at RVA `0xf268..0xf288`:
+`MEDIASUBTYPE_MSAUDIO1 = {00000160-0000-0010-8000-00AA00389B71}`
+(`wFormatTag=0x0160`) and `MEDIASUBTYPE_WMAUDIO2 = {00000161-…}`
+(`wFormatTag=0x0161`); the output pin advertises PCM
+(`{00000001-…}`).  Phase 4's success means the splitter's
+state machine is fully usable: `IMediaFilter::Pause → S_OK`,
+`IMediaFilter::Run(0) → S_OK`, `IMediaFilter::GetState(1000ms) →
+S_OK + FILTER_STATE=2`.  Zero new ole32 / msacm32 / msvcrt stubs
+needed — the splitter does NOT delegate to `msacm32!acmStream*`.
+The next r59 blocker is the WMA1 codec-specific extradata blob
+(synthetic zero block fails the splitter's `QueryAccept`
+validation; real WMA1-encoded ASF/WAV fixture bytes will likely
+unlock it).  See
+`tests/round58_msadds32_audio_amt_walk_and_connect.rs` (6 tests
+across 5 phases).
+
 **Round 57 — `msadds32.ax` audio splitter spawns through
 `DllGetClassObject` + `IClassFactory::CreateInstance`; IUnknown /
 IPersist / IMediaFilter / IBaseFilter all `QueryInterface` cleanly
