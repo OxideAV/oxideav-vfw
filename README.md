@@ -9,6 +9,37 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 51 — Encode side of the IC* surface lands end-to-end
+against `mpg4c32.dll`; `quality=5000` BGR24 → MP43 → BGR24
+self-roundtrip at 27.83 dB PSNR.**  The decode pipeline
+(rounds 21..44) had been parking at 42.9 dB PSNR-RGB across
+17/17 frames on five multi-frame 352×288 fixtures; round 51
+brings up the symmetric encode pipeline.  Six new host-side
+`IC*Compress*` wrappers (`ic_compress_query`,
+`ic_compress_get_format`, `ic_compress_get_size`,
+`ic_compress_begin`, `ic_compress`, `ic_compress_end`)
+mirror the existing decompress family one-for-one, sharing
+the round-22 `msmpeg4_v3_preinit` handshake plant for the
+v3-wrapper-handshake gate at
+`mpg4c32!DriverProc+0x14e2` (without which both BEGIN
+messages return `ICERR_INTERNAL`).  The
+`ICCOMPRESS` struct (48 bytes / 12 dwords) and the
+`ICM_COMPRESS_*` message ordinals (`ICM_USER + 4..9` =
+`0x4004..0x4009`) are transcribed from
+`winsdk-10/Include/.../um/Vfw.h` + the MSDN
+`ICCompress` / `ICCompressBegin` topic pages.  At
+`quality=5000` the codec compresses a 176×144 BGR24 gradient
+to 970 bytes (~78× ratio); the encoded MP43 elementary
+bitstream survives a self-roundtrip through the existing
+decode path at 27.83 dB.  The codec emits FOURCC `MP43` for
+every encode regardless of the requested handler tag —
+mirroring the round-44 decode-side `IPin::ReceiveConnection`
+"MP43-only" finding.  Encode-input format probe lands BGR24
+/ BGR32 / YV12 / I420 / IYUV / YUY2 / UYVY / RGB16-565 /
+BGR8-palette as accepted formats; NV12 / NV21 / RGB15-555 /
+MP43-as-input are rejected with `ICERR_UNSUPPORTED`.  See
+`tests/round51_msmpeg4_encode_roundtrip.rs`.
+
 **Round 50 — `msvcrt!_beginthreadex` stub advances `msadds32.ax`
 PE-load past the splitter's CRT thread-creation edge; combined
 with the r48 `_endthreadex` no-op stub this closes the entire

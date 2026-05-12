@@ -352,13 +352,18 @@ impl SandboxedVfwDecoder {
 
             let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
             let fcc_type = u32::from_le_bytes(*b"VIDC");
-            // Mode 2 = ICMODE_COMPRESS in vfw.h — but the round-24
-            // manual path uses 2 here for MP43 because Microsoft's
-            // codecs have historically been permissive about the
-            // mode word at DRV_OPEN; keep the same value as the
-            // manual path so the trait + manual paths exercise the
-            // identical DRV_OPEN sequence (round-29 byte-equality
-            // requirement). See `tests/round24_mp43_multiframe_and_wmv.rs`.
+            // Mode 2 = ICMODE_DECOMPRESS in vfw.h.  The round-24
+            // manual path uses 2 here for MP43 because that IS the
+            // decode-mode value; the round-29 byte-equality
+            // requirement just demands the trait + manual paths
+            // exercise the identical DRV_OPEN sequence, including
+            // the mode word.  See
+            // `tests/round24_mp43_multiframe_and_wmv.rs`.
+            // (Original comment had ICMODE_COMPRESS / ICMODE_DECOMPRESS
+            //  inverted; corrected in round 51 alongside the encode
+            //  surface landing.  Microsoft's codecs are historically
+            //  permissive about the mode word at DRV_OPEN, so even
+            //  a wrong mode here would still mint a HIC.)
             let hic = sb
                 .ic_open(fcc_type, fcc_handler, 2)
                 .map_err(|e| Error::other(format!("vfw discovery: ic_open failed: {e}")))?;

@@ -101,6 +101,46 @@ pub const ICM_DECOMPRESS: u32 = ICM_USER + 13;
 /// `vfw.h`: `ICM_DECOMPRESS_END`.
 pub const ICM_DECOMPRESS_END: u32 = ICM_USER + 14;
 
+// --- ICM_COMPRESS_* messages (vfw.h, Windows 10 SDK) ---
+//   ICM_COMPRESS_GET_FORMAT     = ICM_USER + 4   (0x4004)
+//   ICM_COMPRESS_GET_SIZE       = ICM_USER + 5   (0x4005)
+//   ICM_COMPRESS_QUERY          = ICM_USER + 6   (0x4006)
+//   ICM_COMPRESS_BEGIN          = ICM_USER + 7   (0x4007)
+//   ICM_COMPRESS                = ICM_USER + 8   (0x4008)
+//   ICM_COMPRESS_END            = ICM_USER + 9   (0x4009)
+//
+// Round 51 transcribes these from `winsdk-10/Include/.../um/Vfw.h`
+// against MSDN's `ICM_COMPRESS` / `ICM_COMPRESS_QUERY` /
+// `ICM_COMPRESS_BEGIN` / `ICM_COMPRESS_END` /
+// `ICM_COMPRESS_GET_FORMAT` / `ICM_COMPRESS_GET_SIZE` topic
+// pages. None of these are documented as decimal offsets in the
+// MSDN topic prose; the canonical numeric values come from the
+// header.
+
+/// `vfw.h`: `ICM_COMPRESS_GET_FORMAT` — codec fills in the output
+/// `BITMAPINFOHEADER` describing what its compressed output looks
+/// like for the supplied input format.
+pub const ICM_COMPRESS_GET_FORMAT: u32 = ICM_USER + 4;
+/// `vfw.h`: `ICM_COMPRESS_GET_SIZE` — max bytes the codec might
+/// emit for one frame at the supplied input/output formats.
+pub const ICM_COMPRESS_GET_SIZE: u32 = ICM_USER + 5;
+/// `vfw.h`: `ICM_COMPRESS_QUERY` — can the codec compress this
+/// input format into the requested output format?
+pub const ICM_COMPRESS_QUERY: u32 = ICM_USER + 6;
+/// `vfw.h`: `ICM_COMPRESS_BEGIN` — set up the encoder pipeline.
+pub const ICM_COMPRESS_BEGIN: u32 = ICM_USER + 7;
+/// `vfw.h`: `ICM_COMPRESS` — encode one frame; `lParam1` is a
+/// pointer to an `ICCOMPRESS` struct.
+pub const ICM_COMPRESS: u32 = ICM_USER + 8;
+/// `vfw.h`: `ICM_COMPRESS_END` — tear down the encoder pipeline.
+pub const ICM_COMPRESS_END: u32 = ICM_USER + 9;
+
+/// `vfw.h`: `ICCOMPRESS_KEYFRAME = 0x00000001L`. Caller sets this
+/// in `ICCOMPRESS::dwFlags` to ask the codec to emit a keyframe;
+/// the codec writes its actual choice into `*lpdwFlags` (the
+/// pointer slot at offset +24 in the `ICCOMPRESS` struct).
+pub const ICCOMPRESS_KEYFRAME: u32 = 0x0000_0001;
+
 // vfw.h: ICDECOMPRESS dwFlags
 /// "This is a key/intra frame" — set on the first frame and on
 /// any frame the bitstream marks as a keyframe.
@@ -268,6 +308,27 @@ pub const ICDECOMPRESS_SIZE: u32 = 24;
 /// per-region decode.
 pub const ICDECOMPRESSEX_SIZE: u32 = 88;
 
+/// `vfw.h` `ICCOMPRESS` — the `lParam1` of `ICM_COMPRESS`. Twelve
+/// fields, all 4 bytes each on i386 (DWORD / LONG / pointer):
+///
+/// ```c
+/// typedef struct {
+///     DWORD              dwFlags;       // +0  ICCOMPRESS_KEYFRAME etc.
+///     LPBITMAPINFOHEADER lpbiOutput;    // +4
+///     LPVOID             lpOutput;      // +8
+///     LPBITMAPINFOHEADER lpbiInput;     // +12
+///     LPVOID             lpInput;       // +16
+///     LPDWORD            lpckid;        // +20 chunk id (out)
+///     LPDWORD            lpdwFlags;     // +24 returned flags (out)
+///     LONG               lFrameNum;     // +28
+///     DWORD              dwFrameSize;   // +32 max size, 0 = no limit
+///     DWORD              dwQuality;     // +36 0..10000
+///     LPBITMAPINFOHEADER lpbiPrev;      // +40
+///     LPVOID             lpPrev;        // +44
+/// } ICCOMPRESS;
+/// ```
+pub const ICCOMPRESS_SIZE: u32 = 48;
+
 // --- IC* host-side wrappers ------------------------------------------
 
 /// Open a codec instance.
@@ -275,12 +336,20 @@ pub const ICDECOMPRESSEX_SIZE: u32 = 88;
 /// `fcc_type` is a 4CC stored as `u32::from_le_bytes(b"VIDC")`
 /// for video.  `fcc_handler` is the codec's 4CC (`b"cvid"` for
 /// Cinepak; case-insensitive in real vfw32, but the codec
-/// dispatch is up to the codec). `mode` is one of:
+/// dispatch is up to the codec). `mode` is one of (vfw.h):
 ///
-/// * `1` — `ICMODE_DECOMPRESS`
-/// * `2` — `ICMODE_COMPRESS`
+/// * `1` — `ICMODE_COMPRESS`
+/// * `2` — `ICMODE_DECOMPRESS`
 /// * `3` — `ICMODE_FASTDECOMPRESS`
 /// * `4` — `ICMODE_QUERY`
+/// * `5` — `ICMODE_FASTCOMPRESS`
+/// * `8` — `ICMODE_DRAW`
+///
+/// (The earlier doc-comment swapped 1 and 2; corrected in round
+/// 51 — Microsoft's codecs are historically permissive about
+/// the mode word at DRV_OPEN so existing decode tests with
+/// `mode=2` continue to work, but the canonical vfw.h mapping
+/// is `ICMODE_DECOMPRESS = 2`.)
 ///
 /// On success a synthetic `HIC` is minted and the codec's
 /// `DriverProc(0, 0, DRV_OPEN, 0, 0)` is invoked. If `DriverProc`
@@ -932,6 +1001,426 @@ pub fn ic_decompress(
     Ok((lresult, out))
 }
 
+// --- IC*Compress* host-side wrappers (round 51) ----------------------
+//
+// Mirror the decompress family one-for-one against vfw.h's
+// ICM_COMPRESS_* messages. The only message that diverges
+// structurally is `ICM_COMPRESS` itself, which takes a 12-field
+// `ICCOMPRESS` struct (48 bytes) — twice as wide as
+// `ICDECOMPRESS` and with `lpbiOutput` ordered before `lpbiInput`
+// (opposite to ICDECOMPRESS). The other five messages
+// (QUERY / GET_FORMAT / GET_SIZE / BEGIN / END) take a pair of
+// `BITMAPINFOHEADER` pointers in `(lParam1, lParam2)`, exactly
+// like their decompress counterparts.
+
+/// `ICCompressQuery` — ask the codec whether it can compress the
+/// given input format to the given output format. `lParam1` = input
+/// BIH, `lParam2` = output BIH (or 0 to defer the choice).
+/// Returns `ICERR_OK` (0) if the codec accepts the input.
+///
+/// MSDN: `LRESULT ICCompressQuery(HIC hic, LPBITMAPINFOHEADER
+/// lpbiInput, LPBITMAPINFOHEADER lpbiOutput)`.
+pub fn ic_compress_query(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    input: &Bih,
+    output: Option<&Bih>,
+) -> Result<u32, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompressQuery",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input, in_addr)?;
+    let out_addr = if let Some(out_bih) = output {
+        let a = state.arena_alloc(BIH_SIZE)?;
+        host_bih_to_guest(mmu, out_bih, a)?;
+        a
+    } else {
+        0
+    };
+    call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_COMPRESS_QUERY, in_addr, out_addr],
+    )
+}
+
+/// `ICCompressGetFormat` — ask the codec to fill in the output
+/// `BITMAPINFOHEADER` corresponding to the given input BIH. The
+/// codec writes the format it would emit (the FourCC tag,
+/// `biBitCount`, `biSizeImage` upper bound, etc.) into the output
+/// slot. Returns `(LRESULT, output_bih)`.
+///
+/// MSDN: `LRESULT ICCompressGetFormat(HIC hic, LPBITMAPINFOHEADER
+/// lpbiInput, LPBITMAPINFOHEADER lpbiOutput)`. When `lpbiOutput`
+/// is NULL the codec returns the byte count needed; we always
+/// supply a 40-byte slot.
+pub fn ic_compress_get_format(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    input: &Bih,
+) -> Result<(u32, Bih), crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompressGetFormat",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input, in_addr)?;
+    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    // Pre-zero the output BIH so a partial codec write still
+    // produces deterministic bytes for the caller to compare.
+    for i in 0..BIH_SIZE {
+        mmu.store8(out_addr + i, 0)
+            .map_err(|t| Win32Error::InvalidArgument {
+                stub: "ICCompressGetFormat",
+                reason: format!("{t}"),
+            })?;
+    }
+    let lr = call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[
+            entry.driver_id,
+            hic,
+            ICM_COMPRESS_GET_FORMAT,
+            in_addr,
+            out_addr,
+        ],
+    )?;
+    let out = guest_bih_to_host(mmu, out_addr)?;
+    Ok((lr, out))
+}
+
+/// `ICCompressGetSize` — ask the codec for the maximum number of
+/// bytes one encoded frame might produce. Caller passes both the
+/// input BIH and the output BIH (the latter typically obtained from
+/// [`ic_compress_get_format`]). Returns the size as a `u32`.
+///
+/// MSDN: `DWORD ICCompressGetSize(HIC hic, LPBITMAPINFOHEADER
+/// lpbiInput, LPBITMAPINFOHEADER lpbiOutput)` — note the return
+/// is documented as `DWORD`, not `LRESULT`. The codec's
+/// `DriverProc` still returns the value in `eax` so the same
+/// `call_guest` shape works.
+pub fn ic_compress_get_size(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    input: &Bih,
+    output: &Bih,
+) -> Result<u32, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompressGetSize",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input, in_addr)?;
+    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, output, out_addr)?;
+    call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[
+            entry.driver_id,
+            hic,
+            ICM_COMPRESS_GET_SIZE,
+            in_addr,
+            out_addr,
+        ],
+    )
+}
+
+/// `ICCompressBegin` — set up the encoder pipeline. Returns the
+/// codec's `LRESULT` (0 = OK).
+///
+/// MSDN: `LRESULT ICCompressBegin(HIC hic, LPBITMAPINFOHEADER
+/// lpbiInput, LPBITMAPINFOHEADER lpbiOutput)`.
+///
+/// Round 51 — applies the same `msmpeg4_v3_preinit` handshake the
+/// decode-begin path already uses. The bare `ICCompressBegin`
+/// against mpg4c32 returns `ICERR_INTERNAL` (`-100` /
+/// `0xFFFFFF9C`) for the same reason `ICDecompressBegin` did in
+/// round 21: mpg4c32's MS-MPEG-4 v3 dispatch gate at
+/// `mpg4c32!DriverProc+0x14e2` walks `[driver_id+0xb4]` for the
+/// `{1u32, GUID}` wrapper-handshake plant before either BEGIN
+/// handler runs.  Mirroring the plant here unblocks the encode
+/// pipeline symmetrically.
+pub fn ic_compress_begin(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    input: &Bih,
+    output: &Bih,
+) -> Result<u32, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompressBegin",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    msmpeg4_v3_preinit(mmu, state, &entry)?;
+    let in_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input, in_addr)?;
+    let out_addr = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, output, out_addr)?;
+    call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_COMPRESS_BEGIN, in_addr, out_addr],
+    )
+}
+
+/// `ICCompressEnd` — tear down the encoder pipeline. Returns the
+/// codec's `LRESULT`.
+///
+/// MSDN: `LRESULT ICCompressEnd(HIC hic)`.
+pub fn ic_compress_end(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+) -> Result<u32, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompressEnd",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+    call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_COMPRESS_END, 0, 0],
+    )
+}
+
+/// Returned-by-reference companion to [`ic_compress`].
+#[derive(Debug, Clone, Default)]
+pub struct CompressOutcome {
+    /// Codec's `LRESULT` (0 = `ICERR_OK`).
+    pub lresult: u32,
+    /// Encoded bytes (truncated to whatever fits in
+    /// `output_capacity`).
+    pub bytes: Vec<u8>,
+    /// `output_bih` after the codec finished — `biSizeImage` is
+    /// the field codecs update to advertise the actual encoded
+    /// byte count.
+    pub output_bih: Bih,
+    /// Value the codec wrote to `*lpdwFlags`. The
+    /// `ICCOMPRESS_KEYFRAME` bit echoes whether the codec
+    /// emitted a keyframe (independent of the caller's request
+    /// — some codecs force every frame to be a keyframe regardless
+    /// of input flags, while others may skip a keyframe request if
+    /// they think it would hurt compression).
+    pub returned_flags: u32,
+    /// Value the codec wrote to `*lpckid`. Real-vfw32 AVI muxers
+    /// use this as the per-frame chunk-id ('00dc' = compressed
+    /// frame, '00db' = uncompressed frame); the codec is allowed
+    /// to override the caller-supplied default.
+    pub ckid: u32,
+}
+
+/// Encode one frame.
+///
+/// Lays out an [`ICCOMPRESS_SIZE`]-byte `ICCOMPRESS` struct in
+/// guest memory, populates input/output `BITMAPINFOHEADER`s, the
+/// raw input pixel buffer, the encoded output buffer, and the
+/// returned-flags / chunk-id slots, then calls
+/// `DriverProc(_, _, ICM_COMPRESS, &icc, sizeof)`. After return,
+/// reads back the encoded bytes + the post-call output BIH (whose
+/// `biSizeImage` holds the actual encoded byte count) +
+/// `*lpdwFlags` + `*lpckid`.
+///
+/// `flags` is the `dwFlags` field of `ICCOMPRESS`; a typical
+/// value for a forced keyframe is [`ICCOMPRESS_KEYFRAME`] (`1`).
+///
+/// `ckid` / `frame_flags_in` / `frame_num` / `frame_size_limit`
+/// (0 = no limit) / `quality` (0..10000) mirror the `ICCOMPRESS`
+/// field names.
+///
+/// `prev_bih_opt` / `prev_bytes_opt` describe the previous
+/// reconstructed frame for P-frame encoders. Pass `None` /
+/// `None` for keyframes — the codec sets the pointer slots
+/// (`lpbiPrev` / `lpPrev`) to NULL.
+#[allow(clippy::too_many_arguments)]
+pub fn ic_compress(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    registry: &Registry,
+    state: &mut HostState,
+    hic: u32,
+    flags: u32,
+    input_bih: &Bih,
+    input_bytes: &[u8],
+    output_bih: &Bih,
+    output_capacity: u32,
+    ckid: u32,
+    frame_num: i32,
+    frame_size_limit: u32,
+    quality: u32,
+    prev_bih_opt: Option<&Bih>,
+    prev_bytes_opt: Option<&[u8]>,
+) -> Result<CompressOutcome, crate::Error> {
+    let entry = state
+        .hics
+        .get(&hic)
+        .cloned()
+        .ok_or_else(|| Win32Error::InvalidArgument {
+            stub: "ICCompress",
+            reason: format!("unknown HIC {hic}"),
+        })?;
+
+    // Lay out the per-call guest scratch:
+    //   bi-input, bi-output, in-bytes, out-bytes, ckid-slot,
+    //   flags-slot, optional bi-prev + prev-bytes.
+    let bi_in = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, input_bih, bi_in)?;
+    let bi_out = state.arena_alloc(BIH_SIZE)?;
+    host_bih_to_guest(mmu, output_bih, bi_out)?;
+
+    let in_buf = state.arena_alloc(input_bytes.len().max(1) as u32)?;
+    if !input_bytes.is_empty() {
+        mmu.write_initializer(in_buf, input_bytes)
+            .map_err(|t| Win32Error::InvalidArgument {
+                stub: "ICCompress",
+                reason: format!("{t}"),
+            })?;
+    }
+    let out_buf = state.arena_alloc(output_capacity.max(1))?;
+    let zeros = vec![0u8; output_capacity as usize];
+    mmu.write_initializer(out_buf, &zeros)
+        .map_err(|t| Win32Error::InvalidArgument {
+            stub: "ICCompress",
+            reason: format!("{t}"),
+        })?;
+
+    // 4-byte `lpckid` + 4-byte `lpdwFlags` out-slots — codec
+    // writes the actual chunk-id and the actual flags into these.
+    // Seeded with caller-supplied values so a non-overwriting
+    // codec preserves the caller's intent.
+    let ckid_slot = state.arena_alloc(4)?;
+    let trap = |t: crate::emulator::Trap| Win32Error::InvalidArgument {
+        stub: "ICCompress",
+        reason: format!("{t}"),
+    };
+    mmu.store32(ckid_slot, ckid).map_err(trap)?;
+    let flags_slot = state.arena_alloc(4)?;
+    mmu.store32(flags_slot, flags).map_err(trap)?;
+
+    // Optional previous-frame slots for P-frame encoders.
+    let (bi_prev, prev_buf) = match (prev_bih_opt, prev_bytes_opt) {
+        (Some(bih), Some(bytes)) => {
+            let bp = state.arena_alloc(BIH_SIZE)?;
+            host_bih_to_guest(mmu, bih, bp)?;
+            let pb = state.arena_alloc(bytes.len().max(1) as u32)?;
+            if !bytes.is_empty() {
+                mmu.write_initializer(pb, bytes).map_err(trap)?;
+            }
+            (bp, pb)
+        }
+        _ => (0, 0),
+    };
+
+    // Lay out the ICCOMPRESS struct. 12 dwords, exact field
+    // ordering from vfw.h (note: lpbiOutput is BEFORE lpbiInput,
+    // inverted vs ICDECOMPRESS).
+    let icc = state.arena_alloc(ICCOMPRESS_SIZE)?;
+    mmu.store32(icc, flags).map_err(trap)?; // +0  dwFlags
+    mmu.store32(icc + 4, bi_out).map_err(trap)?; // +4  lpbiOutput
+    mmu.store32(icc + 8, out_buf).map_err(trap)?; // +8  lpOutput
+    mmu.store32(icc + 12, bi_in).map_err(trap)?; // +12 lpbiInput
+    mmu.store32(icc + 16, in_buf).map_err(trap)?; // +16 lpInput
+    mmu.store32(icc + 20, ckid_slot).map_err(trap)?; // +20 lpckid
+    mmu.store32(icc + 24, flags_slot).map_err(trap)?; // +24 lpdwFlags
+    mmu.store32(icc + 28, frame_num as u32).map_err(trap)?; // +28 lFrameNum
+    mmu.store32(icc + 32, frame_size_limit).map_err(trap)?; // +32 dwFrameSize
+    mmu.store32(icc + 36, quality).map_err(trap)?; // +36 dwQuality
+    mmu.store32(icc + 40, bi_prev).map_err(trap)?; // +40 lpbiPrev
+    mmu.store32(icc + 44, prev_buf).map_err(trap)?; // +44 lpPrev
+
+    let lresult = call_guest(
+        cpu,
+        mmu,
+        registry,
+        state,
+        entry.driver_proc_va,
+        &[entry.driver_id, hic, ICM_COMPRESS, icc, ICCOMPRESS_SIZE],
+    )?;
+
+    // Read back: encoded bytes from out_buf, the updated BIH (its
+    // biSizeImage is what the codec uses to advertise the encoded
+    // size), and the returned-by-reference flags/ckid slots.
+    let mut bytes = vec![0u8; output_capacity as usize];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = mmu.load8(out_buf + i as u32).map_err(trap)?;
+    }
+    let output_bih_back = guest_bih_to_host(mmu, bi_out)?;
+    let returned_flags = mmu.load32(flags_slot).map_err(trap)?;
+    let ckid_back = mmu.load32(ckid_slot).map_err(trap)?;
+
+    // Truncate `bytes` to the codec-advertised payload size when
+    // it is non-zero and within capacity — bi.biSizeImage is the
+    // canonical "actual encoded size" channel per the MSDN
+    // `ICCompress` topic page ("On return, [the codec] sets the
+    // size of the output frame in `biSizeImage` of the
+    // BITMAPINFOHEADER pointed to by `lpbiOutput`"). If the codec
+    // leaves biSizeImage at 0 or beyond `output_capacity`, we
+    // surface the whole buffer and let the caller decide.
+    let encoded_len = output_bih_back.size_image;
+    if encoded_len > 0 && encoded_len <= output_capacity {
+        bytes.truncate(encoded_len as usize);
+    }
+
+    Ok(CompressOutcome {
+        lresult,
+        bytes,
+        output_bih: output_bih_back,
+        returned_flags,
+        ckid: ckid_back,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1191,5 +1680,124 @@ mod tests {
         assert_eq!(out.len(), 16 * 16 * 3);
         // Eax was set to the canned LRESULT.
         assert_eq!(cpu.regs.get32(Reg32::Eax), 0xDEAD_BEEF);
+    }
+
+    // -- Round-51 unit tests for the compress wrappers ---------------
+
+    #[test]
+    fn iccompress_struct_size_matches_vfw_h_definition() {
+        // 12 fields × 4 bytes each on i386 = 48. If anyone shrinks
+        // ICCOMPRESS_SIZE in a future round this test catches it
+        // before it corrupts the codec's view of the struct.
+        assert_eq!(ICCOMPRESS_SIZE, 48);
+    }
+
+    #[test]
+    fn icm_compress_constants_match_vfw_h_offsets() {
+        // Canonical numeric values from `winsdk-10/.../Vfw.h`.
+        // ICM_USER = 0x4000; the per-message offsets are
+        // 4..9 in declaration order (GET_FORMAT, GET_SIZE,
+        // QUERY, BEGIN, COMPRESS, END).
+        assert_eq!(ICM_COMPRESS_GET_FORMAT, 0x4004);
+        assert_eq!(ICM_COMPRESS_GET_SIZE, 0x4005);
+        assert_eq!(ICM_COMPRESS_QUERY, 0x4006);
+        assert_eq!(ICM_COMPRESS_BEGIN, 0x4007);
+        assert_eq!(ICM_COMPRESS, 0x4008);
+        assert_eq!(ICM_COMPRESS_END, 0x4009);
+        assert_eq!(ICCOMPRESS_KEYFRAME, 0x0000_0001);
+    }
+
+    #[test]
+    fn ic_compress_query_dispatches_to_driver_proc() {
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xC0FFEE);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        assert_ne!(hic, 0);
+        // Now flip the canned to return 0 (ICERR_OK), mirroring
+        // a codec that accepts the format.
+        install_canned_driver_proc(&mut mmu, dpv, 0);
+        let bih_in = Bih {
+            width: 176,
+            height: 144,
+            bit_count: 24,
+            compression: [0; 4],
+            ..Default::default()
+        };
+        let bih_out = Bih {
+            width: 176,
+            height: 144,
+            bit_count: 24,
+            compression: *b"MP43",
+            ..Default::default()
+        };
+        let lr = ic_compress_query(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            hic,
+            &bih_in,
+            Some(&bih_out),
+        )
+        .unwrap();
+        assert_eq!(lr, 0);
+    }
+
+    #[test]
+    fn ic_compress_round_trip_passes_buffers_through_emulator() {
+        // The canned proc returns DEAD_BEEF for every message; we
+        // are only verifying that the full ICCOMPRESS marshal +
+        // call-guest sequence does not trap. Real-codec semantics
+        // live in the integration test against `mpg4c32.dll`.
+        let (mut cpu, mut mmu, registry, mut state) = make_env();
+        let dpv = 0x0040_0000;
+        install_canned_driver_proc(&mut mmu, dpv, 0xDEAD_BEEF);
+        state.default_driver_proc = dpv;
+        let hic = ic_open(&mut cpu, &mut mmu, &registry, &mut state, 0, 0, 1).unwrap();
+        assert_ne!(hic, 0);
+        let bih_in = Bih {
+            width: 16,
+            height: 16,
+            bit_count: 24,
+            compression: [0; 4],
+            ..Default::default()
+        };
+        let bih_out = Bih {
+            width: 16,
+            height: 16,
+            bit_count: 24,
+            compression: *b"MP43",
+            ..Default::default()
+        };
+        let input = vec![0xAAu8; 16 * 16 * 3];
+        let outcome = ic_compress(
+            &mut cpu,
+            &mut mmu,
+            &registry,
+            &mut state,
+            hic,
+            ICCOMPRESS_KEYFRAME,
+            &bih_in,
+            &input,
+            &bih_out,
+            16 * 16 * 3,
+            u32::from_le_bytes(*b"00dc"),
+            0,
+            0,
+            5000,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.lresult, 0xDEAD_BEEF);
+        // Output buffer survived. Length stays at output_capacity
+        // because the canned proc didn't touch bi.biSizeImage, so
+        // the truncate-on-encoded-len branch leaves bytes alone.
+        assert_eq!(outcome.bytes.len(), 16 * 16 * 3);
+        // The returned-flags slot was seeded with dwFlags +
+        // canned proc didn't update it, so we see the seed.
+        assert_eq!(outcome.returned_flags, ICCOMPRESS_KEYFRAME);
     }
 }

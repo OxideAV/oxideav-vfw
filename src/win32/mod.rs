@@ -106,7 +106,7 @@ pub struct HicEntry {
     pub fcc_type: u32,
     /// 4-byte fcc handler ('cvid' for Cinepak, 'IV50' for Indeo 5).
     pub fcc_handler: u32,
-    /// Open mode (1 = ICMODE_DECOMPRESS, 2 = ICMODE_COMPRESS, …).
+    /// Open mode (vfw.h: 1 = ICMODE_COMPRESS, 2 = ICMODE_DECOMPRESS, …).
     pub mode: u32,
     /// VA of the codec DLL's `DriverProc` export (the entry point
     /// that every IC* call dispatches into).

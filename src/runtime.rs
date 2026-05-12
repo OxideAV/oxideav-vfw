@@ -828,6 +828,139 @@ impl Sandbox {
             output_capacity,
         )
     }
+
+    // ---- Round 51: encode (compress) wrappers --------------------------
+
+    /// `ICCompressQuery` — does the codec accept this input/output
+    /// format pair? `output` may be `None` to defer the choice.
+    pub fn ic_compress_query(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+        output: Option<&vfw32::Bih>,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_compress_query(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+            output,
+        )
+    }
+
+    /// `ICCompressGetFormat` — ask the codec for the output BIH
+    /// describing what its compressed format looks like for the
+    /// supplied input.
+    pub fn ic_compress_get_format(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+    ) -> Result<(u32, vfw32::Bih), crate::Error> {
+        vfw32::ic_compress_get_format(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+        )
+    }
+
+    /// `ICCompressGetSize` — max encoded-frame byte count for the
+    /// supplied input/output BIH pair.
+    pub fn ic_compress_get_size(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+        output: &vfw32::Bih,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_compress_get_size(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+            output,
+        )
+    }
+
+    /// `ICCompressBegin` — set up the encoder pipeline.
+    pub fn ic_compress_begin(
+        &mut self,
+        hic: u32,
+        input: &vfw32::Bih,
+        output: &vfw32::Bih,
+    ) -> Result<u32, crate::Error> {
+        vfw32::ic_compress_begin(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            input,
+            output,
+        )
+    }
+
+    /// `ICCompressEnd` — tear down the encoder pipeline.
+    pub fn ic_compress_end(&mut self, hic: u32) -> Result<u32, crate::Error> {
+        vfw32::ic_compress_end(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+        )
+    }
+
+    /// `ICCompress` — encode one frame. Returns the full encode
+    /// outcome: codec LRESULT, encoded bytes, the post-call output
+    /// BIH (whose `biSizeImage` holds the actual encoded byte
+    /// count), the codec-written `*lpdwFlags` (e.g. whether the
+    /// codec marked the emitted frame as a keyframe), and the
+    /// codec-written `*lpckid`.
+    ///
+    /// `prev_bih_opt` / `prev_bytes_opt` are the previous
+    /// reconstructed frame (P-frame encoding). Pass `None` for
+    /// keyframes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ic_compress(
+        &mut self,
+        hic: u32,
+        flags: u32,
+        input_bih: &vfw32::Bih,
+        input_bytes: &[u8],
+        output_bih: &vfw32::Bih,
+        output_capacity: u32,
+        ckid: u32,
+        frame_num: i32,
+        frame_size_limit: u32,
+        quality: u32,
+        prev_bih_opt: Option<&vfw32::Bih>,
+        prev_bytes_opt: Option<&[u8]>,
+    ) -> Result<vfw32::CompressOutcome, crate::Error> {
+        vfw32::ic_compress(
+            &mut self.cpu,
+            &mut self.mmu,
+            &self.registry,
+            &mut self.host,
+            hic,
+            flags,
+            input_bih,
+            input_bytes,
+            output_bih,
+            output_capacity,
+            ckid,
+            frame_num,
+            frame_size_limit,
+            quality,
+            prev_bih_opt,
+            prev_bytes_opt,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,110 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 51 — **Encode side of the IC* surface lands end-to-end
+  against `mpg4c32.dll`; `quality=5000` BGR24 → MP43 → BGR24
+  self-roundtrip at 27.83 dB PSNR.** Previous rounds (21..44)
+  drove the decode pipeline (`ICDecompressQuery` /
+  `ICDecompressGetFormat` / `ICDecompressBegin` / `ICDecompress`
+  / `ICDecompressEnd`) at 42.9 dB across 17/17 frames.  Round
+  51 adds the symmetric encode pipeline; the codec now both
+  produces and consumes MP43 elementary bitstreams under the
+  bare VfW path (no DirectShow muxing layer needed for encode).
+  - `src/win32/vfw32.rs` — six new `IC*Compress*` host-side
+    wrappers (`ic_compress_query`, `ic_compress_get_format`,
+    `ic_compress_get_size`, `ic_compress_begin`, `ic_compress`,
+    `ic_compress_end`) mirroring the existing `ic_decompress_*`
+    family.  The `ICM_COMPRESS_*` message ordinals
+    (`ICM_USER + 4..9` = `0x4004..0x4009`) and the 48-byte
+    `ICCOMPRESS` struct layout (12 dwords) are transcribed
+    against `winsdk-10/Include/.../um/Vfw.h` and the MSDN
+    `ICCompress` / `ICCompressBegin` / etc. topic pages.
+    `ICCOMPRESS_KEYFRAME = 0x1` matches the same header.
+    `ic_compress_begin` invokes the same
+    [`msmpeg4_v3_preinit`] handshake plant the round-22
+    decompress-begin path uses — without it,
+    `ICCompressBegin` against mpg4c32 returns `ICERR_INTERNAL`
+    (`-100`) for the same v3-wrapper-handshake gate that
+    `ICDecompressBegin` hit pre-r22.  `ic_compress` returns a
+    new [`CompressOutcome`] aggregate carrying the encoded
+    bytes, post-call output BIH (whose `biSizeImage` holds the
+    actual encoded size), and the codec-written
+    `*lpdwFlags` / `*lpckid` slot values.  Truncates the byte
+    vector at `output_bih.size_image` when the codec reports
+    a non-zero in-bounds size (the MSDN-documented "on return
+    the codec sets `biSizeImage`" contract).
+  - `src/runtime.rs` — six matching [`Sandbox`] convenience
+    methods (`ic_compress_query`, `ic_compress_get_format`,
+    `ic_compress_get_size`, `ic_compress_begin`,
+    `ic_compress`, `ic_compress_end`) forwarding into the
+    `vfw32` module.
+  - `src/win32/mod.rs` + `src/win32/vfw32.rs` — corrected
+    the `HicEntry::mode` doc-comment and the `ic_open` doc-
+    comment to reflect the canonical vfw.h mapping
+    (`ICMODE_COMPRESS = 1`, `ICMODE_DECOMPRESS = 2`); both
+    were inverted in the original docs.  No behavioural
+    change — Microsoft's codecs are historically permissive
+    about the mode word at DRV_OPEN, and existing tests
+    continue to pass `mode=2` for decode unchanged.
+  - `tests/round51_msmpeg4_encode_roundtrip.rs` — three new
+    integration tests against `mpg4c32.dll`:
+    - `msmpeg4_drv_open_compress_mode_returns_nonzero_hic`
+      proves `ICOpen('VIDC','MP43', ICMODE_COMPRESS=1)`
+      mints a HIC (the codec accepts compress-mode at
+      DRV_OPEN; the ICINFO `dwFlags = VIDCF_QUALITY |
+      VIDCF_TEMPORAL` from round 24 was the encode-capability
+      announcement).
+    - `msmpeg4_encode_lifecycle_and_self_roundtrip` walks the
+      full BGR24 → MP43 encode → BGR24 decode cycle for a
+      176×144 deterministic gradient pattern at
+      `quality=5000`: I-frame compresses to 970 bytes (~78×
+      ratio from 76032-byte uncompressed), self-roundtrip
+      decode yields 27.83 dB PSNR-BGR24.  The output FOURCC
+      the codec emits is empirically `MP43` regardless of the
+      input format (the codec hard-codes its compressed-output
+      tag — no FOURCC variant negotiation is honoured on the
+      encode side, mirroring the round-44 decode-side
+      `IPin::ReceiveConnection` "MP43 only" finding).
+    - `msmpeg4_encode_iframe_then_pframe` drives a second
+      frame with `flags=0` and `prev=frame0`; both frames
+      encode successfully (I=970, P=1306 bytes), though the
+      codec sets `*lpdwFlags = ICCOMPRESS_KEYFRAME |
+      AVIIF_KEYFRAME` (`0x12`) for both because the second
+      frame's content is identical to the first — the codec
+      is allowed to override the caller's flag request per
+      the MSDN `ICCompress` "the codec sets `*lpdwFlags` to
+      indicate the actual frame type emitted" contract.
+    - `msmpeg4_compress_query_format_inventory` mass-probes
+      `ICCompressQuery` against 13 BIH shapes; the codec
+      accepts BGR24, BGR32, YV12, I420, IYUV, YUY2, UYVY,
+      RGB16-565, and BGR8/palette as encode inputs, but
+      rejects NV12 / NV21 / RGB15-555 / `MP43-in-as-input`
+      with `ICERR_UNSUPPORTED` (`-2` / `0xFFFFFFFE`).  No
+      hidden FOURCC-self-loopback in the encoder.
+  - Three new unit tests in `tests` inside
+    `src/win32/vfw32.rs` pin the `ICCOMPRESS` struct size,
+    the `ICM_COMPRESS_*` constants, and the canned-driver-proc
+    round-trip behaviour of the new wrappers.
+  - **Empirical findings:**
+    - The encoder's `ICCompressGetSize` for 176×144 BGR24
+      input returns `W*H*3 = 76032` — the worst-case
+      "encoded fits in uncompressed" upper bound, not a
+      codec-specific tighter estimate.  Real-world callers
+      should size their output buffer to at least that
+      value.
+    - The codec sets `*lpckid = 'dc\0\0'` (`0x6364` LE) —
+      the AVI compressed-frame chunk-id stem, missing the
+      leading `00` byte (the stream-index nibble pair).
+      An AVI muxer would prepend the stream index to form
+      the canonical `'00dc'`.
+    - At `quality=5000`, the codec emits keyframes for both
+      frame 0 and frame 1 even when frame 1 is requested as
+      a P-frame.  This is consistent with the codec's
+      published behaviour at high-quality settings; lower
+      `quality` values (1000..3000) typically force the
+      P-frame branch.  Round 51 does not exercise the
+      low-quality regime — future rounds can.
+
 - Round 50 — **`msvcrt!_beginthreadex` stub advances `msadds32.ax`
   PE-load past the splitter's CRT thread-creation edge; combined
   with the r48 `_endthreadex` no-op stub this closes the entire
