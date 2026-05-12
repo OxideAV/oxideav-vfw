@@ -8,6 +8,76 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 62 — **clean-room forensics on the `msadds32.ax`
+  `IMemInputPin::Receive` NULL+0x20 trap that closed round 61.**
+  Round 61's phase 5 surfaced a memory fault at `0x00000020`
+  inside the codec's own decode path after the full input-pin
+  allocator handshake AND output-pin `ReceiveConnection` had
+  landed `S_OK`.  Round 62 captures the trap state precisely and
+  reverse-engineers the failure mode from raw `msadds32.ax`
+  byte inspection against Intel SDM Vol. 2 opcode tables (no
+  Wine / ReactOS / Microsoft DShow base-class source consulted):
+  - **Faulting instruction**: `89 72 20` =
+    `mov [edx + 0x20], esi` at RVA `0x256a` (image_base
+    `0x1c400000`, eip `0x1c40256a`).  `edx = 0x00000000`,
+    `esi = 0x00000000` → store to `[0x20]` traps.
+  - **Trap function**: RVA `0x2548..0x257f`, a list-prepend /
+    LIFO-push helper on `this[0x160]`.  Reads
+    `*[ebp+0x08]` (caller's out-slot) into `edx` with NO NULL
+    check; that out-slot is the caller's local
+    `[ebp_caller-0x04]`.
+  - **Caller**: the input-pin `Receive` implementation at RVA
+    `0x1501`.  The trap is on its **cleanup path** when the
+    main decode body finished without producing a buffer
+    (specifically: `[ebp-0x04]` left NULL by the populator,
+    `[ebp-0x28]` left 0 because the insert-into-sorted-list
+    branch was skipped).
+  - **Populator function**: RVA `0x235e`, a buffer-pool POP
+    helper that either pops from `this->lifo_head_160` or
+    `malloc`+`init`s a new 40-byte node.  `init` (RVA `0x25ac`)
+    chains into `operator new(edi_count)` where `edi_count` is
+    `(addref_result * 10) / helper_size_calc`.  When that
+    quotient rounds to 0 (which our run hits), `operator new(0)`
+    returns NULL → `init` returns `E_OUTOFMEMORY` → populator
+    returns failure → caller's `[ebp-0x04]` stays NULL → cleanup
+    trap.
+  - **IAT resolution**: `0x1c40f088 = ??2@YAPAXI@Z (operator new)`
+    pinned via the thunk-jmp at codec RVA `0x6ae6` (called by
+    the populator at `0x23d4`).  Adjacent IAT slots resolve to
+    `??3@YAXPAX@Z (operator delete)`, `sprintf`, `_strnicmp`,
+    `_purecall`, `_beginthreadex`, `_ftol`, `rand`, `_CIpow`
+    — all from `msvcrt.dll`.
+  - **`IPin::NewSegment` (slot 17) probe** under
+    `R62_DRIVE_NEW_SEGMENT` env var traps immediately by
+    dereferencing the rate-double's high dword `0x3FF00000` as
+    a pointer.  Either the codec's IPin vtable doesn't have
+    NewSegment at slot 17 OR the rate encoding our test uses
+    doesn't match.  Documented for round 63.
+  - 7-test forensics harness in
+    `tests/round62_msadds32_null_0x20_forensics.rs` (phase 1
+    register + EIP capture, phase 2 disassembly windows,
+    phase 2b caller + populator + ctor + init dumps + IAT
+    resolution, phase 2c function-entry walk, phase 2d visited-
+    EIP existence checks, phase 3 regression guard against
+    `VFW_E_NOT_COMMITTED`, phase 4 `NewSegment` probe).
+  - Three new `IPin` vtable slot constants in
+    `oxideav_vfw::com`: `SLOT_PIN_END_OF_STREAM` (14),
+    `SLOT_PIN_BEGIN_FLUSH` (15), `SLOT_PIN_END_FLUSH` (16),
+    `SLOT_PIN_NEW_SEGMENT` (17) — surfaced for round-63 use.
+  - Full reverse-engineered analysis in
+    `docs/codec/msadds32-receive-null-0x20.md` (pseudo-C
+    transcription of both the trap function and the populator
+    + identification of the three independent failure
+    conditions that gate the trap).
+  - Round-63 blocker: pin the runtime values of
+    `edi_addref_result` (return of `helper_addref` at RVA
+    `0x5ce8`) and `helper_size_calc` (return of helper at RVA
+    `0x6ceb`) in our run to confirm the `(... * 10) / ...`
+    quotient is rounding to 0, then either drive the missing
+    `JoinFilterGraph`/`Pause`-time wiring that populates
+    `this->helper_90` correctly, or pre-seed
+    `this->lifo_head_160` with a host-minted node.
+
 - Round 61 — **`msadds32.ax` input-pin `IMemAllocator` handshake
   lands `S_OK` on every step
   (`GetAllocator → SetProperties → Commit → NotifyAllocator`).**

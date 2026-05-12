@@ -9,6 +9,34 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 62 — clean-room forensics on the `msadds32.ax`
+`IMemInputPin::Receive` NULL+0x20 trap.**  Round 61 closed by
+observing a memory fault at `0x00000020` after the full
+input-pin allocator handshake AND output-pin
+`ReceiveConnection` had landed `S_OK`.  Round 62 captures the
+faulting EIP + register file + 16 bytes at trap, then
+reverse-engineers the failure mode from raw `msadds32.ax` byte
+inspection against Intel SDM Vol. 2: the faulting instruction
+is `mov [edx + 0x20], esi` at RVA `0x256a` with `edx = esi =
+0`.  The trap function (RVA `0x2548`) is a LIFO-push helper
+that dereferences a caller-supplied out-slot pointer
+`*[ebp+0x08]` without a NULL check.  The caller is the input-
+pin `Receive` body at RVA `0x1501`, which falls into a
+cleanup path when its main decode body produced no buffer.
+The buffer-pool POP function (RVA `0x235e`) takes its
+`E_OUTOFMEMORY` branch because the chained `operator new` call
+inside `buffer_pool_init` (RVA `0x25ac`) is invoked with a
+quotient that rounds to 0.  Full pseudo-C transcription of
+both functions in
+`docs/codec/msadds32-receive-null-0x20.md`; 7-test forensics
+harness in `tests/round62_msadds32_null_0x20_forensics.rs`.
+Round 63's blocker: pin the runtime values of the two helper
+calls inside the populator (RVA `0x5ce8` and `0x6ceb`) and
+either drive the missing `JoinFilterGraph`/`Pause`-time
+wiring that initialises `this->helper_90`, or pre-seed
+`this->lifo_head_160` with a host-minted node so the POP
+path succeeds without malloc+init.
+
 **Round 61 — `msadds32.ax` input-pin `IMemAllocator` handshake
 fully lands `S_OK` on every step
 (`GetAllocator → SetProperties → Commit → NotifyAllocator`).**

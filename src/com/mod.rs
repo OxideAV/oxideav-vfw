@@ -651,6 +651,21 @@ pub const SLOT_PIN_QUERY_DIRECTION: u32 = 9;
 pub const SLOT_PIN_QUERY_ACCEPT: u32 = 11;
 /// `IPin::EnumMediaTypes(IEnumMediaTypes**)` — slot 12.
 pub const SLOT_PIN_ENUM_MEDIA_TYPES: u32 = 12;
+/// `IPin::EndOfStream()` — slot 14.  Tells a downstream pin no
+/// more samples will arrive on the current segment.
+pub const SLOT_PIN_END_OF_STREAM: u32 = 14;
+/// `IPin::BeginFlush()` — slot 15.  Signals that subsequent
+/// samples on this pin will be flushed; the receiver should
+/// discard any in-flight work.
+pub const SLOT_PIN_BEGIN_FLUSH: u32 = 15;
+/// `IPin::EndFlush()` — slot 16.  Pairs with `BeginFlush`.
+pub const SLOT_PIN_END_FLUSH: u32 = 16;
+/// `IPin::NewSegment(REFERENCE_TIME start, REFERENCE_TIME stop,
+/// double rate)` — slot 17.  Driven by the upstream filter at the
+/// start of each playback segment; some audio decoders won't
+/// process the first `Receive` until they've seen a `NewSegment`
+/// to seed their internal time-base + buffer-pool initialisation.
+pub const SLOT_PIN_NEW_SEGMENT: u32 = 17;
 
 /// `IEnumPins::Next(ULONG cPins, IPin** ppPins, ULONG* pcFetched)`
 /// — slot 3.
