@@ -9,6 +9,32 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 50 — `msvcrt!_beginthreadex` stub advances `msadds32.ax`
+PE-load past the splitter's CRT thread-creation edge; combined
+with the r48 `_endthreadex` no-op stub this closes the entire
+CRT thread-lifecycle surface for the splitter's PE-load.**
+Round 49 wired `_strnicmp` and pinned the next splitter blocker
+as `_beginthreadex`; round 50 wires the 6-arg cdecl
+`_beginthreadex` (`uintptr_t __cdecl _beginthreadex(void
+*security, unsigned stack_size, unsigned (__stdcall
+*start_address)(void *), void *arglist, unsigned initflag,
+unsigned *thrdaddr)`) as a fail-soft no-op returning 0 — the
+MSDN-documented failure sentinel.  The codec sandbox never
+actually spawns the splitter's worker thread on the decode
+path we drive (we only exercise `DLL_PROCESS_ATTACH` /
+`DriverProc` / `IPin::ReceiveConnection`); real call sites in
+the splitter's init layer check the return for non-zero and
+either fall back or skip the worker-thread codepath cleanly.
+If the caller passes a non-NULL `thrdaddr` pointer the stub
+clears `*thrdaddr` to 0; OOB pointers are silently swallowed.
+After round 50, `Sandbox::load("msadds32.ax")` advances past
+`_beginthreadex` and now stops at the next unresolved import:
+`msvcrt!_ftol`.  No DirectShow / VfW decode metric changes —
+`MPG4DS32.AX` (the round-44 critical path) does not import
+`_beginthreadex`; the win is exclusively in the audio
+splitter's PE-load surface.  See
+`tests/round50_msvcrt_beginthreadex.rs`.
+
 **Round 49 — `msvcrt!_strnicmp` stub advances `msadds32.ax`
 PE-load past the splitter's case-insensitive bounded-compare
 edge.**  Round 48 wired `_endthreadex` and pinned the next

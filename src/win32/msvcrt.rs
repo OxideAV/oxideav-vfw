@@ -134,6 +134,41 @@ pub fn register(registry: &mut Registry) {
     //                       const char *string2,
     //                       size_t count) — caller-cleanup.
     registry.register("msvcrt.dll", "_strnicmp", stub_strnicmp as StubFn, 0);
+
+    // ---- Round-50 addition: msadds32.ax PE-load surface --------
+    //
+    // After r49 (`_strnicmp`) the splitter advances its msvcrt
+    // import-table walk to `_beginthreadex`, the CRT entry that
+    // creates an `__stdcall` worker thread.  The codec sandbox
+    // NEVER actually spawns the splitter's worker thread on the
+    // decode path we drive (we only exercise
+    // `DLL_PROCESS_ATTACH` / `DriverProc` /
+    // `IPin::ReceiveConnection`).  Combined with the r48
+    // `_endthreadex` no-op stub, a fail-soft no-op
+    // `_beginthreadex` returning 0 (== "thread creation failed",
+    // a normal failure mode documented in MSDN) closes the entire
+    // CRT thread-lifecycle surface for `msadds32.ax`'s PE-load.
+    //
+    // The IAT slot just needs to resolve before `Sandbox::load`
+    // returns the [`Image`]; real call sites in the splitter's
+    // init layer check the return for non-zero and either fall
+    // back or skip (the splitter's worker thread is the render
+    // loop, which we never drive).
+    //
+    // https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/beginthread-beginthreadex
+    // uintptr_t __cdecl _beginthreadex(void *security,
+    //                                  unsigned stack_size,
+    //                                  unsigned (__stdcall *start_address)(void *),
+    //                                  void *arglist,
+    //                                  unsigned initflag,
+    //                                  unsigned *thrdaddr)
+    //                                                  — caller-cleanup.
+    registry.register(
+        "msvcrt.dll",
+        "_beginthreadex",
+        stub_begin_thread_ex as StubFn,
+        0,
+    );
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -629,6 +664,68 @@ fn stub_strnicmp(
         }
     }
     // Reached `count` bytes with no NUL and no mismatch → equal.
+    Ok(0)
+}
+
+/// `uintptr_t __cdecl _beginthreadex(void *security, unsigned
+/// stack_size, unsigned (__stdcall *start_address)(void *), void
+/// *arglist, unsigned initflag, unsigned *thrdaddr)` — fail-soft.
+///
+/// Per MSDN (`_beginthread, _beginthreadex`): "Creates a thread.
+/// … Returns a handle to the newly created thread if successful;
+/// otherwise, `_beginthreadex` returns 0 and sets `errno` to a
+/// nonzero value".  The MSDN failure contract — return 0 — IS
+/// the fail-soft shape we want: callers that respect the
+/// documented "thread creation can fail" branch fall back or
+/// skip the worker-thread codepath cleanly.
+///
+/// Calling convention: cdecl (caller-cleanup), 6 dwords on the
+/// stack (`security`, `stack_size`, `start_address`, `arglist`,
+/// `initflag`, `thrdaddr`).  `arg_dwords = 0`.
+///
+/// The codec sandbox never actually spawns the splitter's worker
+/// thread on the decode path we drive — we only exercise
+/// `DLL_PROCESS_ATTACH` / `DriverProc` /
+/// `IPin::ReceiveConnection`; the IAT slot just needs to resolve
+/// at PE-load time.  Combined with the r48 `_endthreadex` no-op
+/// stub, this closes the entire CRT thread-lifecycle surface for
+/// `msadds32.ax`'s PE-load.
+///
+/// Implementation contract:
+///
+/// * Returns 0 (NULL handle) — the MSDN "thread creation failed"
+///   sentinel.  `start_address` is never invoked host-side.
+/// * If `thrdaddr` is non-NULL and in-bounds, write 0 through it
+///   so the caller's "did the OS assign a thread id" probe sees
+///   a deterministic value.  If the store traps (OOB pointer),
+///   silently swallow the trap and still return 0 — the MSDN
+///   contract has no way to surface a fault back to the caller,
+///   and panicking would tear down the host process.
+fn stub_begin_thread_ex(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    _state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    // Pull all 6 cdecl dwords defensively so a stack-bounds trap
+    // surfaces as a proper `Win32Error::InvalidArgument` rather
+    // than a silent under-read.  Only `thrdaddr` is actually
+    // consumed; the others are pulled for symmetry with the MSDN
+    // signature and to keep the trace inventory complete.
+    let _security = arg_dword(cpu, mmu, 0).map_err(|t| trap("_beginthreadex", t))?;
+    let _stack_size = arg_dword(cpu, mmu, 1).map_err(|t| trap("_beginthreadex", t))?;
+    let _start_address = arg_dword(cpu, mmu, 2).map_err(|t| trap("_beginthreadex", t))?;
+    let _arglist = arg_dword(cpu, mmu, 3).map_err(|t| trap("_beginthreadex", t))?;
+    let _initflag = arg_dword(cpu, mmu, 4).map_err(|t| trap("_beginthreadex", t))?;
+    let thrdaddr = arg_dword(cpu, mmu, 5).map_err(|t| trap("_beginthreadex", t))?;
+
+    // Optionally clear `*thrdaddr` to 0 — fail-soft on OOB
+    // pointer (silently swallow the trap, still return 0).
+    if thrdaddr != 0 {
+        let _ = mmu.store32(thrdaddr, 0);
+    }
+
+    // Return 0 = MSDN "thread creation failed" sentinel.
     Ok(0)
 }
 

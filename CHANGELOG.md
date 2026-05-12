@@ -8,6 +8,71 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 50 — **`msvcrt!_beginthreadex` stub advances `msadds32.ax`
+  PE-load past the splitter's CRT thread-creation edge; combined
+  with the r48 `_endthreadex` no-op stub this closes the entire
+  CRT thread-lifecycle surface for the splitter's PE-load.**
+  Round 49 wired `_strnicmp` and pinned the next splitter blocker
+  as `_beginthreadex`; round 50 wires the 6-arg cdecl
+  `_beginthreadex` (`uintptr_t __cdecl _beginthreadex(void
+  *security, unsigned stack_size, unsigned (__stdcall
+  *start_address)(void *), void *arglist, unsigned initflag,
+  unsigned *thrdaddr)`) as a fail-soft no-op returning 0.  MSDN
+  documents the failure contract as "returns 0 and sets errno to
+  a nonzero value" — return 0 IS the documented failure sentinel,
+  so callers that respect the documented "thread creation can
+  fail" branch fall back or skip the worker-thread codepath
+  cleanly.  The codec sandbox never actually spawns the
+  splitter's worker thread on the decode path we drive (we only
+  exercise `DLL_PROCESS_ATTACH` / `DriverProc` /
+  `IPin::ReceiveConnection`); real call sites in the splitter's
+  init layer check the return for non-zero and either fall back
+  or skip (the worker thread is the splitter's render loop,
+  which we never drive).
+  - `src/win32/msvcrt.rs` — `stub_begin_thread_ex` + registry
+    entry under a new "Round-50 addition: msadds32.ax PE-load
+    surface" section.  All six cdecl args are pulled through
+    `arg_dword` so a stack-bounds trap surfaces as a proper
+    `Win32Error::InvalidArgument` rather than a silent
+    under-read.  If the caller passes a non-NULL `thrdaddr`
+    pointer the stub clears `*thrdaddr` to 0 via
+    `mmu.store32(thrdaddr, 0)`; OOB pointers are silently
+    swallowed (the MSDN contract has no way to surface a fault
+    back to the caller, and panicking would tear down the host
+    process — the alternative would be bubbling
+    `Win32Error::InvalidArgument` up through the dispatcher,
+    which would propagate as a sandbox-side trap and abort the
+    decode).
+  - `tests/round50_msvcrt_beginthreadex.rs` — 5 tests:
+    registration probe; the canonical 6-dword call with NULL
+    `thrdaddr` returning 0; the non-NULL `thrdaddr` write-back
+    probe (pre-seed the slot to `0xCAFE_BABE`, confirm the stub
+    overwrites it with 0); a fail-soft probe on an unmapped
+    `thrdaddr` (`0x0000_0010`); and the headline
+    `Sandbox::load("msadds32.ax")` PE-load advance with a
+    negated-substring assert on the error message so any silent
+    forward progress in a sibling round shows up here.
+  - **Headline.**  `MPG4DS32.AX` (the DirectShow
+    MS-MPEG-4-v3 decoder filter; the round-44 critical
+    path) does NOT import `_beginthreadex` — only
+    `msadds32.ax` does — so no DirectShow / VfW decode metric
+    changes.  The win is exclusively in the splitter's
+    PE-load surface, which moves from "stuck at
+    `_beginthreadex`" to "stuck at `msvcrt!_ftol`" (the CRT
+    float-to-long conversion helper, MSDN-documented as
+    `long __cdecl _ftol(double)`).
+  - **Next-round blocker.**  Round 51 should add
+    `msvcrt!_ftol` (the CRT `double → long` truncation
+    helper invoked by codecs through `fld[m64] / call _ftol`
+    when the x87 implicit-rounding mode disagrees with the
+    target's truncation contract).  Implementation shape: pop
+    the x87 ST(0) double, truncate toward zero, return the
+    `i32` result in `eax` (the MSDN contract is `long`, which
+    is 32-bit on Win32 / MSVC).  cdecl no-arg, no callee-cleanup.
+  - Stub documented from the MSDN signature page only
+    (`learn.microsoft.com/.../beginthread-beginthreadex`);
+    no ReactOS / Wine / MinGW msvcrt source consulted.
+
 - Round 49 — **`msvcrt!_strnicmp` stub advances `msadds32.ax`
   PE-load past the splitter's case-insensitive bounded-compare
   edge.**  Round 48 wired `_endthreadex` and pinned the next
