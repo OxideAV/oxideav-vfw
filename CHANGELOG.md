@@ -8,6 +8,74 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 55 — **`msvcrt!{rand, srand}` real impl + seedable
+  `Sandbox` PRNG API for reproducible encode output.**  Round 52
+  pinned the next `msadds32.ax` PE-load blocker as `msvcrt!rand`;
+  round 55 wires both `rand` and the seed companion `srand` AND
+  exposes a host-side seedable PRNG API on `Sandbox` so callers
+  can drive the codec with a deterministic LCG sequence — a
+  one-time architectural addition that protects encode output
+  reproducibility against any future codec call that consults
+  `rand`.
+  - `src/win32/msvcrt.rs` — new `stub_rand` and `stub_srand`.
+    `int __cdecl rand(void)` implements MSVC's documented Knuth-
+    style linear-congruential generator:
+    `state = state * 214013 + 2531011 (mod 2^32)`,
+    `rand = (state >> 16) & 0x7FFF` (RAND_MAX = 0x7FFF).  The
+    multiplier (214013), increment (2531011), and output-bit
+    mask are public number-theory constants from many LCG
+    references (Knuth Vol. 2, Numerical Recipes table, …); no
+    Microsoft CRT source was consulted.  `void __cdecl
+    srand(unsigned int seed)` stores `seed` directly into the
+    same state field (no XOR / no scrambling — the documented
+    convention).  Both stubs are cdecl, `arg_dwords = 0`.
+    Reference: MSDN `rand` / `srand` topic pages
+    (`learn.microsoft.com/en-us/cpp/c-runtime-library/reference/rand`).
+  - `src/win32/mod.rs` — `HostState` grows a `rand_state: u32`
+    field, default `1` (MSVC's documented "no `srand` called
+    yet" initial state).  Both `stub_rand` / `stub_srand` and
+    the host-side `Sandbox` API read / write this single field,
+    so host-staged seeds and guest `srand` calls flow through
+    the same state.
+  - `src/runtime.rs` — three new public methods on `Sandbox`
+    (the user-requested architectural addition):
+    `with_rand_seed(seed) -> Self` (builder),
+    `set_rand_seed(&mut self, seed)` (runtime setter),
+    `rand_seed(&self) -> u32` (reader).  Documented contract:
+    two sandboxes seeded identically produce identical `rand`
+    sequences, which makes encode regression tests
+    deterministic across runs.
+  - `tests/round55_msvcrt_rand_seedable.rs` — 12 integration
+    tests pinning: both stubs registered; default-seed
+    reproducibility; same-seed reproducibility; different-seed
+    divergence; output bounded by RAND_MAX; 1000-sample bucket
+    coverage (rules out a degenerate / short-period LCG);
+    guest `srand` overrides host seed; host seed and guest
+    `srand` to the same value produce identical sequences;
+    known-vector LCG model match (first 16 outputs); `rand_seed`
+    read-back tracks the post-call state; `set_rand_seed`
+    mid-flight resets the sequence; round-55 headline
+    (`Sandbox::load("msadds32.ax")` advances past `rand`).
+  - `tests/round55_encode_determinism.rs` — end-to-end
+    validation of the seedable-Sandbox-API contract.  Builds
+    two sandboxes both `with_rand_seed(42)`, drives the
+    round-51 MP43 encode path with the same 176×144 BGR24
+    input, asserts encoded byte streams are **byte-for-byte
+    identical** (architectural contract verified).  Then
+    re-encodes at seed 43 and reports whether outputs differ:
+    **finding — mpg4c32 encode output is IDENTICAL at seed 42
+    vs seed 43 over the same input**.  The codec's VfW encode
+    path does not consult `msvcrt!rand`, so the architectural
+    addition is protection-only on this codec: it pins
+    reproducibility today (vacuously) and pre-empts any future
+    code path that introduces randomness.
+  - `README.md` — new "Reproducible encode" section showing the
+    builder + runtime-setter API surface and documenting the
+    `mpg4c32` empirical finding.
+  - **Next msadds32.ax PE-load blocker:** `msvcrt!_CIpow` (the
+    MSVC x87 helper for `pow(double, double)` with both args
+    on the x87 stack — same calling convention quirk as `_ftol`).
+
 - Round 54 — **AVI 1.0 muxer for vfw-encoded MSMPEG4 v3 output +
   `ffmpeg` cross-decode validation.**  Round 51 produced raw
   MSMPEG4 v3 elementary bytes that self-roundtrip at 27.83 dB

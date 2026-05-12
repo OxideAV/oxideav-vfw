@@ -9,6 +9,36 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 55 — `msvcrt!{rand, srand}` + seedable `Sandbox` PRNG
+API for reproducible encode output.**  Round 52 wired the real
+`msvcrt!_ftol` and pinned the next `msadds32.ax` PE-load blocker
+as `msvcrt!rand`; round 55 wires `rand` (MSVC's documented LCG:
+`state = state * 214013 + 2531011 (mod 2^32)`, output =
+`(state >> 16) & 0x7FFF` — public number-theory constants, no
+Microsoft CRT source consulted) plus the seed companion
+`srand`.  The headline architectural addition: a host-side
+seedable PRNG API on `Sandbox` —
+`with_rand_seed(seed) -> Self` (builder),
+`set_rand_seed(&mut self, seed)` (runtime setter), and
+`rand_seed(&self) -> u32` (reader).  Both the host API and the
+guest's own `msvcrt!srand` write to the same
+`HostState::rand_state` field, so the host can pin
+reproducibility before driving a codec while still observing
+whatever state the codec re-seeds itself to.  Default state is
+`1` (MSVC's documented "no `srand` called yet" initial value).
+**Round-55 encode-determinism finding:** at the SAME seed two
+sandboxes produce byte-for-byte identical encoded MP43 streams
+(architectural contract verified), AND at DIFFERENT seeds the
+encoded streams are STILL identical — `mpg4c32`'s VfW encode
+path does not consult `msvcrt!rand`, so the seedable API is
+protection-only on this codec today (pins reproducibility
+vacuously, pre-empts any future codec path that introduces
+randomness).  After round 55, `Sandbox::load("msadds32.ax")`
+advances past `rand` and now stops at the next unresolved
+import: `msvcrt!_CIpow`.  See
+`tests/round55_msvcrt_rand_seedable.rs` +
+`tests/round55_encode_determinism.rs`.
+
 **Round 54 — AVI 1.0 muxer for vfw-encoded MSMPEG4 v3 output +
 `ffmpeg` cross-decode validation lights up green.**  Round 51
 produced raw MSMPEG4 v3 elementary bytes that self-roundtrip at
@@ -610,6 +640,50 @@ This round delivers:
 Round 2 will add: MMX ISA + the `vfw32` stubs (`ICOpen` /
 `ICDecompress*` / `ICClose` / `ICGetInfo`) + cdecl plumbing,
 and a "decode one Cinepak frame" end-to-end test.
+
+## Reproducible encode
+
+Codecs that consult `msvcrt!rand` during encode produce different
+bytes on every invocation by default — fine for runtime output,
+hostile for regression tests, golden-file diffs, and bug repros.
+Round 55 adds a host-side seedable PRNG API on `Sandbox` so the
+host can pin the codec to a deterministic state before driving
+encode:
+
+```rust
+use oxideav_vfw::Sandbox;
+
+// Builder style — most common: seed the sandbox before `load`.
+let mut sb = Sandbox::new().with_rand_seed(42);
+// ... sb.load("codec.dll", &bytes)?; sb.ic_compress(...) ...
+
+// Runtime mutation — useful for fuzzing / regression sweeps.
+sb.set_rand_seed(0x1234_5678);
+
+// Read back whatever state the host or the codec last set.
+let s = sb.rand_seed();
+```
+
+The host API and the guest's own `msvcrt!srand` call both write
+the same `HostState::rand_state` field.  That means: (a) two
+sandboxes seeded identically and driven over the same input
+produce identical `msvcrt!rand` sequences (and, transitively,
+identical encoded streams if the codec consults `rand`); and
+(b) if the codec re-seeds itself via `srand` at any point, the
+host can observe the new state through `rand_seed()`.
+
+Default state is `1` — MSVC's documented "no `srand` called
+yet" initial value — so omitting the seed call still gives
+deterministic-across-runs behaviour, as long as the codec
+itself does not call `srand` with a time / tickcount-derived
+value internally.
+
+Empirical finding for `mpg4c32.dll` (MS-MPEG-4 v3): the VfW
+encode path does NOT consult `msvcrt!rand`, so encoded output
+is deterministic regardless of seed.  The seedable API is
+protection-only on this codec today; it pre-empts any future
+codec path that introduces randomness.  See
+`tests/round55_encode_determinism.rs`.
 
 ## Why this exists
 

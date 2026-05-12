@@ -201,6 +201,39 @@ pub fn register(registry: &mut Registry) {
     // 2018-edition semantics; we still range-check explicitly so
     // the NaN branch returns `i32::MIN` deterministically.
     registry.register("msvcrt.dll", "_ftol", stub_ftol as StubFn, 0);
+
+    // ---- Round-55 addition: msadds32.ax PE-load surface --------
+    //
+    // After r52 (`_ftol`) the splitter's msvcrt import walk advances
+    // to `msvcrt!rand` (and its seed companion `msvcrt!srand`).  Per
+    // MSDN (`rand`, `srand`):
+    //
+    //   int   __cdecl rand(void)            — RAND_MAX = 0x7FFF.
+    //   void  __cdecl srand(unsigned int seed)
+    //
+    // MSVC implements `rand` as a linear-congruential generator with
+    // the standard Knuth-style parameters (multiplier 214013, increment
+    // 2531011, mod 2^32), returning the middle 15 bits as the output:
+    //
+    //   state = state * 214013 + 2531011   (mod 2^32)
+    //   rand  = (state >> 16) & 0x7FFF
+    //
+    // The multiplier / increment / output-bit mask are public number-
+    // theory constants found in many textbook LCG tables; no Microsoft
+    // CRT source was consulted.
+    //
+    // Wiring the seed at the [`HostState`] level (`HostState::rand_state`)
+    // gives the host control over reproducibility: a `Sandbox` seeded
+    // identically twice will produce identical `rand` sequences, which
+    // matters for encode-regression tests, fuzzing, and bug repros.
+    // The seed defaults to 1 (MSVC's documented "no `srand` called yet"
+    // state).  The guest's own `srand(s)` call overwrites the same
+    // field, so the host can observe what the codec did to the state
+    // via [`crate::Sandbox::rand_seed`].
+    //
+    // Both stubs are cdecl: caller-cleanup, `arg_dwords = 0`.
+    registry.register("msvcrt.dll", "rand", stub_rand as StubFn, 0);
+    registry.register("msvcrt.dll", "srand", stub_srand as StubFn, 0);
 }
 
 /// `void* operator new(size_t)` (Microsoft mangling
@@ -817,6 +850,74 @@ fn stub_ftol(
         f as i32
     };
     Ok(v as u32)
+}
+
+/// `int __cdecl rand(void)` — MSVC-CRT-compatible LCG.
+///
+/// Per MSDN (`rand`): "The `rand` function returns a pseudorandom
+/// integer in the range 0 to `RAND_MAX` (32767).  Use the `srand`
+/// function to seed the pseudorandom-number generator before
+/// calling `rand`."
+///
+/// MSVC implements `rand` with a Knuth-style linear-congruential
+/// generator.  The multiplier / increment / output-bit mask are
+/// public number-theory constants from countless LCG references;
+/// no Microsoft CRT source was consulted:
+///
+/// ```text
+/// state = state * 214013 + 2531011   (mod 2^32)
+/// rand  = (state >> 16) & 0x7FFF      (the middle 15 bits)
+/// ```
+///
+/// Seeding contract: the LCG state lives at
+/// [`HostState::rand_state`].  Both this stub and `srand` write
+/// the same field, so the host can seed the sandbox before
+/// `Sandbox::load` for reproducible output, and the codec can
+/// re-seed at any time via its own `srand` call.  Default state
+/// is `1` — MSVC's documented "no `srand` called yet" initial
+/// value.
+///
+/// cdecl: caller-cleanup, no args on the stack — `arg_dwords = 0`.
+fn stub_rand(
+    _cpu: &mut Cpu,
+    _mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    state.rand_state = state.rand_state.wrapping_mul(214013).wrapping_add(2531011);
+    let r = (state.rand_state >> 16) & 0x7FFF;
+    Ok(r)
+}
+
+/// `void __cdecl srand(unsigned int seed)` — seeds the MSVC LCG.
+///
+/// Per MSDN (`srand`): "Sets the starting seed value for the
+/// pseudorandom number generator.  Subsequent calls to `rand` use
+/// the new seed value to generate the sequence."  The MSVC
+/// implementation stores `seed` directly into the LCG state
+/// (no XOR / no scrambling) — a public, observable convention
+/// derived from the documented "`rand` is a Knuth-LCG" contract,
+/// no MS CRT source consulted.
+///
+/// Writing to [`HostState::rand_state`] keeps the host-side seed
+/// API and the guest-side `srand` call on the same field — the
+/// host can call [`crate::Sandbox::set_rand_seed`] to force a
+/// known state before driving the codec, and the codec's own
+/// `srand` will overwrite it.  Either way,
+/// [`crate::Sandbox::rand_seed`] reports the current value.
+///
+/// cdecl: caller-cleanup, one dword on the stack —
+/// `arg_dwords = 0`.  Returns 0 (void function; `eax` is
+/// unspecified per the MSDN contract).
+fn stub_srand(
+    cpu: &mut Cpu,
+    mmu: &mut Mmu,
+    state: &mut HostState,
+    _registry: &Registry,
+) -> Result<u32, Win32Error> {
+    let seed = arg_dword(cpu, mmu, 0).map_err(|t| trap("srand", t))?;
+    state.rand_state = seed;
+    Ok(0)
 }
 
 fn trap(stub: &'static str, t: crate::emulator::Trap) -> Win32Error {

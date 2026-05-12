@@ -226,6 +226,22 @@ pub struct HostState {
     /// table so a missing `Release` surfaces as a non-zero
     /// `total_refcount()` at end-of-test.
     pub com: crate::com::ComObjectTable,
+    /// Round 55 — PRNG state for `msvcrt!rand` calls from
+    /// sandboxed codec code.  Default `1` matches MSVC's
+    /// documented "no `srand` called yet" initial state.
+    /// Updated by both `msvcrt!srand(seed)` (from guest code)
+    /// and by `Sandbox::set_rand_seed` / `with_rand_seed` (from
+    /// host code) — they share the same field so the host can
+    /// observe what the codec did to the state, and the codec
+    /// can override the host-staged seed via its own `srand`.
+    /// LCG step (Knuth-style, mod 2^32, output bits 30..16
+    /// masked to 15 bits per MSVC's documented contract):
+    ///
+    /// ```text
+    /// state = state * 214013 + 2531011  (mod 2^32)
+    /// rand  = (state >> 16) & 0x7FFF
+    /// ```
+    pub rand_state: u32,
 }
 
 impl HostState {
@@ -266,6 +282,10 @@ impl HostState {
             loaded_drivers: std::collections::BTreeSet::new(),
             module_resource_dirs: BTreeMap::new(),
             com: crate::com::ComObjectTable::new(),
+            // MSVC documents the C standard's "no `srand` called yet"
+            // initial state as `state = 1`.  See round 55 + the
+            // `rand_state` field doc comment for the LCG contract.
+            rand_state: 1,
         }
     }
 

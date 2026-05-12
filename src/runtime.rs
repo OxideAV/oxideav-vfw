@@ -143,6 +143,55 @@ impl Sandbox {
         }
     }
 
+    /// Builder-style seed setter for the `msvcrt!rand` LCG.
+    ///
+    /// PRNG state for `msvcrt!rand` calls from sandboxed codec
+    /// code.  Default `1` matches MSVC's documented "no `srand`
+    /// called yet" initial value.  Set via `with_rand_seed` /
+    /// `set_rand_seed` for reproducible encode output: two
+    /// sandboxes seeded identically produce identical `rand`
+    /// sequences, which makes encode regression tests
+    /// deterministic across runs.
+    ///
+    /// The guest's own `msvcrt!srand(seed)` call writes to the
+    /// same field, so the codec may re-seed at any time; in that
+    /// case [`Self::rand_seed`] will report whatever value the
+    /// codec last installed.
+    ///
+    /// Round 55.
+    pub fn with_rand_seed(mut self, seed: u32) -> Self {
+        self.host.rand_state = seed;
+        self
+    }
+
+    /// Set the `msvcrt!rand` LCG state at runtime.
+    ///
+    /// Same contract as [`Self::with_rand_seed`], but mutates an
+    /// already-constructed sandbox — useful for tests that drive
+    /// multiple encode runs with different seeds, or for fuzzing
+    /// harnesses that want to force the codec into a known state
+    /// before each iteration.
+    ///
+    /// Round 55.
+    pub fn set_rand_seed(&mut self, seed: u32) {
+        self.host.rand_state = seed;
+    }
+
+    /// Read the current `msvcrt!rand` LCG state.
+    ///
+    /// Reflects whatever the host or the guest last wrote: a
+    /// fresh sandbox returns `1` (MSVC's documented "no `srand`
+    /// called yet" initial value); after host
+    /// [`Self::set_rand_seed`] / [`Self::with_rand_seed`] returns
+    /// that value; after a guest `msvcrt!srand(s)` call returns
+    /// `s`; after any number of `msvcrt!rand` calls returns the
+    /// post-step LCG state.
+    ///
+    /// Round 55.
+    pub fn rand_seed(&self) -> u32 {
+        self.host.rand_state
+    }
+
     /// Load a PE32 DLL from `bytes`, mapping it into the
     /// sandbox's MMU. The returned [`Image`] holds the entry
     /// point + export table.
