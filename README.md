@@ -9,6 +9,29 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 61 — `msadds32.ax` input-pin `IMemAllocator` handshake
+fully lands `S_OK` on every step
+(`GetAllocator → SetProperties → Commit → NotifyAllocator`).**
+Round 60 closed by demonstrating
+`IMemInputPin::Receive(WMA2 bytes)` returns
+`VFW_E_NOT_COMMITTED` (`0x80040209`).  Round 61 replays the
+round-25..43 handshake the video path established for
+`mpg4ds32.ax`, now for the audio splitter: `GetAllocator`
+surfaces the codec's own preferred allocator pointer;
+`SetProperties(cBuffers=4, cbBuffer=8192, cbAlign=1,
+cbPrefix=0)` + `Commit()` on that allocator return `S_OK`;
+`NotifyAllocator(alloc, FALSE)` also returns `S_OK`.  Phase 5
+empirically established that the codec's audio decode path
+ALSO requires its OUTPUT pin to be connected to a downstream
+`IMemInputPin` (analogous to the round-31 video path) — driving
+`IPin::ReceiveConnection` on the output pin with a PCM
+`WAVEFORMATEX` (mono 44.1 kHz 16-bit) returns `HRESULT
+0x00000000`.  After this connection, `Receive` no longer
+returns `VFW_E_NOT_COMMITTED`; it now traps with a memory
+fault at `0x00000020` (page unmapped) — round 62's blocker, a
+NULL field deref deeper in the codec's decode path.  5-test
+harness in `tests/round61_msadds32_allocator_handshake.rs`.
+
 **Round 60 — `IPin::ReceiveConnection` now returns `S_OK` against
 the real `msadds32.ax` audio splitter for criteria-passing WMA1
 and WMA2 `AM_MEDIA_TYPE`s.**  Round 59 closed by observing

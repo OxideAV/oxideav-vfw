@@ -8,6 +8,64 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 61 — **`msadds32.ax` input-pin `IMemAllocator` handshake
+  lands `S_OK` on every step
+  (`GetAllocator → SetProperties → Commit → NotifyAllocator`).**
+  Round 60 closed by demonstrating
+  `IMemInputPin::Receive(WMA2 bytes)` returns
+  `VFW_E_NOT_COMMITTED` (`0x80040209`) because the codec's
+  preferred allocator was still in the *decommitted* state.
+  Round 61 replays the round-25..43 handshake the video path
+  established for `mpg4ds32.ax`, now for the audio splitter:
+  - `IMemInputPin::GetAllocator(&ppAllocator)` →
+    `HRESULT 0x00000000`, `*ppAllocator = 0x60000650`
+    (`msadds32` exposes its own preferred allocator).
+  - `IMemInputPin::GetAllocatorRequirements(&props)` →
+    `E_NOTIMPL (0x80004001)` (codec accepts whatever the
+    upstream offers).
+  - `IMemAllocator::SetProperties(cBuffers=4, cbBuffer=8192,
+    cbAlign=1, cbPrefix=0)` on the codec's allocator →
+    `HRESULT 0x00000000`, request mirrored verbatim into
+    `pActual`.
+  - `IMemAllocator::Commit()` on the codec's allocator →
+    `HRESULT 0x00000000`.
+  - `IMemInputPin::NotifyAllocator(alloc, FALSE)` →
+    `HRESULT 0x00000000`.
+  - Per-`HostState` `SetProperties` capture log
+    (`oxideav_vfw::com::all_set_properties`) records 1 entry
+    after the handshake — our own call, which the codec did
+    not intercept or re-shape.
+  - **Phase 5 BREAKTHROUGH** — empirically established that
+    the codec's audio decode path requires its OUTPUT pin to
+    be connected to a downstream `IMemInputPin` (analogous to
+    the round-31 video path).  Driving
+    `IPin::ReceiveConnection` on the codec's output pin with
+    a PCM `WAVEFORMATEX` (mono 44.1 kHz 16-bit, no extradata)
+    + the round-31 host downstream pair returns
+    `HRESULT 0x00000000` — the codec accepts PCM as its
+    downstream format.  After this connection, post-handshake
+    `IMemInputPin::Receive` no longer surfaces
+    `VFW_E_NOT_COMMITTED`; it now traps with a memory fault
+    at `0x00000020` (page unmapped).  This is the round-62
+    blocker: a NULL field dereference inside the codec's
+    decode path, likely a missing import or a needed
+    pre-`Receive` setup step (e.g., `IPin::EndOfStream` /
+    `NewSegment` to seed the bitstream parser).
+  - 5-test harness in
+    `tests/round61_msadds32_allocator_handshake.rs` (phases 1
+    discovery, 2 full handshake assertion, 3 receive
+    observation, 4 SetProperties capture, 5 output-pin
+    connect probe).  Every phase is replayable against the
+    live splitter and records its empirical reaction on
+    stderr for r62 baselining.
+  - No new emulator scaffolding was needed — the
+    `HostIMemAllocator` + Commit/Decommit state machine + 96-byte
+    layout established for video in rounds 30–43 generalises
+    cleanly to the audio path.  Clean-room methodology
+    preserved: MSDN `IMemAllocator` / `IMemInputPin`
+    documentation + COM IUnknown ABI only; no Wine /
+    ReactOS / Microsoft DShow base-class source consulted.
+
 - Round 60 — **`IPin::ReceiveConnection` now returns `S_OK` against
   the real `msadds32.ax` audio splitter for criteria-passing
   WMA1 and WMA2 `AM_MEDIA_TYPE`s.**  Round 59 closed by observing
