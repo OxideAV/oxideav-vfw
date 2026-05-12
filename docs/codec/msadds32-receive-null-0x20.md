@@ -225,33 +225,132 @@ pointer.  That suggests either the codec's `NewSegment` slot is
 not at 17 on this binary OR the rate parameter encoding our
 test uses doesn't match what the codec expects.
 
-## Round-63 blocker
+## Round 63 — resolution
 
-The next round needs to do one of:
+The size-0 chain was pinned to `helper_addref` (RVA `0x5cea`)
+returning 0 on a fresh codec instance.  Round-63 disassembly
+recovered both helper functions exhaustively:
 
-1. **Pin the value of `edi_addref_result` at populator entry
-   under our run**, then identify why
-   `(edi_addref_result * 10) / helper(...)` is rounding to 0.
-   This likely requires either:
-   - Inspecting `this->helper_90` and `this->helper_90 + 0x1c`
-     to see whether the helper object was properly initialised
-     by `JoinFilterGraph` / `Pause`.
-   - Disassembling `helper_addref` (RVA 0x5ce8) and `helper`
-     (RVA 0x6ceb) to understand exactly what they compute.
-2. **Drive `NewSegment` correctly** — verify the codec's
-   IPin vtable has NewSegment at slot 17 (not at some non-
-   standard index) and pass the args with the exact codec-
-   expected encoding (REFERENCE_TIME LONGLONG + double).
-3. **Pre-seed the codec's `this[0x160]` LIFO head** with a
-   host-minted node so the populator's POP path bypasses the
-   malloc+init failure entirely.  Note this only fixes one of
-   two simultaneous NULL fields (the `[esi+0x160]` read at the
-   trap site), not the `[ecx]` read where ecx is the caller's
-   out-slot — so additional wiring is needed to ensure the
-   populator's POP also writes that slot.
+### `helper_size_calc` (RVA `0x6ced..0x6d92`)
 
-The forensics test harness in
-`tests/round62_msadds32_null_0x20_forensics.rs` captures the
-trap state + disassembly windows + IAT resolution + visited-EIP
-set for the receive body, so each subsequent round can replay
-without re-disassembling from raw bytes.
+```text
+0x6ced: 55              push ebp
+0x6cee: 8b ec           mov  ebp, esp
+0x6cf0: 8b 45 18        mov  eax, [ebp+0x18]    ; eax = kind  (arg4)
+0x6cf3: 57              push edi
+0x6cf4: 8b 7d 08        mov  edi, [ebp+0x08]    ; edi = sps   (arg0)
+0x6cf7: f7 d8           neg  eax
+0x6cf9: 1b c0           sbb  eax, eax           ; eax = -1 if kind!=0 else 0
+0x6cfb: 83 e0 1f        and  eax, 0x1f          ; eax = 0x1f if kind!=0 else 0
+0x6cfe: 40              inc  eax                ; eax = base (1 or 32)
+
+0x6cff..0x6d49:  sps-tier branch ladder (see below) → eax = base << shift
+
+0x6d4a: 8b c8           mov  ecx, eax           ; ecx = frame_samples
+0x6d4c: 8b c7           mov  eax, edi           ; eax = sps
+0x6d4e: 99              cdq                     ; (sps is positive, edx=0)
+0x6d4f: 2b c2           sub  eax, edx
+0x6d51: 56              push esi
+0x6d52: 8b f0           mov  esi, eax           ; esi = sps
+0x6d54: 8b c1           mov  eax, ecx
+0x6d56: 0f af 45 0c     imul eax, [ebp+0x0c]    ; eax = frame_samples * (wbps*sps)
+0x6d5a: d1 fe           sar  esi, 1             ; esi = sps/2  (rounding)
+0x6d5c: 03 c6           add  eax, esi
+0x6d5e: 33 d2           xor  edx, edx
+0x6d60: f7 f7           div  edi                ; eax = (frame_samples*wbps + sps/2)
+                                                ;       *= sps / sps = frame_samples*wbps
+0x6d62: 83 c0 07        add  eax, 7
+0x6d65: c1 e8 03        shr  eax, 3             ; eax = ceil(byte_count/8)
+0x6d68: 83 f8 01        cmp  eax, 1
+0x6d6b: 77 1c           ja   0x6d89             ; if byte_count >= 16 → done
+0x6d6d: 85 c0           test eax, eax
+0x6d6f: 75 18           jnz  0x6d89             ; if byte_count >= 8  → done
+
+0x6d71..0x6d87:  doubling loop — frame_samples *= 2 until byte_count >= 8
+
+0x6d89: 8b c1           mov  eax, ecx           ; return frame_samples (NOT bytes)
+0x6d8b: 5e              pop  esi
+0x6d8c: eb 02           jmp  0x6d90
+0x6d8e: 33 c0           xor  eax, eax           ; sps > 48000 early-return path
+0x6d90: 5f 5d           pop  edi, pop ebp
+0x6d92: c2 14 00        ret  0x14               ; 5 stdcall args × 4 bytes
+```
+
+Sample-rate / channel-count tier ladder at `0x6cff..0x6d49`:
+
+| `sps` range       | extra condition | `shift` | `frame_samples` (kind=2) |
+|-------------------|-----------------|---------|--------------------------|
+| `≤ 8000`          | —               | 9       | 16 384                   |
+| `8001..11025`     | —               | 9       | 16 384                   |
+| `11026..16000`    | —               | 9       | 16 384                   |
+| `16001..22050`    | —               | 10      | 32 768                   |
+| `22051..32000`    | `ch == 1`       | 10      | 32 768                   |
+| `22051..32000`    | `ch != 1`       | 11      | 65 536                   |
+| `32001..44100`    | —               | 11      | 65 536                   |
+| `44101..48000`    | —               | 11      | 65 536                   |
+| `> 48000`         | —               | —       | early-return `eax = 0`   |
+
+For the round-62 WMA2 AMT (`sps=44100, wbps=16, ch=1, kind=2`):
+`frame_samples = 65536`.
+
+### `helper_addref` (RVA `0x5cea..0x5cf6`)
+
+```text
+0x5cea: 83 79 20 00     cmp [ecx+0x20], 0       ; "initialised" flag
+0x5cee: 74 04           jz  0x5cf4
+0x5cf0: 8b 41 28        mov eax, [ecx+0x28]     ; cached value
+0x5cf3: c3              ret
+0x5cf4: 33 c0           xor eax, eax            ; uninitialised → return 0
+0x5cf6: c3              ret
+```
+
+A trivial getter.  The matching setter at `0x5cf7..0x5d12`:
+
+```text
+0x5cf7: 8b 44 24 04     mov eax, [esp+4]
+0x5cfb: 85 c0           test eax, eax
+0x5cfd: 75 07           jnz +7
+0x5cff: e8 0f 00 00 00  call <err helper>
+0x5d04: eb 0a           jmp +0xa
+0x5d06: c7 41 20 01 00 00 00  mov [ecx+0x20], 1 ; flag = 1
+0x5d0d: 89 41 28        mov [ecx+0x28], eax    ; cached = arg
+0x5d10: c2 04 00        ret 4
+```
+
+So the `[+0x20]` flag is normally set during the codec's
+`JoinFilterGraph` / `Pause` initialisation — when the codec
+itself calls `set_value(helper, n)` with a positive `n` derived
+from its run-state machinery.  Our scaffold does not drive that
+path, hence the field stays zero on a fresh instance.
+
+### Workaround
+
+Round 63 lands [`Sandbox::msadds32_patch_helper_addref`] which
+overwrites the first 6 bytes of `helper_addref` with
+`mov eax, imm32; ret` (encoding `b8 XX XX XX XX c3`).  Patching
+with any `value ≥ 6554` (so `(value * 10) / 65536 ≥ 1`)
+empirically clears the LIFO-push trap and lets `Receive` run to
+completion.  The HRESULT changes from a memory fault at
+`0x00000020` to `0x8000ffff` (E_UNEXPECTED from the codec's
+inner decode body) — the round-64 investigation surface.
+
+### Round-64 hand-off
+
+The patch is a debugging workaround.  Round 64 should either:
+
+1. **Drive the proper init path** — identify which call (likely
+   `JoinFilterGraph`, `Pause`, or an
+   `IFilterGraph`-time setup hook) prompts the codec to call its
+   own `set_value(helper, n)` and wire that on our side so the
+   `helper_struct[+0x20]` flag is set without a guest-byte patch.
+   Retire the workaround once driven.
+2. **Push past the `0x8000ffff` exit** — with the trap lifted,
+   the next blocker is whatever the codec's inner decode body
+   complains about.  Capture the new failure site (probably
+   a different RVA or a different out-of-band parameter the
+   inner decoder requires).
+
+The round-63 test harness in
+`tests/round63_msadds32_buffer_size_calc.rs` pins both the
+formula (phase-1/2) and the cleared trap (phase-4/5) so the next
+round can replay without re-disassembling.

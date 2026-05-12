@@ -1010,6 +1010,80 @@ impl Sandbox {
             prev_bytes_opt,
         )
     }
+
+    /// Round 63 — patch `msadds32.ax`'s `helper_addref` thunk (at
+    /// RVA `0x5cea`) to unconditionally return `value` (32-bit
+    /// integer).
+    ///
+    /// **Why.** Round-62 forensics
+    /// (`docs/codec/msadds32-receive-null-0x20.md`) traced the
+    /// `IMemInputPin::Receive` NULL-deref trap at RVA `0x256a` to
+    /// a buffer-pool init that's handed a size of zero.  The size
+    /// is `(h * 10) / size_calc(...)` where `h` is what
+    /// `helper_addref` returns.  On a fresh codec instance the
+    /// helper-object field at `helper_90 + 0x3c` (the "initialised"
+    /// flag the addref checks) is zero, so `helper_addref` returns
+    /// `0`, the quotient is `0`, `operator new(0)` returns NULL,
+    /// `buffer_pool_init` fails, and the Receive cleanup branch
+    /// trips a NULL+0x20 deref.
+    ///
+    /// In a real DirectShow host the flag is set during
+    /// `IFilterGraph::JoinFilterGraph` / `Pause` (the codec stamps
+    /// the field as part of its run-state machine).  Until we
+    /// drive that path, the surgical workaround is to short-circuit
+    /// `helper_addref` to return a fixed non-zero value — which
+    /// empirically lifts the trap and lets Receive run to
+    /// completion (with HRESULT `0x8000ffff` from the decode body,
+    /// which is the next round's investigation surface).
+    ///
+    /// **Encoding.** The original function (RVA `0x5cea`, 10 bytes)
+    /// is:
+    ///
+    /// ```text
+    /// 0x5cea: 83 79 20 00  cmp [ecx+0x20], 0
+    /// 0x5cee: 74 04        jz  +4
+    /// 0x5cf0: 8b 41 28     mov eax, [ecx+0x28]
+    /// 0x5cf3: c3           ret
+    /// 0x5cf4: 33 c0        xor eax, eax
+    /// 0x5cf6: c3           ret
+    /// ```
+    ///
+    /// We overwrite the first 6 bytes with:
+    ///
+    /// ```text
+    /// b8 XX XX XX XX  mov eax, imm32
+    /// c3              ret
+    /// ```
+    ///
+    /// The remaining bytes at `0x5cf0..0x5cf6` are unreachable
+    /// after the patch (no caller enters there directly), so the
+    /// dead-code is harmless.
+    ///
+    /// `image_base` is the address the codec was loaded at; pass
+    /// the value returned by [`Self::load`] on `msadds32.ax`.
+    ///
+    /// # Reference material (clean-room only)
+    ///
+    /// * Intel SDM Vol. 2A — `MOV imm32` (`B8+rd`), `RET` (`C3`).
+    /// * Raw bytes of `msadds32.ax` from
+    ///   `docs/video/msmpeg4/reference/binaries/wmpcdcs8-2001/`.
+    ///
+    /// No Wine / ReactOS / MinGW / Microsoft DShow source consulted.
+    pub fn msadds32_patch_helper_addref(
+        &mut self,
+        image_base: u32,
+        value: u32,
+    ) -> Result<(), crate::Error> {
+        const RVA_HELPER_ADDREF: u32 = 0x5cea;
+        let va = image_base.wrapping_add(RVA_HELPER_ADDREF);
+        let mut patch = [0u8; 6];
+        patch[0] = 0xb8; // mov eax, imm32
+        patch[1..5].copy_from_slice(&value.to_le_bytes());
+        patch[5] = 0xc3; // ret
+        self.mmu
+            .write_initializer(va, &patch)
+            .map_err(crate::Error::Trap)
+    }
 }
 
 #[cfg(test)]

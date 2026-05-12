@@ -9,6 +9,47 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 63 — `msadds32.ax` `IMemInputPin::Receive` NULL+0x20 trap
+cleared by a surgical clean-room workaround.**  Round 62 narrowed
+the trap chain to `populator → buffer_pool_init →
+operator_new(0)` where the zero size came from `(h * 10) /
+size_calc` and `h` was what `helper_addref` (RVA `0x5cea`)
+returned on a fresh codec instance.  Round 63 disassembles
+`helper_size_calc` (RVA `0x6ced..0x6d92`) and `helper_addref` end-
+to-end against Intel SDM Vol. 2 + raw `msadds32.ax` bytes (no
+Wine / ReactOS / Microsoft DShow base-class source consulted) and
+confirms:
+
+  - `helper_size_calc(sps, wbps*sps, ch, kind)` returns a
+    `frame_samples` value of `(kind == 0 ? 1 : 32) << shift` where
+    `shift ∈ {9,10,11}` against the sample-rate tier boundaries
+    `{8000, 11025, 16000, 22050, 32000, 44100, 48000}`, with a
+    doubling-loop tail that ensures the per-frame byte count is at
+    least 8.  For the round-62 WMA2 AMT the result is `65536`.
+  - `helper_addref` is a 13-byte getter that returns
+    `helper_struct[+0x28]` only if the `[+0x20]` "initialised" flag
+    is set; on a fresh codec instance both are zero, so the
+    populator's quotient rounds to 0.  Real DirectShow hosts set
+    the flag during `JoinFilterGraph` / `Pause`, which our scaffold
+    does not yet drive.
+  - `Sandbox::msadds32_patch_helper_addref(image_base, value)`
+    surgically overwrites the first 6 bytes of `helper_addref` with
+    `mov eax, imm32; ret`.  Patching with any `value ≥ 6554`
+    empirically clears the trap and lets `Receive` run to
+    completion: the HRESULT changes from a memory fault at
+    `0x00000020` to `0x8000ffff` (E_UNEXPECTED, from the inner
+    decode body) — round 64's investigation surface.
+
+7-test harness at `tests/round63_msadds32_buffer_size_calc.rs`
+pins both the disassembly and the cleared-trap behaviour;
+forensics writeup updated at
+`docs/codec/msadds32-receive-null-0x20.md`.  Round-64 hand-off:
+either drive the real `JoinFilterGraph`/`Pause` path so
+`helper_struct[+0x20]` and `[+0x28]` are initialised by the codec
+itself (retiring the workaround), or push past the
+`0x8000ffff` exit and identify what the codec's inner decode
+body needs that we still aren't supplying.
+
 **Round 62 — clean-room forensics on the `msadds32.ax`
 `IMemInputPin::Receive` NULL+0x20 trap.**  Round 61 closed by
 observing a memory fault at `0x00000020` after the full

@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 63 — **`msadds32.ax` `IMemInputPin::Receive` NULL+0x20 trap
+  resolved by clean-room workaround for the missing `helper_addref`
+  initialisation.**  Round 62 traced the trap chain to
+  `populator → buffer_pool_init → operator_new(0)`, where the
+  zero size comes from `(h * 10) / size_calc` and `h` is what
+  `helper_addref` (RVA `0x5cea`) returns on a fresh codec instance.
+  Round 63 disassembles `helper_size_calc` (RVA `0x6ced..0x6d92`)
+  and `helper_addref` end-to-end against Intel SDM Vol. 2 + the raw
+  bytes of `msadds32.ax`:
+  - **`helper_size_calc` formula**: `frame_samples = (kind == 0 ? 1 : 32) << shift`
+    where `shift ∈ {9, 10, 11}` is a sample-rate / channel-count
+    lookup against the tier boundaries
+    `{8000, 11025, 16000, 22050, 32000, 44100, 48000}`, followed by
+    a doubling loop that ensures `(frame_samples * wbps + sps/2) / sps ≥ 8`.
+    For the round-62 WMA2 AMT (sps=44100, wbps=16, ch=1, kind=2)
+    this returns `65536`.
+  - **`helper_addref` body** (`0x5cea..0x5cf6`, 13 bytes):
+    `cmp [ecx+0x20], 0; jz +4; mov eax, [ecx+0x28]; ret; xor eax,eax; ret`.
+    A trivial getter — returns `helper_struct[+0x28]` if the
+    `[+0x20]` "initialised" flag is set, else returns 0.  On a
+    fresh codec instance both fields are zero, so `h = 0`,
+    `(0 * 10) / 65536 = 0`, `operator_new(0)` returns NULL,
+    `buffer_pool_init` fails, and Receive trips the LIFO-push trap.
+    Real DirectShow hosts set the flag during
+    `IFilterGraph::JoinFilterGraph` / `Pause`, which our scaffold
+    doesn't yet wire.
+  - **Surgical workaround**:
+    [`Sandbox::msadds32_patch_helper_addref`] overwrites the first
+    6 bytes of `helper_addref` with
+    `b8 XX XX XX XX c3` (`mov eax, imm32; ret`) so `helper_addref`
+    unconditionally returns the caller-supplied value.  Patching
+    with any `value ≥ 6554` empirically clears the trap and lets
+    Receive run to completion: HRESULT changes from a
+    `memory fault at 0x00000020` to `0x8000ffff` (E_UNEXPECTED
+    from the inner decode body), which is the round-64
+    investigation surface.
+  - **Test harness** at `tests/round63_msadds32_buffer_size_calc.rs`
+    pins both the disassembly (`phase1*`), the formula
+    (`phase2*`), the codec's helper-state at construction
+    (`phase3_inspect_helper_state_before_receive`), and the
+    cleared trap on patched runs (`phase4_patch_helper_addref_panel`
+    + `phase5_regression_guard`).
+  - Forensics writeup updated in
+    `docs/codec/msadds32-receive-null-0x20.md` to document the
+    resolved formula and the round-64 hand-off (drive the proper
+    initialisation path so the workaround can be retired).
 - Round 62 — **clean-room forensics on the `msadds32.ax`
   `IMemInputPin::Receive` NULL+0x20 trap that closed round 61.**
   Round 61's phase 5 surfaced a memory fault at `0x00000020`
