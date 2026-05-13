@@ -9,6 +9,29 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 66 — MS-MPEG-4 v3 LUT-read trace corpus committed;
+workspace task #303 unblocked for the docs collaborator.**
+Round 66 walks `mpg4c32.dll`'s `.data` section against the
+Microsoft PE/COFF spec, identifies 13 candidate VLC / scan-
+permutation LUT regions (~32 KB of bytes), arms `Sandbox::watch`
+on every region, and drives the full 10-fixture MS-MPEG-4 v3
+corpus through `ic_decompress`.  10 per-fixture JSONL trace
+artifacts now committed at
+`docs/codec/msmpeg4-traces/<fixture>.jsonl[.gz]`.  **Empirical
+finding**: the MP43 decode hot loop reads ONLY from the small
+scan-permutation tables at RVAs `0x57860` / `0x58230` /
+`0x5844c` (85.7 % / 94.1 % / 95.9 % coverage); the two big AC-
+coefficient LUTs at `0x4f938` (16 376 B) and `0x545c0` (12 288 B)
+are NEVER touched at decode time across any fixture — meaning
+the codec's entropy-decode hot loop either reconstructs symbols
+arithmetically inline (G0..G3 then live in `.text` at EIPs
+`0x16e42` / `0x15f33` / `0x16ea8` / `0x16f2f`), or memcpys the
+tables into heap at init.  Section map at
+`docs/codec/msmpeg4-mpg4c32-rdata-map.md`; trace-dir contract
+at `docs/codec/msmpeg4-traces/README.md`; regenerator binary at
+`examples/gen_msmpeg4_traces.rs`; regression-guard at
+`tests/round66_msmpeg4_trace_corpus.rs`.
+
 **Round 65 — `msadds32.ax` `IBaseFilter::JoinFilterGraph` driven
 before `Pause`; round-64 candidate (1) FALSIFIED.**  The codec
 ACCEPTS our host `IFilterGraph` back-pointer (JoinFilterGraph and

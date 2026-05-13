@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 66 — **MS-MPEG-4 v3 trace artifacts unblocking the
+  msmpeg4 docs collaborator on workspace task #303.**  The
+  msmpeg4 video crate has been blocked since round 7 on a docs
+  gap: G0..G3 packed-Huffman tables + alternate-MV VLC tables.
+  Round 66 walks `mpg4c32.dll`'s `.data` section against the
+  Microsoft PE/COFF spec alone, identifies 13 candidate VLC
+  / scan-permutation LUT regions covering ~32 KB of bytes,
+  arms `Sandbox::watch` on every region, and drives the full
+  10-fixture MS-MPEG-4 v3 corpus through `ic_decompress`.  Per-
+  fixture JSONL traces of every LUT memory-read event are now
+  committed at
+  `docs/codec/msmpeg4-traces/<fixture>.jsonl[.gz]` for the
+  docs collaborator to derive the table contents from.  The
+  10 fixtures together drove 6/6 multi-frame fixtures cleanly
+  through all 6+5+4+1+1+1+1+1+1+2 = 22 frames at ICERR_OK.
+  - **Empirical finding** (per
+    `docs/codec/msmpeg4-traces/README.md`): the MP43 decode
+    hot loop reads ONLY from the small scan-permutation tables
+    at RVAs `0x57860` / `0x58230` / `0x5844c`; the two big
+    AC-coefficient LUTs at `0x4f938` (16 376 B) and `0x545c0`
+    (12 288 B) are NEVER touched at decode time across any
+    fixture.  Three hypotheses for the docs collaborator to
+    falsify: (1) entropy-decode hot loop reconstructs symbols
+    arithmetically from packed code-length bytes inline (so the
+    G0..G3 tables live in `.text` at the disassembly-point
+    EIPs `0x16e42` / `0x15f33` / `0x16ea8` / `0x16f2f`), (2)
+    LUTs are memcpy'd to heap at codec-instance init time and
+    the decode-time reads are heap-VA (round-67 would re-arm
+    the watch on the heap arena), (3) the big tables are dead
+    linker leftovers from a sibling encoder path.
+  - Section map at
+    `docs/codec/msmpeg4-mpg4c32-rdata-map.md` lists every
+    candidate's RVA + size + confidence + first 16 decoded
+    entries.
+  - Trace generator binary at `examples/gen_msmpeg4_traces.rs`
+    re-creates the artifacts from a fresh checkout
+    (`cargo run --release --features trace --example
+    gen_msmpeg4_traces`).
+  - Regression-guard test at
+    `tests/round66_msmpeg4_trace_corpus.rs` re-drives 5 of the
+    multi-frame fixtures and asserts that ≥ 50 scan-region
+    `mem_read` events plus ≥ 1 `win32_call` event still fire
+    end-to-end, so a future change to the trace probe sites
+    can't silently break LUT-region detection.
+
 - Round 65 — **`msadds32.ax` `IBaseFilter::JoinFilterGraph` driven
   before `Pause`; round-64 candidate (3) FALSIFIED.**  Round 64
   pinned the `Receive` `E_UNEXPECTED` bail-out to the inner-
