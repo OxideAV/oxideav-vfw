@@ -9,6 +9,25 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 67 — discovery probe propagates the round-24
+`ICINFO_SIZE = 568` strict-codec gate; mpg4c32 identity card
+no longer dropped on the floor.**  Round 24 added the
+strict-size gate to `vfw32::ic_get_info` after disassembling
+`mpg4c32!DriverProc+0x999..0x99c`
+(`cmp [ebp+0x10], 0x238 / jb .return_zero`), but the
+auto-discovery probe in `src/discovery/probe.rs` was still
+calling `ic_get_info(hic, 112)` and silently dropping the
+0-byte response.  Round 67 fixes the call site to pass
+`ICINFO_SIZE` and pins the empirical ICINFO record returned
+by mpg4c32: `dwSize=0x238`, `fccType='vidc'`,
+`fccHandler='MP43'`, `dwFlags=0x28`, `dwVersion=1`,
+`dwVersionICM=0x104`; szName / szDescription / szDriver
+empirically all-NUL inside the codec (MSDN documents these
+as delegated to registry HKEY drivers32 — our sandbox has
+no registry, so the wrapper synthesises szName='MP43' from
+the fcc).  Regression-pinned at
+`tests/round67_mpg4c32_icgetinfo.rs` (3 tests).
+
 **Round 66 — MS-MPEG-4 v3 LUT-read trace corpus committed;
 workspace task #303 unblocked for the docs collaborator.**
 Round 66 walks `mpg4c32.dll`'s `.data` section against the

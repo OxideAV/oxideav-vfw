@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 67 — **`discovery::probe` now honours the round-24
+  `ICINFO_SIZE = 568` strict-codec gate; `mpg4c32.dll` identity
+  card flows through.**  Round 24 added the strict-size
+  precondition to `win32::vfw32::ic_get_info` after pinning the
+  rejection gate at `mpg4c32!DriverProc+0x999..0x99c`
+  (`cmp [ebp+0x10], 0x238 / jb .return_zero`), but the
+  auto-discovery probe still passed `cb = 112` (a value chosen
+  for the Indeo family, which is lenient about short reads).
+  Result: the discovery probe burned an `ICOpen → ICGetInfo`
+  round-trip against `mpg4c32.dll` and threw away a silent
+  0-byte response, never seeing the codec's identity card.
+  Round 67 fixes the call site to pass `ICINFO_SIZE`, matching
+  what real `vfw32!ICGetInfo` passes per MSDN.
+  - **Recovered ICINFO record** (per
+    `tests/round67_mpg4c32_icgetinfo.rs`):
+    `dwSize = 0x238` (568), `fccType = 'vidc'`,
+    `fccHandler = 'MP43'`, `dwFlags = 0x28`, `dwVersion = 1`,
+    `dwVersionICM = 0x104`.
+  - **Empirical finding on string fields**: mpg4c32 leaves
+    `szName` / `szDescription` / `szDriver` ALL all-NUL inside
+    the codec.  MSDN documents these as delegated to the
+    registry HKEY `\Software\Microsoft\Windows NT\
+    CurrentVersion\drivers32`; our sandbox has no registry, so
+    the bytes stay zero.  The `ic_get_info` wrapper's existing
+    round-17 fcc-derived fallback fills `szName = "MP43"` from
+    the handler FourCC; `szDescription` and `szDriver` remain
+    empty.
+  - Regression-pinned at
+    `tests/round67_mpg4c32_icgetinfo.rs` — 3 tests covering
+    (1) `cb = 112` → 0-byte gate rejection, (2) `cb = 568` →
+    full ICINFO with string-field decode, (3) discovery probe
+    uses `ICINFO_SIZE` rather than a magic number.
+  - Source fix: `src/discovery/probe.rs:122` now reads
+    `let _ = sb.ic_get_info(hic, crate::win32::vfw32::ICINFO_SIZE);`.
+
 - Round 66 — **MS-MPEG-4 v3 trace artifacts unblocking the
   msmpeg4 docs collaborator on workspace task #303.**  The
   msmpeg4 video crate has been blocked since round 7 on a docs

@@ -119,7 +119,17 @@ fn try_probe_vfw(bytes: &[u8]) -> Option<ProbeResult> {
                 // Optional sanity ping — we don't require ICGetInfo
                 // to succeed; some codecs leave it as ICERR_UNSUPPORTED
                 // until ICDecompressBegin runs.
-                let _ = sb.ic_get_info(hic, 112);
+                //
+                // Round 67 — `cb` MUST be `>= ICINFO_SIZE` (= 568).
+                // mpg4c32.dll gates the ICM_GETINFO handler at
+                // `mpg4c32!DriverProc+0x999..0x99c`
+                // (`cmp [ebp+0x10], 0x238 / jb .return_zero`), so
+                // the pre-r67 `cb = 112` value silently dropped
+                // mpg4c32's identity card on the floor.  Real
+                // `vfw32!ICGetInfo` always passes `sizeof(ICINFO)`;
+                // mirror that here so the discovery probe sees
+                // what real Windows would see.
+                let _ = sb.ic_get_info(hic, crate::win32::vfw32::ICINFO_SIZE);
                 let _ = sb.ic_close(hic);
                 found.push(fourcc_to_string(fcc_bytes));
             }
