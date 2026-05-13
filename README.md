@@ -9,6 +9,30 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 65 — `msadds32.ax` `IBaseFilter::JoinFilterGraph` driven
+before `Pause`; round-64 candidate (1) FALSIFIED.**  The codec
+ACCEPTS our host `IFilterGraph` back-pointer (JoinFilterGraph and
+Pause both return `S_OK`) but **never calls back through it**:
+phase 5's trace-ring scan finds zero hits across all 11
+IFilterGraph thunk addresses during the full JoinFilterGraph +
+Pause window (176 instructions, 96 unique EIPs).  The
+`helper_struct[+0x3c]` "initialised" flag stays `0x0` after Pause
+completes — JoinFilterGraph does NOT drive the helper-struct
+setter, so the round-63 [`Sandbox::msadds32_patch_helper_addref`]
+workaround is NOT retirable through this path.  `Receive` without
+the patch still traps at `0x00000020`; with patch + JoinFilterGraph
+it still returns `0x8000ffff` (the same round-64 inner-decode-no-
+output bail-out).  Stripping a 12-byte ASF Payload Parsing
+Information prefix (candidate (3) from round 64) also leaves
+`0x8000ffff`.  6-test harness at
+`tests/round65_msadds32_join_filter_graph.rs` pins every
+finding.  Round-66 hand-off (`docs/codec/msadds32-receive-e-
+unexpected.md`): (a) disassemble the `helper_addref` SETTER's
+callers (RVA `0x5cf7..0x5d12`) to find the natural init path the
+codec follows in real DirectShow, and (b) snapshot registers at
+the inner-decode entry (RVA `0xc887`) to determine whether
+`[esi+0xa4]` is NULL or merely stale.
+
 **Round 64 — `msadds32.ax` `IMemInputPin::Receive` E_UNEXPECTED
 pinned to inner-decode-no-output bail-out at RVA `0x172f`.**
 With the round-63 [`Sandbox::msadds32_patch_helper_addref`]

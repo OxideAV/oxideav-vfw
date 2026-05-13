@@ -194,3 +194,64 @@ required** in round 64.  Without it, `Receive` traps at RVA
 `0x256a` before reaching the inner decode at all (regression
 guarded by `phase4_workaround_regression_guard`).  Round 65 may
 retire it iff path (3) sets `helper_struct[+0x20]` natively.
+
+## Round 65 — empirical resolution of candidate (3)
+
+Round 65 implements the structurally cleanest hand-off (#3) — drive
+`IBaseFilter::JoinFilterGraph(host_graph, L"Audio Splitter")` BEFORE
+`IMediaFilter::Pause` so the codec's own filter-graph-aware setup
+populates the inner-decode state.  The 6-test harness at
+`tests/round65_msadds32_join_filter_graph.rs` captures the
+findings:
+
+* `JoinFilterGraph(host_graph, name)` returns `S_OK`.
+* `Pause()` returns `S_OK`.
+* **The codec executes only 96 unique EIPs across the entire
+  JoinFilterGraph + Pause window** (phase 5 trace-ring scan,
+  total 176 instructions).  All 11 IFilterGraph thunk addresses
+  receive **zero callbacks** — the codec stores the back-pointer
+  but never calls back through it during bring-up.
+* `helper_struct[+0x3c]` (the round-63 `[ecx+0x20]` "initialised"
+  flag) stays `0x0` on the codec instance pointed to by
+  `unk+0x90` after Pause completes.  JoinFilterGraph does NOT
+  populate it (phase 1 introspection).
+* `Receive` WITHOUT the round-63 patch but WITH JoinFilterGraph
+  STILL traps at the round-62 `0x00000020` site (phase 2).  The
+  round-63 workaround remains required.
+* `Receive` WITH both the patch AND JoinFilterGraph returns the
+  same `0x8000ffff` (E_UNEXPECTED) from the same trace pattern as
+  round 64's baseline (phase 3).  JoinFilterGraph does not
+  unblock the inner-decode-no-output path.
+* Stripping a 12-byte ASF Payload Parsing Information prefix
+  from the input bytes before `Receive` ALSO leaves the result
+  at `0x8000ffff` (phase 4).  Either the codec's inner decoder
+  expects a different framing, or the failure is upstream of any
+  framing concern (e.g. the inner-decode context at `[esi+0xa4]`
+  itself is uninitialised regardless of input bytes).
+
+### Conclusion
+
+Candidate (3) is **falsified**: driving `JoinFilterGraph` does
+NOT bridge the inner-context initialisation gap.  The codec's
+runtime state machine (populating `[esi+0xa4]` and
+`helper_struct[+0x20]`) is driven by something else entirely —
+likely either (a) a code path inside the codec triggered by the
+ASF demuxer's stream-properties side-channel, (b) a registry
+key the splitter reads at init (HKLM\Software\Microsoft\WMA…), or
+(c) a private internal call sequence we haven't yet traced.
+
+The round-63 `helper_addref_patch` workaround stays in place.
+Round 66 should:
+
+1. Disassemble the `helper_addref` SETTER's callers (the path
+   that writes `helper_struct[+0x20] = 1`) to identify when the
+   codec NATURALLY drives that init.  The setter is at RVA
+   `0x5cf7..0x5d12`; finding its callers will reveal the
+   bring-up step we're skipping.
+2. Separately, trace the inner-decode entry at RVA `0xc887` with
+   a register snapshot at entry: if `[esi+0xa4]` is in fact NULL
+   we have a separate primary blocker; if it's non-NULL but
+   stale, the inner-decode-no-output path is producing
+   `samples_produced=0` for a different reason (likely codec-
+   private-data missing in the WAVEFORMATEX tail per candidate
+   (2) of the round-64 hand-off).

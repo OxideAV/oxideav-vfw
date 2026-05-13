@@ -8,6 +8,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 65 — **`msadds32.ax` `IBaseFilter::JoinFilterGraph` driven
+  before `Pause`; round-64 candidate (3) FALSIFIED.**  Round 64
+  pinned the `Receive` `E_UNEXPECTED` bail-out to the inner-
+  decode-no-output guard at RVA `0x172f` and named three round-65
+  candidates: (1) drive proper `JoinFilterGraph` / `Pause` /
+  `IFilterGraph::Run` init so the codec populates `[esi+0xa4]` +
+  `helper_struct[+0x20]`, (2) install codec-private-data in the
+  `WAVEFORMATEX` tail, (3) strip ASF Payload Parsing Information
+  framing.  Round 65 drives candidate (1) end-to-end against
+  `msadds32.ax` using the host `IFilterGraph` stub already minted
+  by [`Sandbox::mint_host_filter_graph`] (round 27).
+  - **JoinFilterGraph returns `S_OK`** and **Pause returns `S_OK`**;
+    the codec ACCEPTS the back-pointer at vtable slot 13.
+  - **The codec NEVER calls back through the IFilterGraph
+    back-pointer.**  Phase 5's trace-ring scan finds zero hits on
+    every one of the 11 IFilterGraph thunk addresses across the
+    full JoinFilterGraph + Pause window (176 instructions total,
+    96 unique EIPs).  The codec stashes the pointer but performs
+    no Pause-time graph queries.
+  - **`helper_struct[+0x3c]` (= round-63 `[ecx+0x20]`
+    "initialised" flag) stays `0x0`** after Pause completes
+    (phase 1 introspection across `unk+0x90`, `filter+0x90`,
+    `input_pin+0x90`, `mip+0x90`).  JoinFilterGraph does NOT
+    drive the helper-struct setter.
+  - **`Receive` without the round-63 patch STILL traps at
+    `0x00000020`** (phase 2) — the round-63 workaround is NOT
+    retirable through this path.
+  - **`Receive` with patch + JoinFilterGraph returns the same
+    `0x8000ffff`** as round 64's baseline (phase 3) — JoinFilterGraph
+    does not unblock the inner-decode-no-output bail-out.
+  - **ASF Payload-Parsing-Information strip experiment** (phase 4,
+    candidate (3) from round-64 hand-off) also yields `0x8000ffff` —
+    the failure isn't an input-framing mismatch at this layer.
+  - **Conclusion**: round-64 candidate (1) "drive proper
+    JoinFilterGraph" is FALSIFIED.  The codec's inner-decode-
+    context initialisation is driven by something other than the
+    filter-graph back-pointer.  Round-66 hand-off candidates
+    (documented in `docs/codec/msadds32-receive-e-unexpected.md`):
+    (a) disassemble the `helper_addref` SETTER's callers (RVA
+    `0x5cf7..0x5d12`) to find the natural init path, and
+    (b) snapshot registers at the inner-decode entry (RVA
+    `0xc887`) to determine whether `[esi+0xa4]` itself is NULL
+    or merely stale.
+  - 6-test harness at `tests/round65_msadds32_join_filter_graph.rs`
+    pins JoinFilterGraph S_OK + Pause S_OK (phases 1-3),
+    workaround-retirement falsification (phase 6), IFilterGraph
+    callback-count empirical sentinel (phase 5), and ASF strip
+    forensics (phase 4).  Updated forensics writeup at
+    `docs/codec/msadds32-receive-e-unexpected.md`.
+
 - Round 64 — **`msadds32.ax` `IMemInputPin::Receive` E_UNEXPECTED
   forensics: bail-out pinned to the inner-decode-no-output guard
   at RVA `0x172f`.**  Round 63 cleared the NULL+0x20 trap via
