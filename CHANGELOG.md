@@ -8,6 +8,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 64 — **`msadds32.ax` `IMemInputPin::Receive` E_UNEXPECTED
+  forensics: bail-out pinned to the inner-decode-no-output guard
+  at RVA `0x172f`.**  Round 63 cleared the NULL+0x20 trap via
+  [`Sandbox::msadds32_patch_helper_addref`] and surfaced `eax =
+  0x8000ffff` as the new failure surface.  Round 64 walks the
+  trace ring forensically and proves the value isn't emitted by
+  any of the 10 `mov eax, 0x8000FFFF` (`b8 ff ff 00 80`) sites
+  visible in a linear `.text` scan — NONE of them is reached at
+  all during the patched run.  Instead the codec executes
+  `c7 45 08 ff ff 00 80` (`mov dword [ebp+0x08], 0x8000FFFF`) at
+  RVA `0x172f`, which stamps `E_UNEXPECTED` into its caller's
+  HRESULT out-slot before falling through to the cleanup tail at
+  `0x1736..0x176c` that loads `eax = [ebp+0x08]` and returns.
+  - **Failing check**: at RVA `0x165b` the codec branches
+    `jnz +0xce → 0x172f` when `cmp [ebp-0x24], ebx` is non-zero.
+    `[ebp-0x24]` is the "we already drained one input frame
+    without producing output" flag, set to `1` at RVA `0x1661`
+    after the first no-output inner-decode call.  On the SECOND
+    consecutive no-output iteration of the outer loop (back-edge
+    at `0x172a`), the codec bails with `E_UNEXPECTED`.
+  - **Inner decode**: the call at RVA `0x1643` lands at RVA
+    `0xc887` (a `__thiscall` taking 9 stack args; the 6th arg
+    `[ebp+0x1c]` is the `&samples_produced` out-pointer).  It
+    returns `eax = 0` to the outer loop yet leaves `*samples_produced
+    = 0` — i.e. the codec accepted our input frame as well-formed
+    but emitted zero PCM bytes.  The structural sentinels at RVAs
+    `0x1658` (cmp), `0x165b` (jnz), `0x172a` (loop back), and
+    `0x172f` (bail-out) are pinned by phase 5a so round 65 can
+    replay without re-disassembling.
+  - **IMediaSample-side ruled out**: phase 5 sweeps 6 combinations
+    of `SetSyncPoint`, `SetMediaTime`, and `SetDiscontinuity`
+    setters; all return the same `hr = 0x8000ffff` from the same
+    trace pattern.  The failing check is NOT about the sample's
+    presence-of-set bits.
+  - **Round-65 candidates** (documented in
+    `docs/codec/msadds32-receive-e-unexpected.md`):
+    1. Drive the proper `JoinFilterGraph` / `Pause` /
+       `IFilterGraph::Run` init path so the codec's own
+       initialisation populates `[esi+0xa4]` (inner context) and
+       `helper_struct[+0x20]` (retiring the round-63 patch).
+    2. Install codec-private-data (extradata) in the
+       `WAVEFORMATEX` tail of the `AmtBlueprint`.
+    3. Strip ASF Payload Parsing framing from the input bytes
+       before passing them to `Receive`.
+  - 6-test harness at `tests/round64_msadds32_e_unexpected.rs`
+    pins the candidate-RVA scan (`phase1`), live-site discovery
+    (`phase2`), trace-tail disassembly (`phase3`), workaround
+    regression guard (`phase4`), structural-sentinel pinning of
+    the bail-out path (`phase5a`), and IMediaSample-setter panel
+    (`phase5`).
+  - Forensics writeup at
+    `docs/codec/msadds32-receive-e-unexpected.md`.
+
 - Round 63 — **`msadds32.ax` `IMemInputPin::Receive` NULL+0x20 trap
   resolved by clean-room workaround for the missing `helper_addref`
   initialisation.**  Round 62 traced the trap chain to

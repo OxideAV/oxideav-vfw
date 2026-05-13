@@ -334,23 +334,47 @@ completion.  The HRESULT changes from a memory fault at
 `0x00000020` to `0x8000ffff` (E_UNEXPECTED from the codec's
 inner decode body) — the round-64 investigation surface.
 
-### Round-64 hand-off
+### Round-64 hand-off (resolved → round-65)
 
-The patch is a debugging workaround.  Round 64 should either:
+The patch is a debugging workaround.  Round 64 chose option (2)
+from the original menu and traced the `0x8000ffff` HRESULT to its
+emission site.  Findings:
 
-1. **Drive the proper init path** — identify which call (likely
-   `JoinFilterGraph`, `Pause`, or an
-   `IFilterGraph`-time setup hook) prompts the codec to call its
-   own `set_value(helper, n)` and wire that on our side so the
-   `helper_struct[+0x20]` flag is set without a guest-byte patch.
-   Retire the workaround once driven.
-2. **Push past the `0x8000ffff` exit** — with the trap lifted,
-   the next blocker is whatever the codec's inner decode body
-   complains about.  Capture the new failure site (probably
-   a different RVA or a different out-of-band parameter the
-   inner decoder requires).
+  - The value is NOT emitted from any of the 10 `mov eax,
+    0x8000FFFF` (`b8 ff ff 00 80`) sites in the binary's `.text`;
+    none is reached during the patched `Receive`.
+  - The actual emission is `c7 45 08 ff ff 00 80` at RVA
+    `0x172f` — `mov dword [ebp+0x08], 0x8000FFFF` writes
+    `E_UNEXPECTED` into the caller's HRESULT out-slot, which the
+    function's epilogue at `0x176c` loads back into `eax` before
+    returning.
+  - The branch that leads to `0x172f` is `jnz +0xce → 0x172f` at
+    RVA `0x165b`, controlled by `cmp [ebp-0x24], ebx` at RVA
+    `0x1658`.  `[ebp-0x24]` is the "we already drained one input
+    frame without producing output" loop-counter flag, set to
+    `1` at RVA `0x1661` on the first no-output inner-decode call.
+  - So the bail-out fires on the **second consecutive** outer-loop
+    iteration where the inner decode at RVA `0xc887` returned
+    `eax = 0` (S_OK) yet didn't write samples to its
+    `&[ebp-0x10]` "samples produced" out-pointer.
+
+Full round-64 forensics live in
+[`msadds32-receive-e-unexpected.md`](msadds32-receive-e-unexpected.md);
+that doc names three round-65 candidate fixes:
+
+1. Drive the proper `JoinFilterGraph` / `Pause` /
+   `IFilterGraph::Run` init path so the codec populates its
+   inner context AND `helper_struct[+0x20]` (retiring the
+   round-63 patch).
+2. Install codec-private-data in the `WAVEFORMATEX` tail of the
+   `AmtBlueprint` so the inner decoder can configure its state
+   machine.
+3. Strip ASF Payload Parsing framing from the input bytes before
+   passing them to `Receive`.
 
 The round-63 test harness in
 `tests/round63_msadds32_buffer_size_calc.rs` pins both the
-formula (phase-1/2) and the cleared trap (phase-4/5) so the next
-round can replay without re-disassembling.
+formula (phase-1/2) and the cleared trap (phase-4/5); the round-
+64 harness in `tests/round64_msadds32_e_unexpected.rs` pins the
+inner-decode-no-output bail-out path so the next round can
+replay without re-disassembling.

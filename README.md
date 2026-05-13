@@ -9,6 +9,40 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 64 — `msadds32.ax` `IMemInputPin::Receive` E_UNEXPECTED
+pinned to inner-decode-no-output bail-out at RVA `0x172f`.**
+With the round-63 [`Sandbox::msadds32_patch_helper_addref`]
+workaround applied (`value ≥ 6554`), `Receive` runs to completion
+and returns `eax = 0x8000ffff`.  Round 64 walks the trace ring
+forensically and proves the value isn't emitted by any of the 10
+`mov eax, 0x8000FFFF` (`b8 ff ff 00 80`) byte sites in the
+binary's `.text` — none of those is reached at all.  Instead the
+codec executes `c7 45 08 ff ff 00 80` at RVA `0x172f`, which is
+`mov dword [ebp+0x08], 0x8000FFFF` — stamping `E_UNEXPECTED` into
+its caller's HRESULT out-slot.  The branch that leads there is
+`jnz +0xce → 0x172f` at RVA `0x165b`, controlled by `cmp
+[ebp-0x24], ebx` at RVA `0x1658`.  `[ebp-0x24]` is the "we
+already drained one input frame without producing output" flag;
+it's set to `1` at RVA `0x1661` on the first no-output iteration
+and triggers the bail-out on the second.  So the codec accepts
+our WMA2 input frame as well-formed (inner-decode call at RVA
+`0xc887` returns `eax = 0`) but emits zero PCM bytes — and the
+outer Receive loop interprets two consecutive no-output
+iterations as "stream cannot make progress".  Phase 5's
+IMediaSample setter panel (sync-point × media-time ×
+discontinuity, 6 combinations) returns the same `hr = 0x8000ffff`
+from the same trace pattern, so the failing check is NOT
+sample-side.  Round-65 hand-off: either (1) drive the real
+`JoinFilterGraph`/`Pause` init path so the codec populates
+`[esi+0xa4]` (inner context) AND `helper_struct[+0x20]`
+(retiring the round-63 patch), (2) install codec-private-data in
+the `WAVEFORMATEX` tail of the `AmtBlueprint`, or (3) strip ASF
+Payload Parsing framing from the input bytes before passing them
+to Receive.  6-test harness at
+`tests/round64_msadds32_e_unexpected.rs` pins the structural
+sentinels; forensics writeup at
+`docs/codec/msadds32-receive-e-unexpected.md`.
+
 **Round 63 — `msadds32.ax` `IMemInputPin::Receive` NULL+0x20 trap
 cleared by a surgical clean-room workaround.**  Round 62 narrowed
 the trap chain to `populator → buffer_pool_init →
