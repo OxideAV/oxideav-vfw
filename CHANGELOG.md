@@ -63,6 +63,56 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round 68 — **`AmtBlueprint::wma_with_ffmpeg_extradata_prefix`
+  shifts `msadds32.ax`'s Receive HRESULT from `E_UNEXPECTED` to
+  `E_FAIL` — the inner-decode-no-output guard at RVA `0x172f`
+  (round-64 forensic surface) is BYPASSED.**  Round 60's
+  `wma_criteria_passing` constructor populated the WAVEFORMATEX
+  cbSize tail as `[4 or 10 zero bytes] ++ 37-byte magic CLSID`
+  — enough to satisfy the `CompleteConnect` validator at RVA
+  `0x2057` but the leading zero bytes are NOT realistic codec-
+  private-data.  Round 68 adds a successor constructor that
+  preserves the 37-byte CLSID suffix the validator demands but
+  prefixes it with the empirical bytes ffmpeg emits in real
+  fixtures (`00 00 01 00` for WMA1, `00 00 00 00 01 00 00 00 00
+  00` for WMA2; per `tests/fixtures/audio/wma{1,2}_440hz_mono_1s.
+  wma`).
+  - **Empirical outcome** (per `tests/round68_msadds32_real_
+    extradata.rs`, 5 phases):
+    1. Phase 4 (baseline: zero preamble + round-63 patch)
+       reproduces round 64's `0x8000FFFF` (`E_UNEXPECTED`).
+    2. Phase 3 (ffmpeg preamble + round-63 patch) now returns
+       `0x80004005` (`E_FAIL`) — the HRESULT shifted; the
+       inner-decode-no-output bail at `0x172f` is no longer
+       reached; the codec now bails earlier from the inner
+       decode itself at RVA `0xc96a`.
+    3. Phase 2 (ffmpeg preamble, NO round-63 patch) also yields
+       `0x80004005` AND notably no longer traps at the
+       `0x00000020` site — the round-63 patch may now be
+       retirable; round 69 should confirm with an explicit
+       retirement assertion.
+  - **Architectural significance**: this is the first round
+    since round 60 where the codec emits a different HRESULT
+    on the same Receive entry, just by changing the
+    WAVEFORMATEX-tail bytes — proving the inner decode reads
+    codec-private-data at init time, and that round 64's
+    structural blocker has been bypassed.
+  - **Next blocker** identified: one of the 4 inner-decode arg-
+    NULL guards at `0xc887` (offsets `0xc898 / 0xc8a3 / 0xc8ac
+    / 0xc8b7`) OR the inner-inner-decode failure check at
+    `0xc935`.  Round 69 should arm a watchpoint inside the
+    inner decode and capture register state at entry to
+    identify which guard fires.
+  - Forensics doc at
+    `docs/codec/msadds32-receive-e-unexpected.md` extended with
+    a "Round 68" section enumerating the per-phase outcome,
+    the interpretation, and the round-69 hand-off.
+  - Source: new public API
+    `oxideav_vfw::com::AmtBlueprint::wma_with_ffmpeg_
+    extradata_prefix(format_tag, n_channels, n_samples_per_sec,
+    n_avg_bytes_per_sec, n_block_align)` at
+    `src/com/asf_amt.rs`.
+
 - Round 67 — **`discovery::probe` now honours the round-24
   `ICINFO_SIZE = 568` strict-codec gate; `mpg4c32.dll` identity
   card flows through.**  Round 24 added the strict-size

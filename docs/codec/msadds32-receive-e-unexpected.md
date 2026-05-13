@@ -255,3 +255,92 @@ Round 66 should:
    `samples_produced=0` for a different reason (likely codec-
    private-data missing in the WAVEFORMATEX tail per candidate
    (2) of the round-64 hand-off).
+
+## Round 68 — codec-private-data preamble in the WAVEFORMATEX tail
+
+Round 68 implements candidate (2) — populate the codec-private-data
+preamble at the WAVEFORMATEX tail with the bytes a real ffmpeg-
+generated WMA fixture emits, instead of the all-zero placeholder
+[`AmtBlueprint::wma_criteria_passing`] used through rounds 60–65.
+The new constructor [`AmtBlueprint::wma_with_ffmpeg_extradata_prefix`]
+keeps the 37-byte CLSID suffix the `CompleteConnect` validator
+demands, but prefixes it with the empirically-correct bytes:
+
+| tag    | preamble (hex)                  | empirical source           |
+|--------|---------------------------------|----------------------------|
+| 0x0160 | `00 00 01 00`                   | ffmpeg's WMA1 fixture tail |
+| 0x0161 | `00 00 00 00 01 00 00 00 00 00` | ffmpeg's WMA2 fixture tail |
+
+The 5-test harness at `tests/round68_msadds32_real_extradata.rs`
+captures the empirical outcome:
+
+* **Phase 4 (baseline, zero preamble + round-63 patch)** —
+  `receive_hr = 0x8000FFFF (E_UNEXPECTED)`.  Reproduces round 64;
+  confirms the A/B comparison is clean.
+* **Phase 3 (ffmpeg preamble + round-63 patch)** —
+  `receive_hr = 0x80004005 (E_FAIL)`.  **The HRESULT shifted**.
+  The codec no longer reaches the `0x172f` `E_UNEXPECTED` stamp;
+  instead it bails earlier on the inner-decode `E_FAIL`
+  emission at RVA `0xc96a` (`mov eax, 0x80004005`).  This is the
+  inner decode's "argument-validation" exit; per round-64's
+  inner-decode disasm, that exit is taken when ANY of the
+  required pointer args (`[ebp+0x08]`, `[ebp+0x10]`, `[ebp+0x14]`,
+  `[ebp+0x1c]`) is NULL, OR if the inner-inner decode at
+  `call 0xc975` itself returns non-zero (`jnz +0x36 → 0xc96d`).
+* **Phase 2 (ffmpeg preamble, NO round-63 patch)** —
+  `receive_hr = 0x80004005 (E_FAIL)`.  Notably, **NO trap at the
+  `0x00000020` site** that has historically required the
+  round-63 workaround.  The trajectory now bypasses the LIFO-push
+  path entirely.  The round-63 patch MAY now be retirable; needs
+  forensic confirmation that helper_struct[+0x20] is no longer
+  derefed on this path.
+* **Phase 5 (WMA1 ffmpeg preamble + patch)** — same `E_UNEXPECTED`
+  surface as before, because the WMA2 fixture is what gets pushed
+  through Receive (the WMA1 AMT-shape change alone doesn't move
+  the trajectory when the bitstream is still WMA2).
+
+### Interpretation
+
+Candidate (2) is **partially confirmed**.  The codec-private-data
+preamble bytes DO change the decode-time trajectory: the inner
+decode no longer falls through to the "no-output produced" branch
+that emits `E_UNEXPECTED` at the outer `0x172f` site; instead it
+bails earlier from the inner decode itself with `E_FAIL`.  The
+preamble bytes feed into a real init-time decision the codec
+makes about how to interpret subsequent frames.
+
+The remaining blocker is now upstream — round 69 must trace WHICH
+of the inner-decode args at `0xc887` is NULL (or which `call
+0xc975` failure surface is taken).  The forensic next step:
+
+1. Arm a watchpoint inside the inner decode `0xc887..0xc973` and
+   capture the register state at entry to identify which guard
+   (`jz 0xc969` at offsets `0xc898 / 0xc8a3 / 0xc8ac / 0xc8b7`)
+   fires, OR whether the `call 0xc975` post-check at `0xc935`
+   takes the `jnz` branch.
+2. If a guard fires on a NULL arg, that arg comes from the outer
+   `Receive` body's `[ebp-X]` slot — trace where the slot is
+   populated and what produces a NULL there.
+3. If the inner-inner decode fails, that's a fresh signature to
+   trace at `0xc975` itself.
+
+### Workaround retirement status
+
+The round-63 [`Sandbox::msadds32_patch_helper_addref`] workaround
+appears retirable based on phase-2's clean (no-trap) bailout, but
+the test conservatively continues to apply it in phases 3+4 to
+keep the comparison clean.  Round 69 should add an explicit
+`phaseX_workaround_retirement` assertion that drives a full chain
+with the ffmpeg preamble and NO patch, then probes
+`helper_struct[+0x3c]` ([ecx+0x20]) to confirm the field is now
+either populated naturally or no longer read.
+
+### Architectural significance
+
+This is the first round since round 60 where the codec emits a
+different HRESULT from the same Receive entry, with the same
+fixture, just by changing the WAVEFORMATEX-tail bytes.  The
+inner-decode-no-output bail-out at `0x172f` — the structural
+gate that has blocked round 64 onward — is now BYPASSED.  The
+remaining blocker has moved one decode-stage deeper inside the
+codec.

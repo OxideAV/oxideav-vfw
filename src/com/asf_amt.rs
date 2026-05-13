@@ -266,6 +266,79 @@ impl AmtBlueprint {
             extradata,
         }
     }
+
+    /// Round-68 successor of [`Self::wma_criteria_passing`].  Same
+    /// 37-byte magic CLSID suffix the splitter's `CompleteConnect`
+    /// validator demands, but the codec-private-data preamble is
+    /// populated with the bytes a real ffmpeg-produced WMA fixture
+    /// emits, instead of all-zero.
+    ///
+    /// ## Why this matters
+    ///
+    /// The round-60 `wma_criteria_passing` constructor satisfies the
+    /// `inner.vtable[12]` `CompleteConnect` validator (RVA `0x2057`)
+    /// but uses an all-zero codec-private-data preamble.  Round 64
+    /// (see `docs/codec/msadds32-receive-e-unexpected.md`) pinned the
+    /// `Receive` `E_UNEXPECTED` bail-out at RVA `0x172f` to the
+    /// inner-decode-no-output guard: the codec accepts our WMA2
+    /// frame, the inner decode at RVA `0xc887` returns `eax = 0`,
+    /// but the "samples produced" out-pointer stays NULL and two
+    /// consecutive zero-output iterations make the outer loop bail.
+    ///
+    /// The round-64 hand-off ranked four candidates; rounds 64+65
+    /// falsified candidates (1) JoinFilterGraph and (3) ASF Payload
+    /// Parsing strip.  Candidate (2) — codec-private-data missing
+    /// at the WAVEFORMATEX tail — is what this constructor probes.
+    ///
+    /// ## Empirical preamble bytes (per ffmpeg-emitted fixtures)
+    ///
+    /// Sourced from the round-59 `tests/fixtures/audio/wma{1,2}…wma`
+    /// blobs ffmpeg generated at codec-bringup time:
+    ///
+    /// | tag    | preamble (hex)                  | meaning (per public Windows Media Audio spec) |
+    /// |--------|---------------------------------|----------------------------------------------|
+    /// | 0x0160 | `00 00 01 00`                   | sample-rate-class (?) = `0x0001_0000`        |
+    /// | 0x0161 | `00 00 00 00 01 00 00 00 00 00` | encoder version flags (?) = `0x0000_0001`    |
+    ///
+    /// Both layouts preserve the 37-byte CLSID suffix the validator
+    /// demands.  WMA1 emits cbSize = 41 (4 + 37), WMA2 emits
+    /// cbSize = 47 (10 + 37).
+    ///
+    /// ## Reference material (clean-room only)
+    ///
+    /// * `mmreg.h` — `WAVEFORMATEX` layout (public Microsoft).
+    /// * Microsoft Windows Media Audio public spec — codec-private
+    ///   block field meanings (sample-rate-class, encoder version).
+    /// * Raw bytes of ffmpeg-generated WMA1/WMA2 fixtures stored at
+    ///   `tests/fixtures/audio/`.
+    ///
+    /// No Wine / ReactOS / MinGW / Microsoft codec source consulted.
+    pub fn wma_with_ffmpeg_extradata_prefix(
+        format_tag: u16,
+        n_channels: u16,
+        n_samples_per_sec: u32,
+        n_avg_bytes_per_sec: u32,
+        n_block_align: u16,
+    ) -> Self {
+        const MAGIC_CLSID: &[u8; 37] = b"1A0F78F0-EC8A-11d2-BBBE-006008320064\0";
+        let preamble: &[u8] = match format_tag {
+            0x0160 => &[0x00, 0x00, 0x01, 0x00],
+            0x0161 => &[0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+            _ => &[0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let mut extradata = Vec::with_capacity(preamble.len() + MAGIC_CLSID.len());
+        extradata.extend_from_slice(preamble);
+        extradata.extend_from_slice(MAGIC_CLSID);
+        AmtBlueprint {
+            format_tag,
+            n_channels,
+            n_samples_per_sec,
+            n_avg_bytes_per_sec,
+            n_block_align,
+            w_bits_per_sample: 16,
+            extradata,
+        }
+    }
 }
 
 /// Walk the ASF byte stream `bytes`, find the audio Stream
@@ -510,6 +583,43 @@ mod tests {
         let total = out.len() as u64;
         out[size_off..size_off + 8].copy_from_slice(&total.to_le_bytes());
         out
+    }
+
+    #[test]
+    fn wma_with_ffmpeg_extradata_prefix_wma1_layout() {
+        let bp = AmtBlueprint::wma_with_ffmpeg_extradata_prefix(0x0160, 1, 44_100, 4_000, 185);
+        assert_eq!(bp.format_tag, 0x0160);
+        assert_eq!(bp.extradata.len(), 4 + 37);
+        // Preamble: ffmpeg-emitted bytes
+        assert_eq!(&bp.extradata[0..4], &[0x00, 0x00, 0x01, 0x00]);
+        // CLSID suffix: magic the splitter validator demands
+        assert_eq!(
+            &bp.extradata[4..],
+            b"1A0F78F0-EC8A-11d2-BBBE-006008320064\0"
+        );
+        // cbSize gate: the round-60 validator requires >= 0x29 (41).
+        assert!(bp.extradata.len() >= 0x29);
+        assert_eq!(bp.wfx_total_len(), 18 + 41);
+    }
+
+    #[test]
+    fn wma_with_ffmpeg_extradata_prefix_wma2_layout() {
+        let bp = AmtBlueprint::wma_with_ffmpeg_extradata_prefix(0x0161, 1, 44_100, 4_000, 185);
+        assert_eq!(bp.format_tag, 0x0161);
+        assert_eq!(bp.extradata.len(), 10 + 37);
+        // Preamble: ffmpeg-emitted bytes — only offset 4 non-zero.
+        assert_eq!(
+            &bp.extradata[0..10],
+            &[0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        // CLSID suffix: magic the splitter validator demands
+        assert_eq!(
+            &bp.extradata[10..],
+            b"1A0F78F0-EC8A-11d2-BBBE-006008320064\0"
+        );
+        // cbSize gate: the round-60 validator requires >= 0x2F (47).
+        assert!(bp.extradata.len() >= 0x2F);
+        assert_eq!(bp.wfx_total_len(), 18 + 47);
     }
 
     #[test]
