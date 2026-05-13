@@ -6,6 +6,61 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.0...v0.1.1) - 2026-05-13
+
+### Other
+
+- vfw r67: discovery probe propagates the round-24 ICINFO_SIZE strict-codec gate; mpg4c32 identity card flows through
+- vfw r66: MS-MPEG-4 v3 LUT-read trace corpus committed; workspace task #303 unblocked
+- vfw r65: msadds32.ax JoinFilterGraph driven before Pause; round-64 candidate (1) FALSIFIED
+- vfw r64: msadds32.ax IMemInputPin::Receive E_UNEXPECTED pinned to inner-decode-no-output guard at RVA 0x172f
+- vfw r63: msadds32.ax Receive NULL+0x20 trap cleared via surgical helper_addref workaround
+- vfw r62: msadds32.ax IMemInputPin::Receive NULL+0x20 trap clean-room forensics
+- vfw r61: msadds32.ax input-pin IMemAllocator handshake fully lands S_OK; output-pin PCM ReceiveConnection probe surfaces a NULL-deref blocker for r62
+- vfw r60: msadds32.ax ReceiveConnection lands S_OK for criteria-passing WMA1/WMA2 AMTs after clean-room disassembly of the CompleteConnect validator at RVA 0x2057
+- vfw r59: ASF/WMA extractor lifts real WAVEFORMATEX + extradata from ffmpeg fixtures; msadds32.ax ReceiveConnection still E_FAIL but now with spec-grounded headers
+- vfw r58: msadds32.ax audio splitter walks EnumPins + Pause/Run/GetState into FILTER_STATE_RUNNING; WAVEFORMATEX AMT staging lands; ReceiveConnection blocked on codec extradata blob
+- vfw r57: msadds32.ax audio splitter spawns IBaseFilter through DllGetClassObject + CreateInstance — zero new ole32/oleaut32 stubs
+- vfw r56: msvcrt!_CIpow real impl drains the final msadds32.ax PE-load blocker — audio splitter now fully PE-loaded
+- vfw r55: msvcrt!{rand,srand} + seedable Sandbox PRNG API for reproducible encode
+- vfw r54: AVI 1.0 muxer + ffmpeg cross-decode validates encoded MSMPEG4 v3 bytes end-to-end
+- vfw r53: P-frame quality-regime probe — mpg4c32 clears keyframe flag but residual on 8-px translation exceeds I-frame
+- vfw r52: msvcrt!_ftol real impl advances msadds32.ax PE-load past CRT FP-truncation edge
+- vfw r51: encode side of IC* surface lands end-to-end against mpg4c32.dll
+- vfw r50: msvcrt!_beginthreadex stub advances msadds32.ax PE-load past splitter CRT thread-creation edge
+- vfw r49: msvcrt!_strnicmp stub advances msadds32.ax PE-load past splitter case-insensitive bounded-compare edge
+- Round 48 — msvcrt!_endthreadex stub unblocks msadds32.ax PE-load further
+- Round 47 — gdi32!StretchDIBits stub unblocks msadds32.ax PE-load further
+- Round 46 — user32!{SetTimer, KillTimer} stubs unblock msadds32.ax further
+- Round 45 — user32!MapDialogRect stub unblocks msadds32.ax PE-load
+- Round 44 — entire MS-MPEG-4 v3 fixture corpus exercised end-to-end
+- Round 43 — full 6-frame GOP decode at 352×288 (sample-release cycle closed)
+- Round 42 — first multi-frame DShow decode (1→2 frames I+P end-to-end)
+- Round 41 — IMemAllocator::GetBuffer arg-count fix unblocks MP43 decode
+- Round 40 — register-snapshot watchpoints localise stack imbalance in Transform
+- Round 39 — IID_IMediaSample2 QI support; Transform success-tail reached
+- Round 38 — identify codec C++ class base; [filter_base+0x8c] proven non-NULL
+- Round 37 — IPin::QueryPinInfo + ConnectedTo + IBaseFilter::QueryFilterInfo
+- Round 36 — diagnose IMemInputPin::Receive NULL+0x1c trap site
+- Round 35 — register host CLSID_MemoryAllocator class factory
+- Round 34 — codec-allocator negotiation via IMemInputPin::GetAllocator
+- Round 33 — real MP43 keyframe + IMediaFilter::GetState drive + IMemAllocator::SetProperties capture
+- Round 32 — IMediaFilter::Run + HostIMemAllocator::Commit state-machine + IPin::QueryDirection filter
+- Round 31 — IPin::EnumMediaTypes walk + downstream HostIPin::Receive capture
+- Round 30 — DShow IMemAllocator+IMediaSample stubs + dim probe + Indeo/Cinepak trait tests
+- Round 29 — wire oxideav_core::Decoder for VfW codecs end-to-end
+- Round 28 — codec auto-discovery at register() time
+- Round 27 — IFilterGraph + IPin host stubs land; ReceiveConnection S_OK
+- Round 26 — user32!CreateWindowExA cascade + IPin::ReceiveConnection probe
+- Round 25 — DirectShow IBaseFilter scaffolding (Stages 1-5 land)
+- Round 24 — multi-frame MP43 + WMV verdict + ICGetInfo + UnregisterClassA
+- Round 23 — MP43 ffmpeg-oracle PSNR + I+P 2-frame decode
+- Round 22 — MSMPEG4 v3 ICDecompressBegin + first keyframe decode unblock
+- Round 21 — x87 FPU executor + MSMPEG4 v3 DRV_OPEN unblock
+- Round 20 — MMX kernels dispatch + MSMPEG4 v3 PE-load unblock
+- extend codec status table with MSMPEG4 v3 + WMV1/2
+- Round 19 — Lead A: trace-coverage analysis identifies EFLAGS.ID-bit gap
+
 ### Added
 
 - Round 67 — **`discovery::probe` now honours the round-24
