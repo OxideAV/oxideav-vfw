@@ -579,6 +579,47 @@ pub fn arg_dword(cpu: &Cpu, mmu: &Mmu, n: u32) -> Result<u32, crate::emulator::T
     mmu.load32(addr)
 }
 
+/// Cdecl arg-count override table for trace-event extraction.
+///
+/// Stdcall stubs already declare their argument count in
+/// [`StubEntry::arg_dwords`] (the value the dispatch site uses
+/// to pop the stack on return). Cdecl stubs declare `0` because
+/// the *caller* cleans the stack — but the args are still on the
+/// stack at call entry. For known-shape cdecl entries we return
+/// the per-call dword count so the trace probe can read those
+/// dwords back into `args[]` on `kind=win32_call` events.
+///
+/// Returns `None` if the `(dll, name)` pair has no override; in
+/// that case the trace site falls back to the registered
+/// `arg_dwords` (0 for any cdecl stub, leaving `args:[]` as
+/// before — so this is purely additive).
+///
+/// Reference: `docs/video/msmpeg4/audit/06-sandbox-O3-quant-init.md`
+/// §5.2.3 — Auditor needs allocation sizes surfaced at call
+/// time so the codec-context allocation can be located by size
+/// match rather than by return-address differencing.
+pub fn cdecl_trace_arg_count(dll: &str, name: &str) -> Option<u32> {
+    match (dll, name) {
+        // Heap surface — single-arg shapes.
+        //   void* malloc(size_t)                              — 1
+        //   void  free(void*)                                 — 1
+        //   void* operator new(unsigned int)  ??2@YAPAXI@Z    — 1
+        //   void  operator delete(void*)      ??3@YAXPAX@Z    — 1
+        ("msvcrt.dll", "malloc")
+        | ("msvcrt.dll", "free")
+        | ("msvcrt.dll", "??2@YAPAXI@Z")
+        | ("msvcrt.dll", "??3@YAXPAX@Z") => Some(1),
+        // Two-arg shapes — not registered today but cheap to
+        // pre-declare so a future `register("msvcrt.dll",
+        // "calloc"/"realloc", ...)` automatically gets traced
+        // args without revisiting this table.
+        //   void* calloc(size_t count, size_t size)           — 2
+        //   void* realloc(void*, size_t)                      — 2
+        ("msvcrt.dll", "calloc") | ("msvcrt.dll", "realloc") => Some(2),
+        _ => None,
+    }
+}
+
 /// Convert an MMU/CPU [`crate::emulator::Trap`] into a [`Win32Error`]
 /// so a stub's argument-fetch failure surfaces as
 /// `Win32Error::InvalidArgument`. Used by the gdi32 / user32 /
@@ -634,13 +675,23 @@ pub fn dispatch_stub(
     // Trace probe (gated): capture the call-site EIP (= the
     // saved return address pushed by the guest CALL — the
     // instruction right after the CALL, not the thunk address)
-    // and the first few stdcall args off the guest stack BEFORE
-    // running the stub, since the stub mutates the stack.
+    // and the first few args off the guest stack BEFORE running
+    // the stub, since the stub mutates the stack.
+    //
+    // Argument count: `entry.arg_dwords` carries the stdcall
+    // count (the value used to pop the stack on return).
+    // For cdecl stubs this is 0 — but for known cdecl shapes
+    // (msvcrt heap entries) [`cdecl_trace_arg_count`] supplies a
+    // per-call override so trace events surface the size /
+    // pointer args rather than `args:[]`. See
+    // `docs/video/msmpeg4/audit/06-sandbox-O3-quant-init.md`
+    // §5.2.3 for the auditor requirement.
     #[cfg(feature = "trace")]
     let trace_args: Option<(u32, Vec<u32>)> = if mmu.trace.has_sink() {
         let call_site_eip = mmu.load32(cpu.regs.esp()).unwrap_or(0);
-        let mut args = Vec::with_capacity(entry.arg_dwords as usize);
-        for i in 0..entry.arg_dwords {
+        let n_args = cdecl_trace_arg_count(&entry.dll, &entry.name).unwrap_or(entry.arg_dwords);
+        let mut args = Vec::with_capacity(n_args as usize);
+        for i in 0..n_args {
             let a = arg_dword(cpu, mmu, i).unwrap_or(0);
             args.push(a);
         }
@@ -831,6 +882,151 @@ mod tests {
         let addr = r.register("KERNEL32.DLL", "GetProcessHeap", dummy_stub, 0);
         assert_eq!(r.resolve("kernel32.dll", "GetProcessHeap"), Some(addr));
         assert_eq!(r.resolve("Kernel32.Dll", "GetProcessHeap"), Some(addr));
+    }
+
+    #[test]
+    fn cdecl_trace_arg_count_covers_msvcrt_heap_surface() {
+        // Single-arg msvcrt cdecl entries.
+        assert_eq!(cdecl_trace_arg_count("msvcrt.dll", "malloc"), Some(1));
+        assert_eq!(cdecl_trace_arg_count("msvcrt.dll", "free"), Some(1));
+        assert_eq!(
+            cdecl_trace_arg_count("msvcrt.dll", "??2@YAPAXI@Z"),
+            Some(1),
+            "operator new",
+        );
+        assert_eq!(
+            cdecl_trace_arg_count("msvcrt.dll", "??3@YAXPAX@Z"),
+            Some(1),
+            "operator delete",
+        );
+        // Two-arg msvcrt cdecl entries (pre-declared for future
+        // calloc / realloc registrations).
+        assert_eq!(cdecl_trace_arg_count("msvcrt.dll", "calloc"), Some(2));
+        assert_eq!(cdecl_trace_arg_count("msvcrt.dll", "realloc"), Some(2));
+    }
+
+    #[test]
+    fn cdecl_trace_arg_count_returns_none_for_unknown_calls() {
+        assert_eq!(
+            cdecl_trace_arg_count("kernel32.dll", "GetProcessHeap"),
+            None
+        );
+        assert_eq!(cdecl_trace_arg_count("msvcrt.dll", "memcpy"), None);
+        assert_eq!(
+            cdecl_trace_arg_count("MSVCRT.DLL", "malloc"),
+            None,
+            "match is exact-case on dll string per registry contract"
+        );
+    }
+
+    #[cfg(feature = "trace")]
+    #[test]
+    fn dispatch_emits_size_arg_for_msvcrt_malloc() {
+        use std::sync::{Arc, Mutex};
+
+        // Capture sink shared between TraceState (owns Box<dyn Write>)
+        // and the test (reads back the JSONL line).
+        struct CapSink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapSink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+
+        // Bring up an MMU + CPU + registry exactly as a real
+        // dispatch would see them.
+        let mut mmu = Mmu::new();
+        mmu.map(0x4000, 0x4000, Perm::R | Perm::W);
+        mmu.trace.set_sink(Box::new(CapSink(Arc::clone(&buf))));
+
+        let mut cpu = Cpu::new();
+        cpu.regs.set_esp(0x7000);
+
+        let mut registry = Registry::new();
+        // Register a dummy malloc-shaped stub at the msvcrt slot.
+        // The stub returns a known pointer (the value the trace
+        // event records as `ret`); the SIZE arg comes from the
+        // stack at [esp+4] and must surface as `args:[2928]`.
+        fn dummy_malloc_stub(
+            _cpu: &mut Cpu,
+            _mmu: &mut Mmu,
+            _h: &mut HostState,
+            _r: &Registry,
+        ) -> Result<u32, Win32Error> {
+            Ok(0x6000_0000)
+        }
+        let addr = registry.register("msvcrt.dll", "malloc", dummy_malloc_stub, 0);
+
+        // Cdecl call frame: ret addr at [esp], size at [esp+4].
+        // 2928 == 0xb70 — matches the auditor reference value.
+        cpu.push32(&mut mmu, 2928).unwrap(); // arg0 (size)
+        cpu.push32(&mut mmu, 0x1c218058).unwrap(); // saved ret addr (call-site EIP)
+
+        cpu.regs.eip = addr;
+        let mut state = HostState::new(0, 0);
+        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+
+        // The captured JSONL line should carry args:[2928] (decimal,
+        // matching the existing ev_win32_call format), the dummy
+        // pointer in `ret`, and the call-site EIP (NOT the thunk).
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(s.contains(r#""kind":"win32_call""#), "line: {s}");
+        assert!(s.contains(r#""dll":"msvcrt.dll""#), "line: {s}");
+        assert!(s.contains(r#""name":"malloc""#), "line: {s}");
+        assert!(
+            s.contains(r#""args":[2928]"#),
+            "expected args:[2928] (== 0xb70), got: {s}",
+        );
+        assert!(s.contains(r#""ret":"0x60000000""#), "line: {s}");
+        assert!(s.contains(r#""eip":"0x1c218058""#), "line: {s}");
+    }
+
+    #[cfg(feature = "trace")]
+    #[test]
+    fn dispatch_emits_pointer_arg_for_msvcrt_operator_delete() {
+        use std::sync::{Arc, Mutex};
+        struct CapSink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapSink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let mut mmu = Mmu::new();
+        mmu.map(0x4000, 0x4000, Perm::R | Perm::W);
+        mmu.trace.set_sink(Box::new(CapSink(Arc::clone(&buf))));
+        let mut cpu = Cpu::new();
+        cpu.regs.set_esp(0x7000);
+        let mut registry = Registry::new();
+        fn dummy_delete_stub(
+            _cpu: &mut Cpu,
+            _mmu: &mut Mmu,
+            _h: &mut HostState,
+            _r: &Registry,
+        ) -> Result<u32, Win32Error> {
+            Ok(0)
+        }
+        let addr = registry.register("msvcrt.dll", "??3@YAXPAX@Z", dummy_delete_stub, 0);
+        cpu.push32(&mut mmu, 0x6000_02c0).unwrap(); // ptr arg
+        cpu.push32(&mut mmu, 0x1c237e58).unwrap(); // saved ret
+        cpu.regs.eip = addr;
+        let mut state = HostState::new(0, 0);
+        dispatch_stub(&mut cpu, &mut mmu, &registry, &mut state).unwrap();
+        let s = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            s.contains(r#""args":[1610613440]"#),
+            "expected args:[1610613440] (== 0x600002c0), got: {s}",
+        );
+        assert!(s.contains(r#""name":"??3@YAXPAX@Z""#), "line: {s}");
     }
 
     #[test]

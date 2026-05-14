@@ -6,6 +6,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Trace events of `kind=win32_call` now carry the cdecl size /
+  pointer argument for the `msvcrt.dll` heap surface — `malloc`,
+  `free`, `??2@YAPAXI@Z` (operator new), `??3@YAXPAX@Z`
+  (operator delete), and the future `calloc` / `realloc`
+  registrations. Previously the `args` field was always `[]` for
+  these cdecl entries (the registry's `arg_dwords` field is `0`
+  because the *caller* cleans the stack), forcing trace
+  consumers to differentiate via call-site EIP. A new
+  `cdecl_trace_arg_count(dll, name)` table in `src/win32/mod.rs`
+  declares the per-call dword count for known cdecl shapes; the
+  dispatch site reads them off the guest stack at call time and
+  emits them as decimal values in the JSONL `args` array.
+  Required by Auditor P1 — see
+  `docs/video/msmpeg4/audit/06-sandbox-O3-quant-init.md` §5.2.3
+  for the codec-context allocation localisation use-case.
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.0...v0.1.1) - 2026-05-13
 
 ### Other
