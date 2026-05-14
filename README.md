@@ -9,6 +9,31 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 69 — `msadds32.ax` inner-decode NULL-arg-guard hypothesis
+FALSIFIED; E_FAIL traced to RVA `0xe2bb` deep inside the
+inner-inner call chain.**  Round 68's hand-off claimed the round-68
+ffmpeg-extradata trajectory bailed at one of the four NULL-arg
+guards inside the inner decode at `0xc887..0xc973` (`jz 0xc969`
+at offsets `0xc898 / 0xc8a3 / 0xc8ac / 0xc8b7`).  Round 69 arms
+`Cpu::add_register_watchpoint` snapshots at all five sentinel
+sites + the bail target, and proves all four guards PASS:
+`arg0 = 0x60281010`, `arg2 = 0x900ffe9c`, `arg5 = 0x900ffecc`
+non-NULL at every snapshot, and the `0xc969` bail target is NEVER
+reached.  The actual `0x80004005` HRESULT is sourced from RVA
+`0xe2bb` inside function `0xe0f4`, reached via the inner-inner
+call at `0xc92c → 0xc975` — three nested call-stages deeper than
+round 68 hypothesised.  Round 69 also pins two transcription
+errors in the round-64 hand-off: `0xc933` is `mov [ebp+0x1c],
+eax` (round-64 doc missed this 3-byte instruction that stores
+the inner-inner's return INTO the caller's `&samples_produced`
+slot), and the actual `jnz` is at `0xc936` not `0xc935`.
+The round-63 `helper_addref_patch` is **confirmed retirable** on
+the ffmpeg-extradata path — phase 3 (no patch) reaches the inner
+decode and produces identical snapshots to phase 2 (with patch).
+Round-70 hand-off documented at
+`docs/codec/msadds32-receive-e-unexpected.md` §"Round 69".
+5-test harness at `tests/round69_msadds32_inner_decode_watch.rs`.
+
 **Round 67 — discovery probe propagates the round-24
 `ICINFO_SIZE = 568` strict-codec gate; mpg4c32 identity card
 no longer dropped on the floor.**  Round 24 added the

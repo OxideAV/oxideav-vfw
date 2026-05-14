@@ -24,6 +24,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/video/msmpeg4/audit/06-sandbox-O3-quant-init.md` §5.2.3
   for the codec-context allocation localisation use-case.
 
+### Added
+
+- vfw r69: `tests/round69_msadds32_inner_decode_watch.rs` — five
+  `Cpu::add_register_watchpoint` snapshots inside `msadds32.ax`'s
+  inner-decode body at RVA `0xc887..0xc973` empirically falsify
+  round-68's "one of the four NULL-arg guards fires" hypothesis.
+  All four guards (`0xc898 / 0xc8a3 / 0xc8ac / 0xc8b7`) PASS;
+  `arg0 = 0x60281010`, `arg2 = 0x900ffe9c`, `arg5 = 0x900ffecc`
+  pinned non-NULL.  The E_FAIL bail at `0xc969` is NEVER reached
+  on the round-68 trajectory.  The actual `0x80004005` HRESULT is
+  sourced from RVA `0xe2bb` inside function `0xe0f4`, reached
+  via the inner-inner call at `0xc92c → 0xc975`.  Round 69 also
+  catches two transcription errors in the round-64 hand-off:
+  `0xc933` is `mov [ebp+0x1c], eax` (round-64 doc missed this
+  3-byte instruction), and the `jnz` is at `0xc936` not `0xc935`.
+  Round-70 hand-off documented at
+  `docs/codec/msadds32-receive-e-unexpected.md` §"Round 69".
+
 ## [0.1.1](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.0...v0.1.1) - 2026-05-13
 
 ### Other

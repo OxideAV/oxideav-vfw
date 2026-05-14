@@ -344,3 +344,164 @@ inner-decode-no-output bail-out at `0x172f` — the structural
 gate that has blocked round 64 onward — is now BYPASSED.  The
 remaining blocker has moved one decode-stage deeper inside the
 codec.
+
+## Round 69 — inner-decode NULL-guard hypothesis FALSIFIED
+
+Round 69 arms `Cpu::add_register_watchpoint` snapshots inside the
+inner decode body at RVA `0xc887..0xc973` and captures register
+state at five sentinel sites:
+
+| RVA      | role                                                 |
+|----------|------------------------------------------------------|
+| `0xc887` | function entry                                       |
+| `0xc890` | `cmp [ebp+8], eax` — arg0 NULL guard                  |
+| `0xc8a1` | `cmp ebx, eax` — arg2 NULL guard (ebx = arg2)         |
+| `0xc8a9` | `cmp [ebp+0x14], eax` — arg3 NULL guard               |
+| `0xc8b5` | `cmp edi, eax` — arg5 NULL guard (edi = arg5)         |
+
+The 5-test harness at `tests/round69_msadds32_inner_decode_watch.rs`
+records the empirical result with the round-68 ffmpeg-derived
+extradata + round-63 patch combo:
+
+* **All four NULL guards PASS** (the snapshots pin `arg0`, `arg2`,
+  `arg3`, `arg5` as non-zero at every guard site).  Specifically,
+  `arg0 = 0x60281010`, `arg2 = 0x900ffe9c` (a stack pointer into the
+  outer Receive's `&[ebp-0x40]` slot), `arg5 = 0x900ffecc` (a stack
+  pointer into the outer `&[ebp-0x10]` slot).
+* **The E_FAIL bail at `0xc969` is NEVER reached** (the watchpoint
+  there records zero hits).
+* The inner decode runs cleanly through to its inner-inner call at
+  `0xc92c: call 0xc975`, then exits via the `jnz +0x36 → 0xc96e`
+  at `0xc936`, NOT via the `0xc969` E_FAIL bail.
+* The actual `0x80004005` HRESULT is sourced from RVA `0xe2bb`
+  (one of 17 `mov eax, 0x80004005` sites in the binary), inside a
+  function whose entry is at RVA `0xe0f4`, reached deep inside the
+  `0xc975` inner-inner call chain.
+* Round-64's "actual jnz is at `0xc935`" claim is also a **typo
+  in the round-64 hand-off**: the real `75 36 jnz` is at RVA
+  `0xc936`; RVA `0xc935` is the last byte of the prior `mov
+  [ebp+0x1c], eax` (`89 45 1c`).
+
+### Corrected disassembly of `0xc92c..0xc972`
+
+Raw bytes confirm:
+
+```text
+0xc92c: e8 44 00 00 00     call 0xc975          ; inner-inner decode
+0xc931: 85 c0              test eax, eax        ; eax = inner-inner ret
+0xc933: 89 45 1c           mov [ebp+0x1c], eax  ; **STORES eax into arg5
+                                                ; out-slot (samples_produced)**
+0xc936: 75 36              jnz +0x36 → 0xc96e   ; bail (eax is non-zero)
+0xc938..0xc962: success-tail
+0xc962: eb 8e              jmp -0x72 → 0xc8f2   ; loop back (more decode)
+0xc964..0xc968: 8b 45 1c / eb 05  (UNREACHED on this run)
+0xc969: b8 05 40 00 80     mov eax, 0x80004005  ; E_FAIL  (UNREACHED)
+0xc96e: 5f                 pop edi              ; epilogue
+0xc96f: 5e                 pop esi
+0xc970: 5b                 pop ebx
+0xc971: c9                 leave
+0xc972: c2 24 00           ret 0x24             ; 9 stdcall args
+```
+
+Two important corrections relative to round-64's reading:
+
+1. **`0xc933` is `mov [ebp+0x1c], eax`** — the codec stores the
+   inner-inner's return value INTO the caller's `samples_produced`
+   out-slot (arg5).  Round 64's transcription missed this 3-byte
+   instruction.  This means when the inner-inner returns a non-zero
+   HRESULT (e.g. `0x80004005`), that HRESULT is also written into
+   the outer Receive's "samples produced" slot — but the outer
+   never reads it from there because it bails on the inner decode's
+   own non-zero return.
+2. **The actual `jnz` is at `0xc936`** (`75 36`), not `0xc935`.
+   The fifth-byte offset between round-64's hand-off note and the
+   raw bytes is a transcription error in that note.
+
+### How the outer Receive bails
+
+Outer-Receive trajectory pinned by `tests/round69_msadds32_inner_decode_watch.rs::phase5`:
+
+```text
+0x1643: e8 3f b2 00 00     call 0xc887           ; inner decode
+0x1648: 3b c3              cmp eax, ebx           ; eax == 0 ?
+0x164a: 89 45 08            mov [ebp+0x08], eax   ; stash as HRESULT
+0x164d: 0f 85 e3 00 00 00  jnz +0xe3 → 0x1736    ; ←── BAIL (eax = E_FAIL)
+0x1736..: cleanup tail
+```
+
+The visited-EIP set confirms all of `0x1643 / 0x1648 / 0x164a /
+0x164d / 0x1736` are reached, but `0x165b / 0x172f / 0x176c` are
+NOT — meaning the bail is the inner-decode-return-non-zero path
+(`jnz at 0x164d`), NOT the "two consecutive no-output iterations"
+path (`jnz at 0x165b → 0x172f`) that produces E_UNEXPECTED.
+
+### Diagnosis
+
+The round-68 hand-off's hypothesis — "one of the four NULL-arg
+guards fires at `0xc898 / 0xc8a3 / 0xc8ac / 0xc8b7`" — is
+**FALSIFIED**.  None of those four `jz` branches is taken on the
+round-68 trajectory.  The actual E_FAIL emission is much deeper:
+
+* `Receive` → calls `0xc887` (inner decode)
+* `0xc887` → arg-NULL guards all pass → reaches `0xc92c: call 0xc975` (inner-inner)
+* `0xc975` → runs a 95-RVA call chain that ends at the function
+  starting at `0xe0f4`
+* `0xe0f4` → at offset `+0x5a` (RVA `0xe14e: test eax, eax`),
+  the call at `0xe13c → 0xea3a` returned non-zero, taking the
+  `jne +0xbb → 0xe211` path
+* `0xe211..0xe2b9` → continues with checks against `eax == 1`,
+  ultimately emitting `mov eax, 0x80004005` at RVA `0xe2bb`
+* The non-zero HRESULT propagates back up through `0xc975` and
+  `0xc887` to the outer Receive's `0x164d` bail.
+
+### Round 69 conclusions
+
+1. The four NULL-arg guards are RED HERRINGS — all four args are
+   non-NULL on the round-68 trajectory.  Round 69's harness
+   asserts this empirically via `phase2_watch_inner_decode_arg_guards_with_patch_and_ffmpeg_extradata`.
+2. The E_FAIL is sourced from RVA `0xe2bb` inside function
+   `0xe0f4`.  `0xe0f4` is itself reached via the call at `0xe13c`
+   to `0xea3a` returning non-zero — so the bail starts even
+   deeper.  Tracing to the actual condition that flips eax
+   non-zero at `0xea3a` is the round-70 task.
+3. Round 64's transcription of the inner decode at `0xc931..` had
+   two errors (missing `mov [ebp+0x1c], eax` at `0xc933`; the
+   `jnz` is at `0xc936` not `0xc935`).  This document supersedes
+   round 64's reading for those 6 bytes.
+4. The round-63 `helper_addref_patch` is **confirmed retirable**
+   on the ffmpeg-extradata path: phase 3 (NO patch) reaches the
+   inner decode and produces identical snapshots to phase 2 (WITH
+   patch).  The patch can be removed from
+   `tests/round68_msadds32_real_extradata.rs::phase3` and
+   `phase4` without regressing this trajectory.  Retirement is
+   left to round 70 to bundle with the next forward step.
+
+### Round-70 hand-off
+
+The forensic next step is to trace into `0xea3a` (the call from
+`0xe13c` inside `0xe0f4`).  Arm `add_register_watchpoint`
+snapshots at:
+
+* `0xea3a` — function entry; capture this-pointer (`ecx`) and
+  stack args.
+* `0xea44` — `cmp [esi+8], edi` (where esi = this); if `[this+8]
+  == 0`, the function bails immediately with `eax = 0`.  Since
+  the call site at `0xe13c` returned non-zero, the `[this+8]`
+  check passed.
+* The 4 conditional branches inside `0xea3a..0xeb47` that lead to
+  a `mov eax, ...` of a non-zero value.
+
+Two concrete candidates for the root condition:
+
+* `0xe141: cmp [ebx+0x468], 0` — this is the first conditional
+  inside `0xe0f4` after the `0xe13c` call.  At `0xe14e: test
+  eax, eax / 0xe150: jne → 0xe211`, eax is being tested.  But
+  the `cmp [ebx+0x468]` happened just BEFORE that test, at
+  `0xe141`.  Whether `[ebx+0x468]` is zero or non-zero is set by
+  the `0xe13c` call OR by the codec's earlier state.
+* Field `[ebx+0x468]` looks like a "decode error counter" or
+  "frame-status flags" common in audio decoders (WMA's
+  bitstream-error-recovery state).  Tracing the WRITES to this
+  field across the bring-up calls (ReceiveConnection / Pause /
+  Run) will reveal whether the codec ever populates it; if it
+  remains uninitialised, that's the round-70 blocker.
