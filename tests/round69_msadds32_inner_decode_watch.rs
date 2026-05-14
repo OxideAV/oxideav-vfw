@@ -569,9 +569,7 @@ fn run_watch_armed_receive(
     let mem_snap = sb.cpu.take_memory_snapshots();
     let regs_snap = sb.cpu.clear_register_watchpoints();
     let mut snapshots: Vec<Snapshot> = Vec::with_capacity(regs_snap.len());
-    for (i, ((eip, regs), (_eip_mem, mem))) in
-        regs_snap.into_iter().zip(mem_snap).enumerate()
-    {
+    for (i, ((eip, regs), (_eip_mem, mem))) in regs_snap.into_iter().zip(mem_snap).enumerate() {
         snapshots.push(Snapshot {
             eip,
             fire_order: i,
