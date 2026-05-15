@@ -505,3 +505,156 @@ Two concrete candidates for the root condition:
   field across the bring-up calls (ReceiveConnection / Pause /
   Run) will reveal whether the codec ever populates it; if it
   remains uninitialised, that's the round-70 blocker.
+
+## Round 70 — bail JCC re-pinned to `0xe282`, NOT `0xe148`
+
+Round 70 (`tests/round70_msadds32_ea3a_forensic.rs`, 4-phase
+harness) traces into `0xea3a` and pins the actual conditional
+that steers `0xe0f4` to the `0x80004005` E_FAIL stamp at `0xe2bb`.
+
+### Headline finding
+
+A linear-byte scan of `.text` for jumps targeting RVA `0xe2bb`
+identifies **NINE** distinct bail JCCs inside `0xe0f4`'s body
+(not just the `0xe148` jne after `cmp [ebx+0x468], 0` that round
+69 highlighted):
+
+| RVA      | bytes           | mnemonic                                      |
+|----------|-----------------|-----------------------------------------------|
+| `0xe148` | `0f 85 6d 01 00 00` | `jne` (after `cmp [ebx+0x468], 0`)        |
+| `0xe173` | `0f 85 …`         | `jne`                                         |
+| `0xe19e` | `0f 85 …`         | `jne`                                         |
+| `0xe1a6` | `0f 8c …`         | `jl`                                          |
+| `0xe1c5` | `0f 85 …`         | `jne`                                         |
+| `0xe205` | `0f 8d …`         | `jge`                                         |
+| `0xe22b` | `0f 8c …`         | `jl`                                          |
+| `0xe266` | `75 53`           | `jne` (after `cmp [ebx+0x468], 0` — repeat)  |
+| `0xe282` | `7d 37`           | `jge` (after `cmp edi, [ebp+0x10]`)          |
+
+Phase 4 arms a watchpoint at every bail JCC + at `0xe2bb` and
+identifies the FIRST bail JCC fired before each `0xe2bb` snapshot.
+The empirical answer: **`0xe282`** (NOT `0xe148`).  At the bail
+moment:
+
+```text
+edi          = 0x00000748   (output sample index, loop counter)
+[ebp+0x10]   = 0x00000748   (loop bound — codec's declared sample count)
+[ebp+8]      = 0x00000747   (previous iteration's stored edi)
+[ebp+0xc]    = 0x00000001
+ebx          = 0x60209120   (= outer_this; [ebx+0x468] = 0)
+```
+
+The `cmp edi, [ebp+0x10]; jge +0x37 → 0xe2bb` sequence at
+`0xe27d..0xe282` fires when the loop counter has reached the
+declared sample-count bound.  Critically, the `[ebx+0x468]` field
+that round 69 hypothesised as the bail predicate was empirically
+**zero at every snapshot of `0xe141`** — the JNE at `0xe148` was
+NOT taken on this run.
+
+### Round-69 hypothesis FALSIFIED
+
+Round 69's reading "`[ebx+0x468]` is the bail predicate" is
+**WRONG** — `[ebx+0x468]` is the `0xe148` predicate, but `0xe148`
+isn't fired at all on the round-70 trajectory.  The actual bail is
+the loop-overflow check `0xe282`.
+
+### Disassembly of `0xe267..0xe293` (the loop tail)
+
+Bytes from `msadds32.ax` raw image:
+
+```text
+0xe25d: ff 06                    inc dword [esi]
+0xe25f: 83 bb 68 04 00 00 00      cmp [ebx+0x468], 0
+0xe266: 75 53                    jne +0x53 → 0xe2bb     ; ALSO an E_FAIL bail
+0xe268: 8b 4d f8                 mov ecx, [ebp-8]
+0xe26b: 85 c0                   test eax, eax
+0xe26d: 8b 45 14                 mov eax, [ebp+0x14]
+0xe270: 0f bf 04 08              movsx eax, word [eax+ecx]
+0xe274: 75 02                   jne +2 → 0xe278
+0xe276: f7 d8                   neg eax                  ; conditionally negate
+0xe278: 8b 4d fc                 mov ecx, [ebp-4]
+0xe27b: 3b 7d 10                 cmp edi, [ebp+0x10]    ; loop counter vs bound
+0xe27e: 66 89 04 79              mov [ecx + edi*2], ax  ; STORE 16-bit sample
+0xe282: 7d 37                   jge +0x37 → 0xe2bb     ; ←── ACTUAL ROUND-70 BAIL
+0xe284: 47                      inc edi
+0xe285: 89 7d 08                 mov [ebp+8], edi
+0xe288: 8b c7                   mov eax, edi
+0xe28a: 3b 45 10                 cmp eax, [ebp+0x10]
+0xe28d: 0f 8c 9b fe ff ff        jl 0xe12e              ; loop back if < bound
+0xe293: 33 c0                   xor eax, eax            ; success exit
+0xe295..: pop edi/esi/ebx; leave; ret 0x10
+```
+
+### Disassembly of `0xea3a` (the helper called from `0xe13c`)
+
+`0xea3a` is a `__fastcall` (this in ECX) helper that walks a
+chained sub-table indexed by `this->field_18`.  Per phase 1's
+empirical capture:
+
+* `[esi+8]` (where esi=this) at the first hit = `0x00000013`
+  (non-zero) → JNZ at `0xea47` taken → continues into the helper
+  body (does NOT take the early-return-zero path at `0xea49..0xea4b`).
+* The function loops at `0xea51..0xea96` walking sub-table entries,
+  with both helper calls (`0xe928` at `0xea5a`, `0xe9a9` at `0xea75`
+  / `0xeaa2`) invoked.
+* On the round-70 trajectory the function's return value is small
+  (1..0xff range; phase 1 logged `eax=0x16/0x3c` at the `0xeab1`
+  epilogue snapshot).
+* `0xea3a` itself does NOT write to `[outer_this+0x468]` — the
+  call writes to `*arg2` (the outer's `[esi]` slot, an event
+  counter — see `0xea83 / 0xeaad: add [eax], ecx`).  Phase 3's
+  pre-call vs post-call probe of `[outer_this+0x468]` confirms
+  the field is UNCHANGED across the call (`pre = post = 0`).
+
+### Helper_addref patch retirement — confirmed
+
+Phase 2 runs the same arm-set twice (with patch / without patch)
+and reports IDENTICAL reach-sets.  The round-63
+[`Sandbox::msadds32_patch_helper_addref`] workaround is therefore
+**confirmed retirable** on the ffmpeg-extradata path — round 70's
+forensic phases 1, 3, and 4 all run with `apply_helper_addref_patch
+= None` and reach `0xea3a / 0xe141 / 0xe282 / 0xe2bb` cleanly.
+The patch API is preserved on `Sandbox` for prior-round test
+backwards compatibility (rounds 63/64/65/68/69 still call it
+explicitly), but the function is structurally unnecessary on the
+trajectory round 70 walks.
+
+### Round-71 hand-off
+
+The bail predicate is the loop-counter vs `[ebp+0x10]` comparison
+at `0xe27b`.  `[ebp+0x10]` is the second arg to `0xe0f4` (passed
+by the caller — one of `0xc975`'s downstream call sites).
+
+The forensic next step:
+
+1. Trace `[ebp+0x10]`'s source — which call into `0xe0f4` passes
+   what value as arg2?  Most likely it's a sample-count derived
+   from the input frame's `WAVEFORMATEX::nSamplesPerSec` /
+   `nBlockAlign`, or from the ffmpeg-extradata preamble's
+   per-superframe header.
+2. The loop body at `0xe21a..0xe293` walks `[ebp+0x10]` output
+   samples per outer iteration.  At iteration boundary, edi (the
+   stored output position at `[ebp+8]`) is reloaded from `[ebp-4]`
+   (sub-table position) at the JL back-edge `0xe28d → 0xe12e`.
+3. The bail at `0xe282` fires when `edi >= [ebp+0x10]` BEFORE the
+   16-bit store at `0xe27e`.  Since the normal exit `0xe293`
+   fires AFTER the same store + edi-increment + bound check at
+   `0xe28a..0xe28d`, the bail-vs-success distinction is exactly
+   one iteration: if the codec's bitstream demands MORE samples
+   than `[ebp+0x10]` allows, `0xe282` fires; if EXACTLY-fits,
+   `0xe293` fires; if FEWER, the loop back-edge re-iterates.
+4. The actionable trace target: `0xe27b: cmp edi, [ebp+0x10]` —
+   write a memory watchpoint on the slot `[ebp-4]` (sub-table
+   position) and on `[ebp+0x10]` to capture how `edi` accumulates
+   across iterations and what the bound is set to.  Likely the
+   codec's bitstream is mis-decoded (wrong huffman table /
+   bit-position) and emits one extra sub-frame.
+
+### Architectural significance
+
+This round narrows the bail signature from "deep call chain to
+`0xe2bb`" (round 69) to a specific output-sample-overrun loop
+condition at `0xe27b..0xe282`.  Round 71's investigation surface
+is now ONE basic block (`0xe21a..0xe293`) plus the call into
+`0xe0f4` itself — a 2-3× reduction in surface compared to round
+69's hand-off.

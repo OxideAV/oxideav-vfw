@@ -9,6 +9,27 @@ through a software-interpreter sandbox.
 
 ## Status
 
+**Round 70 — `msadds32.ax` E_FAIL bail JCC re-pinned to `0xe282`
+(loop-overflow), NOT `0xe148` (`[ebx+0x468]` test).**  Round 70
+traces into `0xea3a` and identifies that the `0x80004005` HRESULT
+at `0xe2bb` is reached from the `jge +0x37` at RVA `0xe282` after
+`cmp edi, [ebp+0x10]` (loop counter vs declared sample-count
+bound), NOT from any of the 8 other JCCs in `0xe0f4`'s body that
+also target `0xe2bb`.  At the bail moment `edi = 0x748` and
+`[ebp+0x10] = 0x748` — the loop walked the sample emission count
+up to the codec's declared bound and then bailed.  Round 70 also
+re-confirms the round-63 `helper_addref_patch` is **retirable**
+on the ffmpeg-extradata path (phase 2 A/B run with vs without the
+patch produces identical reach-sets); the patch API is preserved
+on `Sandbox` for prior-round test backwards compatibility.
+Round-69's hypothesis that `[ebx+0x468]` is the bail predicate is
+**FALSIFIED** — at every `0xe141` snapshot post-mortem,
+`[ebx+0x468] == 0`, so the JNE at `0xe148` was NOT taken.
+Round-71 hand-off: trace `[ebp+0x10]`'s source and the bitstream
+that overruns the sample bound.  4-test harness at
+`tests/round70_msadds32_ea3a_forensic.rs`; round-70 disasm in
+`docs/codec/msadds32-receive-e-unexpected.md` §"Round 70".
+
 **Round 69 — `msadds32.ax` inner-decode NULL-arg-guard hypothesis
 FALSIFIED; E_FAIL traced to RVA `0xe2bb` deep inside the
 inner-inner call chain.**  Round 68's hand-off claimed the round-68

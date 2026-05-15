@@ -6,6 +6,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- vfw r70: `tests/round70_msadds32_ea3a_forensic.rs` — 4-test
+  harness traces into `msadds32.ax`'s `0xea3a` helper called from
+  RVA `0xe13c` inside `0xe0f4`, and **re-pins** the actual bail
+  JCC that reaches the `0x80004005` E_FAIL stamp at `0xe2bb`.
+  Round 69 hypothesised the bail was the `jne` at `0xe148` after
+  `cmp [ebx+0x468], 0`; round 70 enumerates all 9 JCCs inside
+  `0xe0f4`'s body that target `0xe2bb` (linear-byte scan) and
+  identifies the actual bail as `0xe282: jge +0x37` after `cmp
+  edi, [ebp+0x10]`.  At the bail moment `edi = 0x748`,
+  `[ebp+0x10] = 0x748` — the codec walked its output-sample
+  emission counter up to the declared sample-count bound and
+  bailed via the loop-overflow path, NOT via the
+  `[outer_this+0x468]` flag check (which empirically reads zero
+  at every snapshot of `0xe141`).  Round 70 also re-confirms
+  the round-63 `helper_addref_patch` is **retirable** on the
+  ffmpeg-extradata path: phase 2's A/B (with-patch / no-patch)
+  produces identical reach-sets across all armed sentinel sites.
+  The `Sandbox::msadds32_patch_helper_addref` API is preserved
+  for prior-round (r63/r64/r65/r68/r69) test backwards
+  compatibility; round 70 phases 1, 3, and 4 all run without the
+  patch.  Round-71 hand-off documented at
+  `docs/codec/msadds32-receive-e-unexpected.md` §"Round 70".
+
 ### Changed
 
 - Trace events of `kind=win32_call` now carry the cdecl size /
