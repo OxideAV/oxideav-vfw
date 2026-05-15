@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- vfw r70 (piece B / task #829): `Sandbox::ic_get_state(handle,
+  &mut buf) -> Result<u32>` and `Sandbox::ic_set_state(handle, &buf)
+  -> Result<()>` — host-side wrappers for the VfW `ICM_GETSTATE`
+  (`0x5009`) and `ICM_SETSTATE` (`0x500A`) messages, mirroring the
+  existing `ic_compress_*` family.  Required by oxideav-tracevfw
+  to drive the codec encoder's per-quality-knob round-trip.
+  `ic_get_state` returns the byte count the codec actually wrote
+  (or its raw `LRESULT` for codecs that report `ICERR_UNSUPPORTED`
+  — empirical finding for `mpg4c32.dll`, which reports `-1`
+  meaning "no per-instance state to serialise via the VfW state
+  surface").  `ic_set_state` returns `Ok(())` on `ICERR_OK` or
+  surfaces the codec's failure `LRESULT` via `Win32Error::
+  InvalidArgument`.  3-test integration harness at
+  `tests/round70_ic_get_set_state.rs` (probe / round-trip /
+  canned-driver smoke), 5 in-module unit tests in
+  `src/win32/vfw32.rs`.
+
 - vfw r70: `tests/round70_msadds32_ea3a_forensic.rs` — 4-test
   harness traces into `msadds32.ax`'s `0xea3a` helper called from
   RVA `0xe13c` inside `0xe0f4`, and **re-pins** the actual bail

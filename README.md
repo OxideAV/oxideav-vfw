@@ -10,25 +10,39 @@ through a software-interpreter sandbox.
 ## Status
 
 **Round 70 — `msadds32.ax` E_FAIL bail JCC re-pinned to `0xe282`
-(loop-overflow), NOT `0xe148` (`[ebx+0x468]` test).**  Round 70
-traces into `0xea3a` and identifies that the `0x80004005` HRESULT
-at `0xe2bb` is reached from the `jge +0x37` at RVA `0xe282` after
-`cmp edi, [ebp+0x10]` (loop counter vs declared sample-count
-bound), NOT from any of the 8 other JCCs in `0xe0f4`'s body that
-also target `0xe2bb`.  At the bail moment `edi = 0x748` and
-`[ebp+0x10] = 0x748` — the loop walked the sample emission count
-up to the codec's declared bound and then bailed.  Round 70 also
-re-confirms the round-63 `helper_addref_patch` is **retirable**
-on the ffmpeg-extradata path (phase 2 A/B run with vs without the
-patch produces identical reach-sets); the patch API is preserved
-on `Sandbox` for prior-round test backwards compatibility.
-Round-69's hypothesis that `[ebx+0x468]` is the bail predicate is
+(loop-overflow), NOT `0xe148` (`[ebx+0x468]` test); plus
+`Sandbox::ic_get_state` / `ic_set_state` API for tracevfw.**
+Round 70 traces into `0xea3a` and identifies that the `0x80004005`
+HRESULT at `0xe2bb` is reached from the `jge +0x37` at RVA
+`0xe282` after `cmp edi, [ebp+0x10]` (loop counter vs declared
+sample-count bound), NOT from any of the 8 other JCCs in
+`0xe0f4`'s body that also target `0xe2bb`.  At the bail moment
+`edi = 0x748` and `[ebp+0x10] = 0x748` — the loop walked the
+sample emission count up to the codec's declared bound and then
+bailed.  Round 70 also re-confirms the round-63
+`helper_addref_patch` is **retirable** on the ffmpeg-extradata
+path (phase 2 A/B run with vs without the patch produces
+identical reach-sets); the patch API is preserved on `Sandbox`
+for prior-round test backwards compatibility.  Round-69's
+hypothesis that `[ebx+0x468]` is the bail predicate is
 **FALSIFIED** — at every `0xe141` snapshot post-mortem,
 `[ebx+0x468] == 0`, so the JNE at `0xe148` was NOT taken.
 Round-71 hand-off: trace `[ebp+0x10]`'s source and the bitstream
 that overruns the sample bound.  4-test harness at
 `tests/round70_msadds32_ea3a_forensic.rs`; round-70 disasm in
 `docs/codec/msadds32-receive-e-unexpected.md` §"Round 70".
+
+Piece B (task #829) lands `Sandbox::ic_get_state(handle, &mut buf)
+-> Result<u32>` and `Sandbox::ic_set_state(handle, &buf) ->
+Result<()>` host-side wrappers for the VfW `ICM_GETSTATE` (`0x5009`)
+and `ICM_SETSTATE` (`0x500A`) messages, mirroring the existing
+`ic_compress_*` family.  Required by oxideav-tracevfw to drive the
+codec encoder's per-quality-knob round-trip.  Empirical finding:
+`mpg4c32.dll` returns `ICERR_UNSUPPORTED` (`-1`) for both messages
+— this codec has no per-instance state to serialise via the VfW
+state surface.  3 integration tests at
+`tests/round70_ic_get_set_state.rs`, 5 in-module unit tests in
+`src/win32/vfw32.rs`.
 
 **Round 69 — `msadds32.ax` inner-decode NULL-arg-guard hypothesis
 FALSIFIED; E_FAIL traced to RVA `0xe2bb` deep inside the
