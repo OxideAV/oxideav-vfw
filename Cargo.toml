@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust 32-bit x86 emulator + PE loader + Video for Windows host that lets oxideav delegate decoding to legitimately-licensed Windows codec DLLs on any platform — for rare/legacy codec compatibility, not day-to-day playback. See docs/winmf/winmf-emulator.md for the design contract."
+description = "Thin bridge that wires the ud-emulator 32-bit x86 / PE32 / Video for Windows sandbox into the oxideav codec registry, plus the FS-walking discovery layer that probes ~/.local/share/oxideav/codecs/ for legitimately-licensed Windows codec DLLs."
 repository = "https://github.com/OxideAV/oxideav-vfw"
 homepage = "https://github.com/OxideAV/oxideav-vfw"
 readme = "README.md"
@@ -20,30 +20,23 @@ registry = ["dep:oxideav-core"]
 # default), probe each `*.dll` / `*.ax` for a VfW or DirectShow
 # entry point, and register one `Codec` per recognised FourCC.
 # Default-on; consumers building with `default-features = false`
-# get the manual `Sandbox` API without the FS scan.
+# get the bare ud-emulator re-exports without the FS scan.
 auto-discovery = ["registry", "dep:log", "dep:serde", "dep:serde_json"]
-# Trace mode — adds reverse-engineering instrumentation surface
-# (Win32 stub calls, memory watchpoints, traps) that emits JSONL
-# events to a sink configured via the `OXIDEAV_VFW_TRACE_FILE`
-# environment variable or [`Sandbox::set_trace_sink`]. Off by
-# default; compatibility-only consumers do not pay for the
-# probe-site branches. See docs/winmf/winmf-emulator.md
-# §"Trace mode" for the design contract.
-trace = []
+# Trace mode — passthrough to `ud-emulator/trace`. Off by default.
+# See ud-emulator's docs for the JSONL probe-site schema.
+trace = ["ud-emulator/trace"]
 # Sub-feature — enables per-instruction execution trace inside
-# the `trace` mode. Imposes ~3× extra overhead on top of `trace`,
-# so it gates separately. Has no effect unless `trace` is also
-# enabled.
-trace-exec = ["trace"]
+# `trace` mode. Imposes ~3× extra overhead on top of `trace`.
+trace-exec = ["trace", "ud-emulator/trace-exec"]
 
 [dependencies]
+ud-emulator = "0.1"
 oxideav-core = { version = "0.1", optional = true }
 log = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
-# Used by tests/common/mod.rs to fetch codec DLL fixtures on
-# demand from samples.oxideav.org. Dev-dep only, so the
-# production crate's dependency tree is unaffected.
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# Tests that exercise the bridge's `discover()` cache layer use the
+# synthetic-PE helper from ud-emulator (`pe::test_image::build_minimal_dll`).
+ud-emulator = "0.1"

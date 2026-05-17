@@ -20,7 +20,7 @@ use oxideav_core::{
     Packet, PixelFormat, Result, RuntimeContext, VideoFrame, VideoPlane,
 };
 
-use crate::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
+use ud_emulator::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
 
 use super::probe::{fourcc_to_bytes, Kind};
 
@@ -222,9 +222,9 @@ struct SandboxedVfwDecoder {
     /// and consumers may discard the result without ever calling
     /// `send_packet`, so we don't pay for the DLL load until it
     /// matters.
-    sandbox: Option<crate::Sandbox>,
+    sandbox: Option<ud_emulator::Sandbox>,
     /// Loaded image — kept alive alongside the sandbox.
-    image: Option<crate::pe::Image>,
+    image: Option<ud_emulator::pe::Image>,
     /// Currently-open ICOpen handle. `0` means "not opened yet".
     hic: u32,
     /// True once `ICDecompressBegin` has run successfully on
@@ -336,7 +336,7 @@ impl SandboxedVfwDecoder {
         if self.sandbox.is_none() {
             let bytes = std::fs::read(&self.record.dll_path)
                 .map_err(|e| Error::other(format!("vfw discovery: read DLL failed: {e}")))?;
-            let mut sb = crate::Sandbox::new();
+            let mut sb = ud_emulator::Sandbox::new();
             // VfW codecs (esp. mpg4c32) need a generous instruction
             // budget to walk the larger fixtures' P-frames; the
             // round-24 manual path uses 8 G instructions for the
@@ -348,7 +348,7 @@ impl SandboxedVfwDecoder {
             sb.install_codec(&img)
                 .map_err(|e| Error::other(format!("vfw discovery: install_codec failed: {e}")))?;
             // Drive DllMain so any per-DLL CRT init runs.
-            let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+            let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
             let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
             let fcc_type = u32::from_le_bytes(*b"VIDC");
@@ -581,8 +581,8 @@ impl Drop for SandboxedVfwDecoder {
 struct SandboxedDshowDecoder {
     codec_id: CodecId,
     record: DiscoveryRecord,
-    sandbox: Option<crate::Sandbox>,
-    image: Option<crate::pe::Image>,
+    sandbox: Option<ud_emulator::Sandbox>,
+    image: Option<ud_emulator::pe::Image>,
     /// IBaseFilter pointer (after CreateInstance).
     filter: u32,
     /// First input pin (after EnumPins → Next).
@@ -741,12 +741,12 @@ impl SandboxedDshowDecoder {
             let bytes = std::fs::read(&self.record.dll_path).map_err(|e| {
                 Error::other(format!("vfw discovery (DShow): read DLL failed: {e}"))
             })?;
-            let mut sb = crate::Sandbox::new();
+            let mut sb = ud_emulator::Sandbox::new();
             sb.cpu.set_instr_limit(8_000_000_000);
             let img = sb.load("codec.ax", &bytes).map_err(|e| {
                 Error::other(format!("vfw discovery (DShow): Sandbox::load failed: {e}"))
             })?;
-            let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+            let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
             // Resolve the CLSID from the discovery record.
             let clsid_str = self.record.clsid.as_deref().ok_or_else(|| {
@@ -755,20 +755,20 @@ impl SandboxedDshowDecoder {
                      can't drive DllGetClassObject",
                 )
             })?;
-            let clsid = crate::com::Guid::parse(clsid_str).map_err(|e| {
+            let clsid = ud_emulator::com::Guid::parse(clsid_str).map_err(|e| {
                 Error::other(format!(
                     "vfw discovery (DShow): bad CLSID {clsid_str:?}: {e}"
                 ))
             })?;
             let _factory = sb
-                .dll_get_class_object(&img, clsid, crate::IID_ICLASSFACTORY)
+                .dll_get_class_object(&img, clsid, ud_emulator::IID_ICLASSFACTORY)
                 .map_err(|e| {
                     Error::other(format!(
                         "vfw discovery (DShow): DllGetClassObject failed: {e}"
                     ))
                 })?;
             let filter = sb
-                .co_create_instance(clsid, crate::IID_IBASEFILTER)
+                .co_create_instance(clsid, ud_emulator::IID_IBASEFILTER)
                 .map_err(|e| {
                     Error::other(format!(
                         "vfw discovery (DShow): co_create_instance failed: {e}"
@@ -799,13 +799,13 @@ impl SandboxedDshowDecoder {
             let host_graph = sb.mint_host_filter_graph().map_err(|e| {
                 Error::other(format!("vfw discovery (DShow): mint host graph: {e}"))
             })?;
-            let _ = crate::com::call::call_method(
+            let _ = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
                 &mut sb.host,
                 self.filter,
-                crate::com::SLOT_BASEFILTER_JOIN_FILTER_GRAPH,
+                ud_emulator::com::SLOT_BASEFILTER_JOIN_FILTER_GRAPH,
                 &[host_graph, 0],
             );
             self.host_graph = host_graph;
@@ -814,7 +814,7 @@ impl SandboxedDshowDecoder {
         // Round 31 A — walk the codec's input pin AMT enumeration
         // first.  If it surfaces any AMTs, prefer them over the
         // fabricated VIH+BIH the round-30 path forced.
-        let captured = crate::com::host_iface_r31::walk_codec_input_pin_amts(
+        let captured = ud_emulator::com::host_iface_r31::walk_codec_input_pin_amts(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
@@ -853,7 +853,7 @@ impl SandboxedDshowDecoder {
                         "vfw discovery (DShow): mint host output pin (codec amt {i}): {e}"
                     ))
                 })?;
-            let r = crate::com::call::call_method(
+            let r = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
@@ -883,7 +883,7 @@ impl SandboxedDshowDecoder {
                         "vfw discovery (DShow): mint host output pin (synth): {e}"
                     ))
                 })?;
-            let r = crate::com::call::call_method(
+            let r = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
@@ -912,7 +912,7 @@ impl SandboxedDshowDecoder {
 
         // QI for IMemInputPin.
         let mip = sb
-            .query_interface(self.input_pin, crate::IID_IMEMINPUTPIN)
+            .query_interface(self.input_pin, ud_emulator::IID_IMEMINPUTPIN)
             .map_err(|e| {
                 Error::other(format!(
                     "vfw discovery (DShow): QI IMemInputPin failed: {e}"
@@ -948,13 +948,13 @@ impl SandboxedDshowDecoder {
                     "vfw discovery (DShow): codec_alloc out-slot init: {e}"
                 ))
             })?;
-        let r_ga = crate::com::call::call_method(
+        let r_ga = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             mip,
-            crate::com::SLOT_MEMINPUTPIN_GET_ALLOCATOR,
+            ud_emulator::com::SLOT_MEMINPUTPIN_GET_ALLOCATOR,
             &[codec_alloc_pp],
         )
         .map_err(|e| {
@@ -1000,7 +1000,7 @@ impl SandboxedDshowDecoder {
         // shape — pool size 4, cbBuffer big enough for the largest
         // keyframe we'd push (we use 384*288*3 = 331_776, capped at
         // 256 KiB minimum), cbAlign = 1, cbPrefix = 0.
-        if r_ga == crate::com::S_OK && codec_alloc != 0 {
+        if r_ga == ud_emulator::com::S_OK && codec_alloc != 0 {
             let props = sb.host.arena_alloc(16).map_err(|e| {
                 Error::other(format!(
                     "vfw discovery (DShow): codec_alloc props arena: {e}"
@@ -1034,13 +1034,13 @@ impl SandboxedDshowDecoder {
                         ))
                     })?;
             }
-            let r_sp = crate::com::call::call_method(
+            let r_sp = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
                 &mut sb.host,
                 codec_alloc,
-                crate::com::SLOT_MEMALLOCATOR_SET_PROPERTIES,
+                ud_emulator::com::SLOT_MEMALLOCATOR_SET_PROPERTIES,
                 &[props, actual],
             )
             .map_err(|e| {
@@ -1060,13 +1060,13 @@ impl SandboxedDshowDecoder {
             // other VFW_S_* informational codes from SetProperties
             // when their internal pool already matches the request.
             if (r_sp & 0x8000_0000) == 0 {
-                let r_co = crate::com::call::call_method(
+                let r_co = ud_emulator::com::call::call_method(
                     &mut sb.cpu,
                     &mut sb.mmu,
                     &sb.registry,
                     &mut sb.host,
                     codec_alloc,
-                    crate::com::SLOT_MEMALLOCATOR_COMMIT,
+                    ud_emulator::com::SLOT_MEMALLOCATOR_COMMIT,
                     &[],
                 )
                 .map_err(|e| {
@@ -1106,7 +1106,7 @@ impl SandboxedDshowDecoder {
         } else {
             alloc
         };
-        let r_na = crate::com::call::call_method(
+        let r_na = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
@@ -1153,7 +1153,7 @@ impl SandboxedDshowDecoder {
                         "vfw discovery (DShow): stage downstream RGB24 AMT: {e}"
                     ))
                 })?;
-            let r_dn = crate::com::call::call_method(
+            let r_dn = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
@@ -1176,13 +1176,13 @@ impl SandboxedDshowDecoder {
         // Round 32 B — Commit the host allocator so subsequent
         // GetBuffer calls succeed (the allocator starts decommitted
         // per real IMemAllocator semantics).
-        let r_commit = crate::com::call::call_method(
+        let r_commit = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             alloc,
-            crate::com::SLOT_MEMALLOCATOR_COMMIT,
+            ud_emulator::com::SLOT_MEMALLOCATOR_COMMIT,
             &[],
         )
         .map_err(|e| {
@@ -1206,13 +1206,13 @@ impl SandboxedDshowDecoder {
         // slots (5 = Pause, 6 = Run) are reachable directly via
         // the IBaseFilter pointer; no explicit QI(IID_IMediaFilter)
         // is required.
-        let r_pause = crate::com::call::call_method(
+        let r_pause = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             self.filter,
-            crate::com::SLOT_MEDIAFILTER_PAUSE,
+            ud_emulator::com::SLOT_MEDIAFILTER_PAUSE,
             &[],
         )
         .map_err(|e| {
@@ -1226,13 +1226,13 @@ impl SandboxedDshowDecoder {
         // a 64-bit integer marshalled as two adjacent dwords on the
         // stdcall stack (low dword first, high dword next).  We
         // start the stream at t=0.
-        let r_run = crate::com::call::call_method(
+        let r_run = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             self.filter,
-            crate::com::SLOT_MEDIAFILTER_RUN,
+            ud_emulator::com::SLOT_MEDIAFILTER_RUN,
             &[0, 0],
         )
         .map_err(|e| {
@@ -1265,13 +1265,13 @@ impl SandboxedDshowDecoder {
                     "vfw discovery (DShow): IMediaFilter::GetState seed: {e}"
                 ))
             })?;
-        let r_state = crate::com::call::call_method(
+        let r_state = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             self.filter,
-            crate::com::SLOT_MEDIAFILTER_GET_STATE,
+            ud_emulator::com::SLOT_MEDIAFILTER_GET_STATE,
             &[1000, state_slot],
         )
         .map_err(|e| {
@@ -1296,31 +1296,37 @@ impl SandboxedDshowDecoder {
 /// `skip` which is already-bound input).  Returns `None` if the
 /// filter has no output pin.  Round 32 unifies on
 /// [`pin_with_direction`].
-fn first_output_pin_dshow(sb: &mut crate::Sandbox, filter: u32, skip: u32) -> Option<u32> {
-    pin_with_direction(sb, filter, crate::com::PIN_DIRECTION_OUTPUT, Some(skip))
+fn first_output_pin_dshow(sb: &mut ud_emulator::Sandbox, filter: u32, skip: u32) -> Option<u32> {
+    pin_with_direction(
+        sb,
+        filter,
+        ud_emulator::com::PIN_DIRECTION_OUTPUT,
+        Some(skip),
+    )
 }
 
 /// Stage a downstream RGB24 AM_MEDIA_TYPE.  Used by round 31 B.
 fn stage_am_media_type_rgb24_dshow(
-    sb: &mut crate::Sandbox,
+    sb: &mut ud_emulator::Sandbox,
     width: i32,
     height: i32,
 ) -> Result<u32> {
-    let to_oxide =
-        |e: crate::Error| Error::other(format!("vfw discovery (DShow): stage RGB24 AMT: {e}"));
+    let to_oxide = |e: ud_emulator::Error| {
+        Error::other(format!("vfw discovery (DShow): stage RGB24 AMT: {e}"))
+    };
     let blob = sb
         .host
         .arena_alloc(72 + 88 + 16)
-        .map_err(|e| to_oxide(crate::Error::Win32(e)))?;
+        .map_err(|e| to_oxide(ud_emulator::Error::Win32(e)))?;
     let amt = blob;
     let fmt = blob + 72;
     let mediatype_video =
-        crate::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
+        ud_emulator::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
     let format_videoinfo =
-        crate::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
+        ud_emulator::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
     let mediasubtype_rgb24 =
-        crate::com::Guid::parse("{E436EB7D-524F-11CE-9F53-0020AF0BA770}").unwrap();
-    let trap = |e: crate::emulator::Trap| to_oxide(crate::Error::Trap(e));
+        ud_emulator::com::Guid::parse("{E436EB7D-524F-11CE-9F53-0020AF0BA770}").unwrap();
+    let trap = |e: ud_emulator::emulator::Trap| to_oxide(ud_emulator::Error::Trap(e));
     mediatype_video.stage(&mut sb.mmu, amt).map_err(trap)?;
     mediasubtype_rgb24
         .stage(&mut sb.mmu, amt + 16)
@@ -1387,33 +1393,34 @@ fn stage_am_media_type_rgb24_dshow(
 /// round-27 test helper, lifted into the production module so
 /// `SandboxedDshowDecoder` can reuse it.
 fn stage_am_media_type_dshow(
-    sb: &mut crate::Sandbox,
+    sb: &mut ud_emulator::Sandbox,
     fourcc: [u8; 4],
     width: i32,
     height: i32,
 ) -> Result<u32> {
-    let to_oxide = |e: crate::Error| Error::other(format!("vfw discovery (DShow): stage AMT: {e}"));
+    let to_oxide =
+        |e: ud_emulator::Error| Error::other(format!("vfw discovery (DShow): stage AMT: {e}"));
     let blob = sb
         .host
         .arena_alloc(72 + 88 + 16)
-        .map_err(|e| to_oxide(crate::Error::Win32(e)))?;
+        .map_err(|e| to_oxide(ud_emulator::Error::Win32(e)))?;
     let amt = blob;
     let fmt = blob + 72;
 
     // AM_MEDIA_TYPE @ amt.
     let mediatype_video =
-        crate::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
+        ud_emulator::com::Guid::parse("{73646976-0000-0010-8000-00AA00389B71}").unwrap();
     let format_videoinfo =
-        crate::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
+        ud_emulator::com::Guid::parse("{05589F80-C356-11CE-BF01-00AA0055595A}").unwrap();
     let d1 = u32::from_le_bytes(fourcc);
-    let subtype = crate::com::Guid::new(
+    let subtype = ud_emulator::com::Guid::new(
         d1,
         0x0000,
         0x0010,
         [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
     );
 
-    let trap = |e: crate::emulator::Trap| to_oxide(crate::Error::Trap(e));
+    let trap = |e: ud_emulator::emulator::Trap| to_oxide(ud_emulator::Error::Trap(e));
     mediatype_video.stage(&mut sb.mmu, amt).map_err(trap)?;
     subtype.stage(&mut sb.mmu, amt + 16).map_err(trap)?;
     sb.mmu
@@ -1488,20 +1495,20 @@ fn stage_am_media_type_dshow(
 /// Reference: MSDN — "IPin::QueryDirection" + `PIN_DIRECTION`
 /// enum (`PINDIR_INPUT = 0`, `PINDIR_OUTPUT = 1`).  Source:
 /// `strmif.h` from the Windows SDK.
-fn first_input_pin(sb: &mut crate::Sandbox, filter: u32) -> Option<u32> {
-    pin_with_direction(sb, filter, crate::com::PIN_DIRECTION_INPUT, None)
+fn first_input_pin(sb: &mut ud_emulator::Sandbox, filter: u32) -> Option<u32> {
+    pin_with_direction(sb, filter, ud_emulator::com::PIN_DIRECTION_INPUT, None)
 }
 
 /// Walk every pin on `filter` via EnumPins/Next; for each pin
 /// that reports `direction`, return it (skipping `skip` if any).
 /// Released enumerator + non-matching pin objects on the way.
 fn pin_with_direction(
-    sb: &mut crate::Sandbox,
+    sb: &mut ud_emulator::Sandbox,
     filter: u32,
     direction: u32,
     skip: Option<u32>,
 ) -> Option<u32> {
-    use crate::com::call::call_method;
+    use ud_emulator::com::call::call_method;
     // Stop the filter so ReceiveConnection is legal in the caller's
     // subsequent flow (matches the round-30 behaviour for the input
     // pin path; harmless on output-pin probing — codec is already
@@ -1512,7 +1519,7 @@ fn pin_with_direction(
         &sb.registry,
         &mut sb.host,
         filter,
-        crate::com::SLOT_BASEFILTER_STOP,
+        ud_emulator::com::SLOT_BASEFILTER_STOP,
         &[],
     );
     let scratch = sb.host.arena_alloc(4).ok()?;
@@ -1523,7 +1530,7 @@ fn pin_with_direction(
         &sb.registry,
         &mut sb.host,
         filter,
-        crate::com::SLOT_BASEFILTER_ENUM_PINS,
+        ud_emulator::com::SLOT_BASEFILTER_ENUM_PINS,
         &[scratch],
     );
     let pp = sb.mmu.load32(scratch).unwrap_or(0);
@@ -1543,7 +1550,7 @@ fn pin_with_direction(
             &sb.registry,
             &mut sb.host,
             pp,
-            crate::com::SLOT_ENUMPINS_NEXT,
+            ud_emulator::com::SLOT_ENUMPINS_NEXT,
             &[1, pin_slot, pin_slot + 4],
         );
         let pin = sb.mmu.load32(pin_slot).unwrap_or(0);
@@ -1582,7 +1589,7 @@ fn pin_with_direction(
             &sb.registry,
             &mut sb.host,
             pin,
-            crate::com::SLOT_PIN_QUERY_DIRECTION,
+            ud_emulator::com::SLOT_PIN_QUERY_DIRECTION,
             &[dir_slot],
         );
         if !matches!(r, Ok(0)) {
@@ -1665,13 +1672,13 @@ impl Decoder for SandboxedDshowDecoder {
         sb.mmu
             .write_initializer(pp, &0u32.to_le_bytes())
             .map_err(|e| Error::other(format!("vfw discovery (DShow): mmu init: {e}")))?;
-        let r_gb = crate::com::call::call_method(
+        let r_gb = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             allocator,
-            crate::com::SLOT_MEMALLOCATOR_GET_BUFFER,
+            ud_emulator::com::SLOT_MEMALLOCATOR_GET_BUFFER,
             &[pp, 0, 0, 0],
         )
         .map_err(|e| Error::other(format!("vfw discovery (DShow): GetBuffer trapped: {e}")))?;
@@ -1714,13 +1721,13 @@ impl Decoder for SandboxedDshowDecoder {
                         "vfw discovery (DShow): codec sample GetPointer init: {e}"
                     ))
                 })?;
-            let r_gp = crate::com::call::call_method(
+            let r_gp = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
                 &mut sb.host,
                 sample,
-                crate::com::SLOT_MEDIASAMPLE_GET_POINTER,
+                ud_emulator::com::SLOT_MEDIASAMPLE_GET_POINTER,
                 &[pp_buf],
             )
             .map_err(|e| {
@@ -1728,7 +1735,7 @@ impl Decoder for SandboxedDshowDecoder {
                     "vfw discovery (DShow): codec sample GetPointer trapped: {e}"
                 ))
             })?;
-            if r_gp != crate::com::S_OK {
+            if r_gp != ud_emulator::com::S_OK {
                 return Err(Error::other(format!(
                     "vfw discovery (DShow): codec sample GetPointer returned \
                      {r_gp:#010x}"
@@ -1749,13 +1756,13 @@ impl Decoder for SandboxedDshowDecoder {
                 })?;
             }
             // SetActualDataLength(packet.data.len()).
-            let _ = crate::com::call::call_method(
+            let _ = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
                 &mut sb.host,
                 sample,
-                crate::com::SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH,
+                ud_emulator::com::SLOT_MEDIASAMPLE_SET_ACTUAL_DATA_LENGTH,
                 &[packet.data.len() as u32],
             )
             .map_err(|e| {
@@ -1764,13 +1771,13 @@ impl Decoder for SandboxedDshowDecoder {
                 ))
             })?;
             // SetSyncPoint(packet.flags.keyframe).
-            let _ = crate::com::call::call_method(
+            let _ = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
                 &mut sb.host,
                 sample,
-                crate::com::SLOT_MEDIASAMPLE_SET_SYNC_POINT,
+                ud_emulator::com::SLOT_MEDIASAMPLE_SET_SYNC_POINT,
                 &[u32::from(packet.flags.keyframe)],
             )
             .map_err(|e| {
@@ -1977,7 +1984,7 @@ impl Decoder for SandboxedDshowDecoder {
             // Slot 7 of the filter's primary C++ vtable. We need
             // to pass `this = filter_base` (NOT `self.filter`),
             // since the C++ class methods use offset-0 vtable.
-            let _ = crate::com::call::call_method(
+            let _ = ud_emulator::com::call::call_method(
                 &mut sb.cpu,
                 &mut sb.mmu,
                 &sb.registry,
@@ -2072,18 +2079,18 @@ impl Decoder for SandboxedDshowDecoder {
         // is the entry-EIP of the failing instruction (set in
         // `Cpu::step` BEFORE the opcode dispatch); regs reflect
         // state at the point of the trap.
-        let r_recv = match crate::com::call::call_method(
+        let r_recv = match ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             mip,
-            crate::com::SLOT_MEMINPUTPIN_RECEIVE,
+            ud_emulator::com::SLOT_MEMINPUTPIN_RECEIVE,
             &[sample],
         ) {
             Ok(v) => v,
             Err(e) => {
-                use crate::emulator::regs::Reg32;
+                use ud_emulator::emulator::regs::Reg32;
                 let ring = sb.cpu.trace_ring.clone();
                 let trap_eip = ring.last().copied().unwrap_or(sb.cpu.regs.eip);
                 let module_base = sb.host.primary_module_base;
@@ -2288,13 +2295,13 @@ impl Decoder for SandboxedDshowDecoder {
         // `using_codec_allocator`, else the host fallback.  Errors
         // are swallowed (best-effort cleanup; the codec may have
         // already released or refused the sample).
-        let _ = crate::com::call::call_method(
+        let _ = ud_emulator::com::call::call_method(
             &mut sb.cpu,
             &mut sb.mmu,
             &sb.registry,
             &mut sb.host,
             allocator,
-            crate::com::SLOT_MEMALLOCATOR_RELEASE_BUFFER,
+            ud_emulator::com::SLOT_MEMALLOCATOR_RELEASE_BUFFER,
             &[sample],
         );
 
@@ -2353,7 +2360,7 @@ impl Drop for SandboxedDshowDecoder {
             if self.filter != 0 {
                 let _ = sb.com_release(self.filter);
             }
-            crate::com::host_iface_r31::clear_queue(&sb.host);
+            ud_emulator::com::host_iface_r31::clear_queue(&sb.host);
         }
     }
 }
@@ -2364,7 +2371,7 @@ impl Drop for SandboxedDshowDecoder {
 /// Bottom-up storage is flipped to top-down to match the VfW
 /// path's surface convention.
 fn surface_received_dshow_frame(
-    rs: crate::com::host_iface_r31::ReceivedSample,
+    rs: ud_emulator::com::host_iface_r31::ReceivedSample,
     pts: Option<i64>,
     width: u32,
     height: u32,

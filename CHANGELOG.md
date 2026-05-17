@@ -6,6 +6,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING** — rewrite `oxideav-vfw` as a thin bridge over
+  [`ud-emulator`](https://crates.io/crates/ud-emulator)`= "0.1"`
+  (currently v0.1.3). Removed ~28k LOC of in-tree emulator / PE
+  loader / Win32 stubs / DirectShow COM scaffolding / msadds32
+  forensic test harnesses — that surface now lives upstream in
+  `ud-emulator`, which was built as a near-verbatim mirror of
+  this crate specifically to absorb it.
+  - The two oxideav-specific layers (`discovery/` — FS walk +
+    cache + per-DLL probe; the `Codec` / `Decoder` trait adapter
+    inside `discovery::codec`) are retained verbatim and now
+    call into `ud_emulator::*` paths instead of `crate::*`.
+  - `register()` + the `oxideav_core::register!` invocation are
+    unchanged; codec priority stays at 200.
+  - Downstream consumers that historically wrote
+    `oxideav_vfw::Sandbox` / `oxideav_vfw::Guid` /
+    `oxideav_vfw::Bih` / `oxideav_vfw::DLL_PROCESS_ATTACH` /
+    `oxideav_vfw::IID_*` / `oxideav_vfw::{TraceState,
+    WatchMode, Watchpoint}` continue to compile via re-exports.
+  - Forensic round-1 through round-70 integration tests
+    (msadds32 ea3a, mp43 encode determinism, gdi32 cascade, …)
+    are deleted from this crate; equivalents live in
+    `ud-emulator`'s own corpus + the `ud vfw {probe,decode,
+    encode}` CLI.
+  - `examples/gen_msmpeg4_traces.rs` removed — trace generation
+    is `ud vfw` territory.
+  - Public modules `com`, `emulator`, `pe`, `runtime`, `trace`,
+    `win32` are gone. Reach for them at
+    `ud_emulator::{com,emulator,pe,runtime,trace,win32}`
+    instead.
+
 ### Added
 
 - vfw r70 (piece B / task #829): `Sandbox::ic_get_state(handle,

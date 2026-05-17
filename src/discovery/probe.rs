@@ -17,7 +17,7 @@
 //! permutation — false positives on synthetic VIDC handlers
 //! would just inflate the on-disk cache.
 
-use crate::Sandbox;
+use ud_emulator::Sandbox;
 
 /// Static list of FourCCs we sweep through `ICOpen` for every
 /// candidate DLL. Mirrors the codecs we already have working
@@ -109,7 +109,7 @@ fn try_probe_vfw(bytes: &[u8]) -> Option<ProbeResult> {
         return None;
     }
     // Drive DllMain so any CRT init runs before ICOpen.
-    let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+    let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
     let mut found: Vec<String> = Vec::new();
     for fcc_bytes in VFW_FOURCC_CANDIDATES {
@@ -129,7 +129,7 @@ fn try_probe_vfw(bytes: &[u8]) -> Option<ProbeResult> {
                 // `vfw32!ICGetInfo` always passes `sizeof(ICINFO)`;
                 // mirror that here so the discovery probe sees
                 // what real Windows would see.
-                let _ = sb.ic_get_info(hic, crate::win32::vfw32::ICINFO_SIZE);
+                let _ = sb.ic_get_info(hic, ud_emulator::win32::vfw32::ICINFO_SIZE);
                 let _ = sb.ic_close(hic);
                 found.push(fourcc_to_string(fcc_bytes));
             }
@@ -158,11 +158,11 @@ fn try_probe_dshow(bytes: &[u8]) -> Option<ProbeResult> {
     let mut sb = Sandbox::new();
     let img = sb.load("probe.dll", bytes).ok()?;
     img.export("DllGetClassObject")?;
-    let _ = sb.call_dll_main(&img, crate::DLL_PROCESS_ATTACH);
+    let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
     for (clsid_str, clsid_bytes) in DSHOW_CLSID_CANDIDATES {
         let guid = guid_from_le_bytes(clsid_bytes);
-        match sb.dll_get_class_object(&img, guid, crate::IID_ICLASSFACTORY) {
+        match sb.dll_get_class_object(&img, guid, ud_emulator::IID_ICLASSFACTORY) {
             Ok(ptr) if ptr != 0 => {
                 return Some(ProbeResult {
                     kind: Kind::DirectShow,
@@ -205,21 +205,21 @@ pub fn fourcc_to_bytes(s: &str) -> Option<[u8; 4]> {
 }
 
 /// Convert a 16-byte little-endian on-disk GUID literal to a
-/// [`crate::com::Guid`]. The wire form is
+/// [`ud_emulator::Guid`]. The wire form is
 /// `data1[le], data2[le], data3[le], data4[8]`.
-fn guid_from_le_bytes(bytes: &[u8; 16]) -> crate::com::Guid {
+fn guid_from_le_bytes(bytes: &[u8; 16]) -> ud_emulator::Guid {
     let data1 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let data2 = u16::from_le_bytes([bytes[4], bytes[5]]);
     let data3 = u16::from_le_bytes([bytes[6], bytes[7]]);
     let mut data4 = [0u8; 8];
     data4.copy_from_slice(&bytes[8..16]);
-    crate::com::Guid::new(data1, data2, data3, data4)
+    ud_emulator::Guid::new(data1, data2, data3, data4)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pe::test_image::build_minimal_dll;
+    use ud_emulator::pe::test_image::build_minimal_dll;
 
     #[test]
     fn probe_garbage_classified_unsupported() {
@@ -276,6 +276,6 @@ mod tests {
         assert_eq!(g.data2, 0x49D0);
         assert_eq!(g.data3, 0x11D2);
         assert_eq!(g.data4, [0xBB, 0x50, 0x00, 0x60, 0x08, 0x32, 0x00, 0x64]);
-        assert_eq!(g, crate::com::MSADDS_AUDIO_DECODER_CLSID);
+        assert_eq!(g, ud_emulator::MSADDS_AUDIO_DECODER_CLSID);
     }
 }

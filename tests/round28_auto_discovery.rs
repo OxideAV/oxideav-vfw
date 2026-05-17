@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use oxideav_core::RuntimeContext;
 use oxideav_vfw::discovery;
-use oxideav_vfw::pe::test_image::build_minimal_dll;
+use ud_emulator::pe::test_image::build_minimal_dll;
 
 /// Tiny zero-dep tempdir helper. Sibling tests bring in `ureq`
 /// for HTTPS fetches; we deliberately avoid a `tempfile` dev-dep
