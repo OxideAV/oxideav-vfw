@@ -6,6 +6,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.1...v0.1.2) - 2026-05-17
+
+### Other
+
+- rewrite as thin bridge over ud-emulator 0.1.3
+- vfw r70: Sandbox::ic_get_state / ic_set_state for VfW state surface
+- vfw r70: msadds32.ax E_FAIL bail JCC re-pinned to 0xe282 (loop overflow)
+- vfw r69 fmt: collapse for-loop header onto single line
+- vfw r69: msadds32.ax inner-decode NULL-arg-guard hypothesis FALSIFIED; E_FAIL traced to RVA 0xe2bb
+- surface cdecl size/pointer args on win32_call trace events for msvcrt heap
+- vfw r68: msadds32.ax HRESULT shifts from E_UNEXPECTED to E_FAIL with ffmpeg-derived codec-private-data preamble
+
 ### Changed
 
 - **BREAKING** — rewrite `oxideav-vfw` as a thin bridge over
