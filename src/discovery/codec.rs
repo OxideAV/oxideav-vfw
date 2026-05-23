@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecTag, Decoder, Error, Frame,
-    Packet, PixelFormat, Result, RuntimeContext, VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecTag, Decoder, Encoder, Error,
+    Frame, Packet, PixelFormat, Result, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
 use ud_emulator::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
@@ -145,14 +145,25 @@ fn push_sanitised(out: &mut String, s: &str) {
 /// tag. The shared `make_decoder` factory below pulls the
 /// matching [`DiscoveryRecord`] out of [`record_table`] at
 /// construction time.
-pub fn register_codec_info(ctx: &mut RuntimeContext, codec_id: &str, fourcc: &str) {
+pub fn register_codec_info(ctx: &mut RuntimeContext, codec_id: &str, fourcc: &str, kind: Kind) {
     let id = CodecId::new(codec_id.to_string());
-    let caps = CodecCapabilities::video("vfw_sandboxed")
+    let mut caps = CodecCapabilities::video("vfw_sandboxed")
         .with_decode()
         .with_lossy(true)
         .with_priority(200);
+    // Only VfW (`ICM`) codecs expose the `ICCompress*` lifecycle the
+    // [`SandboxedVfwEncoder`] drives; DirectShow transform filters
+    // are decode-only through this bridge, so we don't advertise an
+    // encoder for them. The shared `make_encoder` factory rejects
+    // non-VfW records defensively regardless.
+    if matches!(kind, Kind::Vfw) {
+        caps = caps.with_encode();
+    }
 
     let mut info = CodecInfo::new(id).capabilities(caps).decoder(make_decoder);
+    if matches!(kind, Kind::Vfw) {
+        info = info.encoder(make_encoder);
+    }
     if let Some(bytes) = fourcc_to_bytes(fourcc) {
         info = info.tag(CodecTag::fourcc(&bytes));
     }
@@ -182,6 +193,39 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
             record,
             params.clone(),
         )?)),
+        Kind::Unsupported => Err(Error::unsupported(
+            "vfw discovery: this codec was probed but found unsupported",
+        )),
+    }
+}
+
+/// Shared `make_encoder` factory — the encode-side mirror of
+/// [`make_decoder`]. Looks up the per-codec [`DiscoveryRecord`]
+/// stashed by [`register_factory_for_id`] and, for `Kind::Vfw`
+/// codecs, constructs a [`SandboxedVfwEncoder`] that drives the
+/// `ICCompressQuery → ICCompressBegin → ICCompress → ICCompressEnd`
+/// lifecycle through the ud-emulator bridge.
+///
+/// DirectShow transform filters are decode-only through this bridge
+/// (their compress path would require an entirely different
+/// `IPin`/`IMemInputPin` output-direction handshake), so they
+/// surface `Error::Unsupported` here.
+pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let id_str = params.codec_id.as_str();
+    let record = lookup_record(id_str).ok_or_else(|| {
+        Error::other(format!(
+            "vfw discovery: codec id {id_str:?} not registered (call \
+             oxideav_vfw::register first, or ensure OXIDEAV_VFW_CODEC_PATH \
+             points at a codec directory)"
+        ))
+    })?;
+
+    match record.kind {
+        Kind::Vfw => Ok(Box::new(SandboxedVfwEncoder::new(record, params.clone())?)),
+        Kind::DirectShow => Err(Error::unsupported(
+            "vfw discovery: DirectShow filters are decode-only through this \
+             bridge; no ICCompress encode path",
+        )),
         Kind::Unsupported => Err(Error::unsupported(
             "vfw discovery: this codec was probed but found unsupported",
         )),
@@ -541,6 +585,380 @@ impl Drop for SandboxedVfwDecoder {
             if self.hic != 0 {
                 if self.begin_done {
                     let _ = sb.ic_decompress_end(self.hic);
+                }
+                let _ = sb.ic_close(self.hic);
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// SandboxedVfwEncoder — encode-side mirror of SandboxedVfwDecoder.
+//
+// Drives the VfW *compress* lifecycle through the ud-emulator
+// bridge:
+//
+// * `ensure_open` (lazy on the first `send_frame`): read the DLL,
+//   install + DllMain, `ICOpen('VIDC', fourcc, ICMODE_COMPRESS)`,
+//   then negotiate the output format. The input is a fixed BI_RGB
+//   24bpp top-down→bottom-up BIH (mirroring the byte order the
+//   decoder emits); the output BIH carries the codec's FourCC.
+//   `ICCompressGetFormat` lets the codec fill in the on-wire output
+//   header; `ICCompressGetSize` gives the encoded-byte upper bound
+//   used to size the per-packet output buffer; `ICCompressBegin`
+//   primes the pipeline.
+// * `send_frame` stashes the pending video frame; `receive_packet`
+//   flips the frame's planes bottom-up, calls `ICCompress` (with
+//   the keyframe request driven from `frame_num == 0`), and
+//   surfaces the codec's encoded bytes as a `Packet` carrying the
+//   codec-returned keyframe flag.
+// * `Drop` calls `ICCompressEnd` then `ICClose`.
+//
+// Per-frame `prev` (P-frame reference) state is intentionally NOT
+// threaded here yet: every frame is encoded as an independent unit
+// with `prev_bih_opt = None`. Codecs that force keyframe-only under
+// that contract round-trip fine; inter-frame reference wiring is a
+// bounded follow-up.
+// ────────────────────────────────────────────────────────────────
+
+struct SandboxedVfwEncoder {
+    record: DiscoveryRecord,
+    /// Output stream parameters handed back via [`Encoder::output_params`].
+    output_params: CodecParameters,
+    /// Lazily constructed on the first `send_frame` (mirrors the
+    /// decoder — `make_encoder` runs on every codec lookup and the
+    /// caller may discard the result without ever encoding).
+    sandbox: Option<ud_emulator::Sandbox>,
+    image: Option<ud_emulator::pe::Image>,
+    /// Open `ICOpen` handle; `0` until `ensure_open` runs.
+    hic: u32,
+    /// True once `ICCompressBegin` succeeded — `Drop` calls
+    /// `ICCompressEnd` only when set.
+    begin_done: bool,
+    width: u32,
+    height: u32,
+    /// Encoder target FourCC (= the codec's handler FourCC).
+    fourcc_bytes: [u8; 4],
+    /// Output BIH negotiated in `ensure_open` (the codec's on-wire
+    /// compressed header). Re-used per-frame for `ICCompress`.
+    output_bih: Option<Bih>,
+    /// Per-frame output-buffer capacity from `ICCompressGetSize`.
+    output_capacity: u32,
+    /// Monotonic encoded-frame counter (drives the keyframe request).
+    frame_num: i32,
+    /// Pending frame awaiting `receive_packet`. Cleared per packet.
+    pending: Option<VideoFrame>,
+    eof: bool,
+}
+
+impl SandboxedVfwEncoder {
+    fn new(record: DiscoveryRecord, params: CodecParameters) -> Result<Self> {
+        let fourcc_bytes = fourcc_to_bytes(&record.fourcc).ok_or_else(|| {
+            Error::other(format!(
+                "vfw discovery (encode): bad fourcc {:?} in record",
+                record.fourcc
+            ))
+        })?;
+        let width = params.width.unwrap_or(0);
+        let height = params.height.unwrap_or(0);
+        // The output stream parameters mirror the input dims and
+        // carry the codec's FourCC as the on-wire tag, so a muxer
+        // re-emits the same FourCC the codec was opened for.
+        let mut output_params = CodecParameters::video(params.codec_id.clone());
+        output_params.width = params.width;
+        output_params.height = params.height;
+        output_params.tag = Some(CodecTag::fourcc(&fourcc_bytes));
+        Ok(SandboxedVfwEncoder {
+            record,
+            output_params,
+            sandbox: None,
+            image: None,
+            hic: 0,
+            begin_done: false,
+            width,
+            height,
+            fourcc_bytes,
+            output_bih: None,
+            output_capacity: 0,
+            frame_num: 0,
+            pending: None,
+            eof: false,
+        })
+    }
+
+    /// Input BIH — BI_RGB 24bpp, positive height (bottom-up storage,
+    /// the byte order VfW codecs reliably accept and the mirror of
+    /// the decoder's BGR24 output convention).
+    fn build_input_bih(&self) -> Bih {
+        Bih {
+            bi_size: 40,
+            width: self.width as i32,
+            height: self.height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: [0; 4], // BI_RGB
+            size_image: self.width.saturating_mul(self.height).saturating_mul(3),
+            x_pels_per_meter: 0,
+            y_pels_per_meter: 0,
+            clr_used: 0,
+            clr_important: 0,
+        }
+    }
+
+    /// Output BIH template before negotiation — the codec's FourCC
+    /// at the stream dims. `ICCompressGetFormat` overwrites the
+    /// remaining fields with the codec's preferred on-wire header.
+    fn build_output_bih_template(&self) -> Bih {
+        Bih {
+            bi_size: 40,
+            width: self.width as i32,
+            height: self.height as i32,
+            planes: 1,
+            bit_count: 24,
+            compression: self.fourcc_bytes,
+            size_image: 0,
+            x_pels_per_meter: 0,
+            y_pels_per_meter: 0,
+            clr_used: 0,
+            clr_important: 0,
+        }
+    }
+
+    /// Lazy open: load DLL, install, DllMain, ICOpen in compress
+    /// mode, then negotiate the output format and prime the encode
+    /// pipeline via the `ICCompress*` setup calls.
+    fn ensure_open(&mut self) -> Result<()> {
+        if self.begin_done {
+            return Ok(());
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(Error::invalid(
+                "vfw discovery (encode): width/height must be supplied on \
+                 CodecParameters (the encode path cannot probe dims from a \
+                 raw frame)",
+            ));
+        }
+        if self.sandbox.is_none() {
+            let bytes = std::fs::read(&self.record.dll_path).map_err(|e| {
+                Error::other(format!("vfw discovery (encode): read DLL failed: {e}"))
+            })?;
+            let mut sb = ud_emulator::Sandbox::new();
+            sb.cpu.set_instr_limit(8_000_000_000);
+            let img = sb.load("codec.dll", &bytes).map_err(|e| {
+                Error::other(format!("vfw discovery (encode): Sandbox::load failed: {e}"))
+            })?;
+            sb.install_codec(&img).map_err(|e| {
+                Error::other(format!("vfw discovery (encode): install_codec failed: {e}"))
+            })?;
+            let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
+
+            let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
+            let fcc_type = u32::from_le_bytes(*b"VIDC");
+            // Mode 1 = ICMODE_COMPRESS in vfw.h.
+            let hic = sb.ic_open(fcc_type, fcc_handler, 1).map_err(|e| {
+                Error::other(format!("vfw discovery (encode): ic_open failed: {e}"))
+            })?;
+            if hic == 0 {
+                return Err(Error::other(
+                    "vfw discovery (encode): ICOpen returned NULL (codec rejected \
+                     handler FourCC in compress mode)",
+                ));
+            }
+            self.sandbox = Some(sb);
+            self.image = Some(img);
+            self.hic = hic;
+        }
+
+        let bih_in = self.build_input_bih();
+        let mut bih_out = self.build_output_bih_template();
+        let hic = self.hic;
+        let sb = self
+            .sandbox
+            .as_mut()
+            .expect("sandbox just constructed above");
+
+        // Ask the codec for its preferred output header. Best-effort:
+        // codecs that don't implement GetFormat (ICERR_UNSUPPORTED)
+        // fall back to our FourCC template, which most encoders
+        // accept directly.
+        if let Ok((rc, out)) = sb.ic_compress_get_format(hic, &bih_in) {
+            if rc == 0 && out.bi_size >= 40 {
+                bih_out = out;
+            }
+        }
+
+        // ICCompressQuery — does the codec accept this input→output
+        // pair? `0` = ICERR_OK.
+        let q = sb
+            .ic_compress_query(hic, &bih_in, Some(&bih_out))
+            .map_err(|e| {
+                Error::other(format!(
+                    "vfw discovery (encode): ic_compress_query failed: {e}"
+                ))
+            })?;
+        if q != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery (encode): ic_compress_query returned {q:#010x} \
+                 (want 0 = ICERR_OK; codec rejected the input/output format)"
+            )));
+        }
+
+        // ICCompressGetSize — the encoded-frame byte upper bound.
+        // Fall back to a generous worst-case (input size) if the
+        // codec reports 0 / fails.
+        let raw_input = self.width.saturating_mul(self.height).saturating_mul(3);
+        let cap = match sb.ic_compress_get_size(hic, &bih_in, &bih_out) {
+            Ok(n) if n > 0 => n,
+            _ => raw_input.max(1),
+        };
+        self.output_capacity = cap;
+
+        let b = sb.ic_compress_begin(hic, &bih_in, &bih_out).map_err(|e| {
+            Error::other(format!(
+                "vfw discovery (encode): ic_compress_begin failed: {e}"
+            ))
+        })?;
+        if b != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery (encode): ic_compress_begin returned {b:#010x} \
+                 (want 0 = ICERR_OK)"
+            )));
+        }
+        self.output_bih = Some(bih_out);
+        self.begin_done = true;
+        Ok(())
+    }
+}
+
+impl Encoder for SandboxedVfwEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.output_params.codec_id
+    }
+
+    fn output_params(&self) -> &CodecParameters {
+        &self.output_params
+    }
+
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        if self.pending.is_some() {
+            return Err(Error::other(
+                "vfw discovery (encode): receive_packet must be called before \
+                 sending another frame",
+            ));
+        }
+        let vf = match frame {
+            Frame::Video(v) => v.clone(),
+            _ => {
+                return Err(Error::invalid(
+                    "vfw discovery (encode): only video frames are encodable",
+                ))
+            }
+        };
+        self.ensure_open()?;
+        self.pending = Some(vf);
+        Ok(())
+    }
+
+    fn receive_packet(&mut self) -> Result<Packet> {
+        let vf = match self.pending.take() {
+            Some(v) => v,
+            None => {
+                return if self.eof {
+                    Err(Error::Eof)
+                } else {
+                    Err(Error::NeedMore)
+                };
+            }
+        };
+
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let stride = width * 3;
+        let plane = vf
+            .planes
+            .first()
+            .ok_or_else(|| Error::invalid("vfw discovery (encode): video frame has no planes"))?;
+        if plane.data.len() < stride * height {
+            return Err(Error::invalid(format!(
+                "vfw discovery (encode): frame plane is {} bytes, expected {} \
+                 (stride*height for {width}x{height} BGR24)",
+                plane.data.len(),
+                stride * height,
+            )));
+        }
+
+        // The codec's input BIH is positive-height (bottom-up); flip
+        // the caller's top-down BGR24 plane into bottom-up storage,
+        // the mirror of the decode path's top-down conversion.
+        let mut raw = vec![0u8; stride * height];
+        for row in 0..height {
+            let src_off = row * plane.stride;
+            let dst_off = (height - 1 - row) * stride;
+            raw[dst_off..dst_off + stride].copy_from_slice(&plane.data[src_off..src_off + stride]);
+        }
+
+        let bih_in = self.build_input_bih();
+        let bih_out = self
+            .output_bih
+            .clone()
+            .ok_or_else(|| Error::other("vfw discovery (encode): output BIH not negotiated"))?;
+        let cap = self.output_capacity;
+        let hic = self.hic;
+        let frame_num = self.frame_num;
+        // Request a keyframe for the first frame; later frames let the
+        // codec decide (most MS codecs force keyframe-only under the
+        // no-prev-reference contract we use here).
+        let req_flags = if frame_num == 0 { 1 } else { 0 }; // ICCOMPRESS_KEYFRAME = 1
+        let sb = self
+            .sandbox
+            .as_mut()
+            .ok_or_else(|| Error::other("vfw discovery (encode): no sandbox"))?;
+
+        let outcome = sb
+            .ic_compress(
+                hic, req_flags, &bih_in, &raw, &bih_out, cap, 0, frame_num, 0, 0, None, None,
+            )
+            .map_err(|e| {
+                Error::other(format!("vfw discovery (encode): ic_compress trapped: {e}"))
+            })?;
+        if outcome.lresult != 0 {
+            return Err(Error::other(format!(
+                "vfw discovery (encode): ic_compress returned {:#010x} (want 0 = ICERR_OK)",
+                outcome.lresult
+            )));
+        }
+
+        // `biSizeImage` carries the actual encoded byte count; trust
+        // it over the returned buffer length when smaller.
+        let encoded_len = (outcome.output_bih.size_image as usize).min(outcome.bytes.len());
+        let data = if encoded_len > 0 && encoded_len <= outcome.bytes.len() {
+            outcome.bytes[..encoded_len].to_vec()
+        } else {
+            outcome.bytes
+        };
+
+        self.frame_num += 1;
+        // ICCOMPRESS_KEYFRAME (bit 0) echoes whether the codec
+        // actually emitted a keyframe.
+        let keyframe = (outcome.returned_flags & 1) != 0 || frame_num == 0;
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1000), data);
+        pkt.pts = vf.pts;
+        pkt.flags.keyframe = keyframe;
+        Ok(pkt)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.eof = true;
+        Ok(())
+    }
+}
+
+impl Drop for SandboxedVfwEncoder {
+    fn drop(&mut self) {
+        if let Some(sb) = self.sandbox.as_mut() {
+            if self.hic != 0 {
+                if self.begin_done {
+                    let _ = sb.ic_compress_end(self.hic);
                 }
                 let _ = sb.ic_close(self.hic);
             }
@@ -2462,6 +2880,62 @@ mod tests {
         ));
         let r = make_decoder(&params);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn make_encoder_vfw_constructs_lazily() {
+        // The encode-side mirror of `make_decoder`: for a `Kind::Vfw`
+        // record the factory constructs a `SandboxedVfwEncoder`
+        // without touching the DLL (load happens lazily on the first
+        // `send_frame`). Only the FourCC + dims are validated here.
+        let id = "vfw_mp43_make_encoder_test_unique";
+        register_factory_for_id(
+            id,
+            DiscoveryRecord {
+                dll_path: PathBuf::from("/dev/null"),
+                fourcc: "MP43".to_string(),
+                kind: Kind::Vfw,
+                clsid: None,
+            },
+        );
+        let mut params = CodecParameters::video(CodecId::new(id));
+        params.width = Some(176);
+        params.height = Some(144);
+        let enc = make_encoder(&params).expect("VfW make_encoder constructs lazily");
+        assert_eq!(enc.codec_id().as_str(), id);
+        // Output params echo the dims and carry the codec FourCC as
+        // the on-wire tag so a muxer re-emits MP43.
+        let op = enc.output_params();
+        assert_eq!(op.width, Some(176));
+        assert_eq!(op.height, Some(144));
+        assert_eq!(op.tag, Some(CodecTag::fourcc(b"MP43")));
+    }
+
+    #[test]
+    fn make_encoder_dshow_kind_is_unsupported() {
+        // DirectShow filters are decode-only through this bridge — the
+        // encode factory rejects them cleanly rather than constructing
+        // a broken encoder.
+        let id = "vfw_dshow_make_encoder_unsupported_unique";
+        register_factory_for_id(
+            id,
+            DiscoveryRecord {
+                dll_path: PathBuf::from("/dev/null"),
+                fourcc: "WMV3".to_string(),
+                kind: Kind::DirectShow,
+                clsid: Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
+            },
+        );
+        let params = CodecParameters::video(CodecId::new(id));
+        assert!(make_encoder(&params).is_err());
+    }
+
+    #[test]
+    fn make_encoder_unknown_id_errors_cleanly() {
+        let params = CodecParameters::video(CodecId::new(
+            "vfw_unknown_encoder_id_should_not_match_anything",
+        ));
+        assert!(make_encoder(&params).is_err());
     }
 
     #[test]

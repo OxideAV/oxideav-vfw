@@ -67,7 +67,7 @@ mod probe;
 
 pub use cache::{Cache, CacheEntry};
 pub use codec::{
-    codec_id_for, last_codec_allocator_negotiation, lookup_record, make_decoder,
+    codec_id_for, last_codec_allocator_negotiation, lookup_record, make_decoder, make_encoder,
     output_pixel_format, register_factory_for_id, CodecAllocatorNegotiation, DiscoveryRecord,
 };
 pub use paths::{cache_file_path, discovery_paths};
@@ -222,7 +222,7 @@ pub fn discover_and_register(ctx: &mut oxideav_core::RuntimeContext) -> usize {
                     clsid: entry.clsid.clone(),
                 },
             );
-            codec::register_codec_info(ctx, &codec_id_str, fcc);
+            codec::register_codec_info(ctx, &codec_id_str, fcc, entry.kind);
             fourccs_seen.push(fcc.clone());
             registered += 1;
         }

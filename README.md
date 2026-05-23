@@ -22,7 +22,13 @@ ud-emulator's software interpreter sandbox.
    FourCC into the runtime, wired to a `Decoder` factory that
    constructs lazily and drives the codec through the
    `ICDecompressQuery → ICDecompressBegin → ICDecompress →
-   ICDecompressEnd` lifecycle on first `send_packet`.
+   ICDecompressEnd` lifecycle on first `send_packet`. VfW
+   (`Kind::Vfw`) codecs additionally register an `Encoder` factory
+   that mirrors the decode path over the `ICCompressQuery →
+   ICCompressGetFormat → ICCompressGetSize → ICCompressBegin →
+   ICCompress → ICCompressEnd` lifecycle on first `send_frame`.
+   DirectShow (`Kind::DirectShow`) filters are decode-only through
+   this bridge.
 
 Everything below that — the i386 interpreter, the PE32 loader,
 the kernel32 / user32 / gdi32 / vfw32 / msvfw32 / ole32 / winmm

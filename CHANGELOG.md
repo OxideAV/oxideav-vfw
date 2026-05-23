@@ -6,6 +6,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Encode side of the ud-emulator bridge.** VfW (`Kind::Vfw`)
+  codecs now register an `oxideav_core::Encoder` factory
+  (`discovery::make_encoder`) alongside the existing decoder. The
+  new `SandboxedVfwEncoder` is the encode-side mirror of
+  `SandboxedVfwDecoder`: on the first `send_frame` it lazily loads
+  the DLL, opens the codec in `ICMODE_COMPRESS`, and drives the
+  `ICCompressQuery → ICCompressGetFormat → ICCompressGetSize →
+  ICCompressBegin` setup handshake; each `receive_packet` flips the
+  caller's top-down BGR24 plane into the codec's bottom-up input
+  BIH, calls `ICCompress` (keyframe requested on frame 0), and
+  surfaces the encoded bytes as a `Packet` carrying the
+  codec-returned keyframe flag. `Drop` runs `ICCompressEnd +
+  ICClose`. `register_codec_info` advertises `with_encode()` +
+  the encoder factory only for `Kind::Vfw` records — DirectShow
+  filters stay decode-only (no `ICCompress*` path through this
+  bridge), and `make_encoder` rejects non-VfW kinds defensively.
+  Per-frame P-frame reference state (`prev_bih`/`prev_bytes`) is
+  not yet threaded — every frame encodes as an independent unit;
+  inter-frame reference wiring is a bounded follow-up.
+  - New unit tests (`make_encoder_{vfw_constructs_lazily,
+    dshow_kind_is_unsupported,unknown_id_errors_cleanly}`) +
+    integration tests
+    (`tests/round107_encoder_trait_integration.rs`) cover the
+    factory wiring, the video-only `send_frame` guard, and the
+    missing-dims error path.
+
 ### Changed
 
 - **BREAKING** — rewrite `oxideav-vfw` as a thin bridge over
