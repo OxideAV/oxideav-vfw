@@ -138,6 +138,16 @@ fn push_sanitised(out: &mut String, s: &str) {
     }
 }
 
+/// Round 112 — read an optional `u32` bridge knob out of
+/// [`CodecParameters::options`]. Returns `None` when the key is
+/// absent OR when its string value doesn't parse as a `u32`
+/// (best-effort: a malformed knob falls back to the encoder's
+/// default rather than failing construction). The accepted format
+/// is a plain decimal integer.
+fn parse_option_u32(params: &CodecParameters, key: &str) -> Option<u32> {
+    params.options.get(key).and_then(|v| v.trim().parse().ok())
+}
+
 /// Register one [`CodecInfo`] for a discovered DLL+FourCC pair.
 ///
 /// Priority is fixed at 200 — VfW is a last-resort path that
@@ -609,16 +619,40 @@ impl Drop for SandboxedVfwDecoder {
 //   primes the pipeline.
 // * `send_frame` stashes the pending video frame; `receive_packet`
 //   flips the frame's planes bottom-up, calls `ICCompress` (with
-//   the keyframe request driven from `frame_num == 0`), and
-//   surfaces the codec's encoded bytes as a `Packet` carrying the
-//   codec-returned keyframe flag.
+//   the keyframe request driven from `frame_num == 0` and from the
+//   `keyint` option), threads the previous raw input frame as the
+//   `lpbiPrev` / `lpPrev` P-frame reference on non-keyframe calls,
+//   and surfaces the codec's encoded bytes as a `Packet` carrying
+//   the codec-returned keyframe flag.
 // * `Drop` calls `ICCompressEnd` then `ICClose`.
 //
-// Per-frame `prev` (P-frame reference) state is intentionally NOT
-// threaded here yet: every frame is encoded as an independent unit
-// with `prev_bih_opt = None`. Codecs that force keyframe-only under
-// that contract round-trip fine; inter-frame reference wiring is a
-// bounded follow-up.
+// **P-frame reference state (round 112).** After each successful
+// `ICCompress` we stash the bottom-up input bytes in
+// `prev_input_bytes`. On the next non-keyframe encode we pass
+// `prev_bih_opt = Some(&bih_in)` + `prev_bytes_opt =
+// Some(&prev_input_bytes)` so the codec can encode the current
+// frame as a delta against the prior input. This is the
+// no-decoder-feedback-loop contract: we use the previous *raw*
+// input as the reference, not the codec's reconstructed previous
+// frame (which would require driving a parallel decoder). MS VfW
+// codecs historically accept this — at worst a P-frame becomes a
+// slightly-worse delta. Codecs that demand the reconstructed
+// reference still produce valid keyframe-only output because the
+// keyframe path bypasses `prev_*` entirely.
+//
+// **Quality / keyframe-interval knobs (round 112).** Two optional
+// `CodecParameters.options` entries are honoured:
+// * `"quality"` (u32 0..10000) — passed to `ICCompress`'s `quality`
+//   slot. `0` (the default) means "codec chooses". Higher = better
+//   quality / larger frames.
+// * `"keyint"` (u32, frames) — every Nth frame is forced to a
+//   keyframe (frame 0 is always a keyframe). `0` (the default)
+//   disables periodic keyframes; only frame 0 is forced.
+// Both keys are read once at `make_encoder` time and held on the
+// encoder; an unparseable value falls back to `0` silently rather
+// than failing construction (the encoder's policy is "best effort
+// over hard reject" — these are bridge knobs, not codec
+// invariants).
 // ────────────────────────────────────────────────────────────────
 
 struct SandboxedVfwEncoder {
@@ -649,6 +683,23 @@ struct SandboxedVfwEncoder {
     /// Pending frame awaiting `receive_packet`. Cleared per packet.
     pending: Option<VideoFrame>,
     eof: bool,
+    /// Round 112 — previous frame's bottom-up BGR24 input bytes,
+    /// stashed after each successful `ICCompress`. Threaded through
+    /// the next non-keyframe `ICCompress` as the `lpPrev` P-frame
+    /// reference. `None` before the first frame and immediately
+    /// after a forced keyframe (so the codec doesn't see stale
+    /// references).
+    prev_input_bytes: Option<Vec<u8>>,
+    /// Round 112 — bridge-knob: quality 0..10000 threaded into
+    /// `ICCompress`'s `quality` slot. `0` = "codec chooses"
+    /// (default). Sourced from `CodecParameters.options["quality"]`
+    /// at construction time.
+    quality: u32,
+    /// Round 112 — bridge-knob: force every Nth frame to a
+    /// keyframe. `0` = disabled (only frame 0 forced).  Sourced
+    /// from `CodecParameters.options["keyint"]` at construction
+    /// time.
+    keyint: u32,
 }
 
 impl SandboxedVfwEncoder {
@@ -661,6 +712,15 @@ impl SandboxedVfwEncoder {
         })?;
         let width = params.width.unwrap_or(0);
         let height = params.height.unwrap_or(0);
+        // Round 112 — read the optional `quality` / `keyint` bridge
+        // knobs out of `CodecParameters.options`. Best-effort: an
+        // absent or unparseable value falls back to `0` (the
+        // "codec chooses" / "disabled" sentinel) rather than failing
+        // construction. Quality is clamped to the VfW 0..10000 range.
+        let quality = parse_option_u32(&params, "quality")
+            .unwrap_or(0)
+            .min(10_000);
+        let keyint = parse_option_u32(&params, "keyint").unwrap_or(0);
         // The output stream parameters mirror the input dims and
         // carry the codec's FourCC as the on-wire tag, so a muxer
         // re-emits the same FourCC the codec was opened for.
@@ -683,7 +743,20 @@ impl SandboxedVfwEncoder {
             frame_num: 0,
             pending: None,
             eof: false,
+            prev_input_bytes: None,
+            quality,
+            keyint,
         })
+    }
+
+    /// Round 112 — is the frame at `frame_num` a forced keyframe?
+    /// Frame 0 is always a keyframe; with `keyint > 0` every Nth
+    /// frame thereafter is forced as well.
+    fn is_keyframe(&self, frame_num: i32) -> bool {
+        if frame_num == 0 {
+            return true;
+        }
+        self.keyint > 0 && (frame_num as u32) % self.keyint == 0
     }
 
     /// Input BIH — BI_RGB 24bpp, positive height (bottom-up storage,
@@ -905,10 +978,29 @@ impl Encoder for SandboxedVfwEncoder {
         let cap = self.output_capacity;
         let hic = self.hic;
         let frame_num = self.frame_num;
-        // Request a keyframe for the first frame; later frames let the
-        // codec decide (most MS codecs force keyframe-only under the
-        // no-prev-reference contract we use here).
-        let req_flags = if frame_num == 0 { 1 } else { 0 }; // ICCOMPRESS_KEYFRAME = 1
+        let quality = self.quality;
+        // Round 112 — a frame is a forced keyframe at frame 0 and at
+        // every `keyint`-th frame thereafter. Forced keyframes request
+        // `ICCOMPRESS_KEYFRAME` (bit 0) and thread NO previous
+        // reference; P-frames clear the request bit and pass the
+        // previous raw input as the `lpPrev` reference (if we have
+        // one stashed).
+        let want_keyframe = self.is_keyframe(frame_num);
+        // ICCOMPRESS_KEYFRAME = 1.
+        let req_flags = if want_keyframe { 1 } else { 0 };
+        // Take ownership of the previous-frame buffer for the duration
+        // of the call so we can re-borrow `self.sandbox` mutably
+        // without a double borrow. We only feed it on P-frames.
+        let prev_bytes = if want_keyframe {
+            None
+        } else {
+            self.prev_input_bytes.take()
+        };
+        let prev_bih = if prev_bytes.is_some() {
+            Some(self.build_input_bih())
+        } else {
+            None
+        };
         let sb = self
             .sandbox
             .as_mut()
@@ -916,7 +1008,18 @@ impl Encoder for SandboxedVfwEncoder {
 
         let outcome = sb
             .ic_compress(
-                hic, req_flags, &bih_in, &raw, &bih_out, cap, 0, frame_num, 0, 0, None, None,
+                hic,
+                req_flags,
+                &bih_in,
+                &raw,
+                &bih_out,
+                cap,
+                0,
+                frame_num,
+                0,
+                quality,
+                prev_bih.as_ref(),
+                prev_bytes.as_deref(),
             )
             .map_err(|e| {
                 Error::other(format!("vfw discovery (encode): ic_compress trapped: {e}"))
@@ -940,7 +1043,13 @@ impl Encoder for SandboxedVfwEncoder {
         self.frame_num += 1;
         // ICCOMPRESS_KEYFRAME (bit 0) echoes whether the codec
         // actually emitted a keyframe.
-        let keyframe = (outcome.returned_flags & 1) != 0 || frame_num == 0;
+        let keyframe = (outcome.returned_flags & 1) != 0 || want_keyframe;
+        // Round 112 — stash this frame's bottom-up input bytes as the
+        // P-frame reference for the *next* encode. A keyframe we just
+        // emitted is still a valid reference for the following
+        // P-frame, so we always update `prev_input_bytes` here
+        // (whether this frame was a keyframe or not).
+        self.prev_input_bytes = Some(raw);
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), data);
         pkt.pts = vf.pts;
         pkt.flags.keyframe = keyframe;
@@ -2957,5 +3066,82 @@ mod tests {
         let params = CodecParameters::video(CodecId::new(id));
         let decoder = make_decoder(&params).expect("DShow make_decoder constructs lazily");
         assert_eq!(decoder.codec_id().as_str(), id);
+    }
+
+    // ── Round 112 — P-frame reference + quality/keyint knobs ──────
+
+    /// Build a bare `Kind::Vfw` record for the option-parsing tests —
+    /// the DLL is never loaded (these tests stop at `new`).
+    fn vfw_record() -> DiscoveryRecord {
+        DiscoveryRecord {
+            dll_path: PathBuf::from("/dev/null"),
+            fourcc: "MP43".to_string(),
+            kind: Kind::Vfw,
+            clsid: None,
+        }
+    }
+
+    #[test]
+    fn parse_option_u32_reads_decimal_and_falls_back() {
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_parse"));
+        params.options.insert("quality", "7500");
+        params.options.insert("garbage", "not-a-number");
+        assert_eq!(parse_option_u32(&params, "quality"), Some(7500));
+        // Missing key → None.
+        assert_eq!(parse_option_u32(&params, "keyint"), None);
+        // Unparseable value → None (best-effort fallback).
+        assert_eq!(parse_option_u32(&params, "garbage"), None);
+    }
+
+    #[test]
+    fn encoder_reads_quality_and_keyint_options_clamped() {
+        // quality is clamped to the VfW 0..10000 range; keyint passes
+        // through verbatim.
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_clamp"));
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("quality", "999999"); // over-large
+        params.options.insert("keyint", "12");
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs");
+        assert_eq!(enc.quality, 10_000);
+        assert_eq!(enc.keyint, 12);
+        // No frames encoded yet → no P-frame reference.
+        assert!(enc.prev_input_bytes.is_none());
+    }
+
+    #[test]
+    fn encoder_defaults_quality_and_keyint_to_zero() {
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_default"));
+        params.width = Some(16);
+        params.height = Some(16);
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs");
+        assert_eq!(enc.quality, 0);
+        assert_eq!(enc.keyint, 0);
+    }
+
+    #[test]
+    fn is_keyframe_honours_frame0_and_keyint() {
+        // keyint = 0 → only frame 0 is a keyframe.
+        let mut p0 = CodecParameters::video(CodecId::new("vfw_kf_none"));
+        p0.width = Some(16);
+        p0.height = Some(16);
+        let enc0 = SandboxedVfwEncoder::new(vfw_record(), p0).expect("constructs");
+        assert!(enc0.is_keyframe(0));
+        assert!(!enc0.is_keyframe(1));
+        assert!(!enc0.is_keyframe(5));
+        assert!(!enc0.is_keyframe(100));
+
+        // keyint = 4 → frames 0, 4, 8, … are keyframes.
+        let mut p4 = CodecParameters::video(CodecId::new("vfw_kf_4"));
+        p4.width = Some(16);
+        p4.height = Some(16);
+        p4.options.insert("keyint", "4");
+        let enc4 = SandboxedVfwEncoder::new(vfw_record(), p4).expect("constructs");
+        assert!(enc4.is_keyframe(0));
+        assert!(!enc4.is_keyframe(1));
+        assert!(!enc4.is_keyframe(3));
+        assert!(enc4.is_keyframe(4));
+        assert!(!enc4.is_keyframe(5));
+        assert!(enc4.is_keyframe(8));
     }
 }

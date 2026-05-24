@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Per-frame P-frame reference + quality / keyframe-interval
+  knobs on `SandboxedVfwEncoder` (round 112).** The encoder now
+  threads the previous raw input frame through `ICCompress`'s
+  `lpbiPrev` / `lpPrev` slots on non-keyframe encodes — the
+  inter-frame reference wiring the round-107 entry flagged as a
+  bounded follow-up. After each successful `ICCompress` the
+  bottom-up BGR24 input bytes are stashed in `prev_input_bytes`;
+  the next P-frame passes them (with the input BIH) as the
+  reference so the codec can encode a delta. This is the
+  no-decoder-feedback-loop contract: we use the previous *raw*
+  input as the reference (not the codec's reconstructed previous
+  frame, which would require driving a parallel decoder); MS VfW
+  codecs historically accept this, and codecs that demand the
+  reconstructed reference still produce valid keyframe-only output
+  because the keyframe path bypasses `prev_*` entirely.
+  - Two optional `CodecParameters.options` bridge knobs, read once
+    at `make_encoder` time: `"quality"` (u32, clamped to the VfW
+    `0..10000` range; `0` = "codec chooses") is passed to
+    `ICCompress`'s `quality` slot, and `"keyint"` (u32 frames; `0`
+    = disabled) forces every Nth frame to a keyframe (frame 0 is
+    always a keyframe). A malformed knob value falls back to the
+    default rather than failing construction (best-effort policy:
+    these are bridge knobs, not codec invariants).
+  - New unit tests (`parse_option_u32_reads_decimal_and_falls_back,
+    encoder_reads_quality_and_keyint_options_clamped,
+    encoder_defaults_quality_and_keyint_to_zero,
+    is_keyframe_honours_frame0_and_keyint`) + integration tests
+    (`tests/round112_encoder_pframe_and_knobs.rs`) cover the
+    option-parsing fallback, the clamp, the keyframe-cadence
+    predicate, and the public `make_encoder` knob-wiring path.
+
 - **Encode side of the ud-emulator bridge.** VfW (`Kind::Vfw`)
   codecs now register an `oxideav_core::Encoder` factory
   (`discovery::make_encoder`) alongside the existing decoder. The
