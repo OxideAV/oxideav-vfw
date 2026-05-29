@@ -337,16 +337,16 @@ impl SandboxedVfwDecoder {
     /// Build the input BIH used for query/begin — `size_image` is
     /// stubbed to 0 here; per-packet `ic_decompress` overrides the
     /// field with the actual encoded byte count.
+    //
+    // `clippy::needless_update` allow — ud-emulator 0.1.x may grow
+    // new `Bih` fields between minor releases (`tail` landed in
+    // 0.1.5). The `..Default::default()` tail keeps this initializer
+    // building against any forward-compatible `Bih` shape; current
+    // clippy flags it when the locally-resolved `Bih` happens to be
+    // fully covered. See r178 commit `76207cd` for the original
+    // forward-compat rationale.
+    #[allow(clippy::needless_update)]
     fn build_input_bih(&self, size_image: u32) -> Bih {
-        // ud-emulator 0.1.5 grew a `tail` field on `Bih` (codec-private
-        // extension bytes past the canonical 40-byte header — HuffYUV
-        // and friends stash per-instance config there). Use the
-        // `..Default::default()` tail so this initializer compiles
-        // against any `Bih` shape ud-emulator 0.1.x may ship; the
-        // canonical 40-byte header continues to set `bi_size = 40` so
-        // the extension area stays empty for our format-negotiation
-        // path, which is what the round-24+ trace records show real
-        // mpg4c32 / Indeo / Cinepak codecs accept.
         Bih {
             bi_size: 40,
             width: self.width as i32,
@@ -367,6 +367,11 @@ impl SandboxedVfwDecoder {
     /// on disk; bottom-up since `height` is positive). round-24
     /// confirmed mpg4c32 honours BI_RGB but rejects 32bpp; Indeo
     /// (IR32_32 / IR50_32 round 7+) likewise.
+    //
+    // `clippy::needless_update` allow — see `build_input_bih`
+    // above for the forward-compat rationale on the `..Default`
+    // tail.
+    #[allow(clippy::needless_update)]
     fn build_output_bih(&self) -> Bih {
         Bih {
             bi_size: 40,
@@ -793,10 +798,12 @@ impl SandboxedVfwEncoder {
     /// Input BIH — BI_RGB 24bpp, positive height (bottom-up storage,
     /// the byte order VfW codecs reliably accept and the mirror of
     /// the decoder's BGR24 output convention).
+    //
+    // `clippy::needless_update` allow — see
+    // `SandboxedVfwDecoder::build_input_bih` for the forward-compat
+    // rationale on the `..Default` tail.
+    #[allow(clippy::needless_update)]
     fn build_input_bih(&self) -> Bih {
-        // See `SandboxedVfwDecoder::build_input_bih` for the
-        // `..Default::default()` rationale (ud-emulator 0.1.5+ added
-        // the `tail` extension-bytes field).
         Bih {
             bi_size: 40,
             width: self.width as i32,
@@ -816,6 +823,11 @@ impl SandboxedVfwEncoder {
     /// Output BIH template before negotiation — the codec's FourCC
     /// at the stream dims. `ICCompressGetFormat` overwrites the
     /// remaining fields with the codec's preferred on-wire header.
+    //
+    // `clippy::needless_update` allow — see
+    // `SandboxedVfwDecoder::build_input_bih` for the forward-compat
+    // rationale on the `..Default` tail.
+    #[allow(clippy::needless_update)]
     fn build_output_bih_template(&self) -> Bih {
         Bih {
             bi_size: 40,

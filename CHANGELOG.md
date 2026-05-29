@@ -8,6 +8,36 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **End-to-end corrupted-cache recovery integration test (round 189).**
+  New `tests/round189_corrupted_cache_recovery.rs` locks in the hard
+  contract documented on `discovery::Cache::load` and the
+  `discovery` module header — *a corrupted on-disk cache is treated
+  as empty rather than poisoning `register()`*. The pre-existing
+  `cache::tests::load_corrupted_file_returns_none` unit test only
+  exercised `Cache::load` in isolation; this round wires the full
+  `discover()` round-trip:
+  - Scribble malformed JSON onto the cache file (path redirected via
+    `XDG_CACHE_HOME` / `LOCALAPPDATA` to a per-test tempdir so the
+    dev box's real cache is never touched).
+  - Call `discover()` against a codec dir holding one synthetic non-PE
+    `*.dll`.
+  - Assert no panic, the candidate is re-probed (recorded as
+    `Kind::Unsupported`), the cache file is overwritten with a valid
+    JSON array on the way out, and a second `discover()` call hits the
+    healed cache rather than re-probing.
+  Also covers the zero-byte cache edge (interrupted atomic write
+  between `create()` and `write_all`). Two tests, both gated on
+  `auto-discovery` so the `--no-default-features` build remains
+  test-empty for this file. Companion in-crate housekeeping: the four
+  `Bih { .., ..Default::default() }` initializers in
+  `src/discovery/codec.rs` (added r178 `76207cd` as forward-compat
+  for upstream `Bih` field growth) gained per-fn
+  `#[allow(clippy::needless_update)]` annotations so the
+  forward-compat `..Default` tail keeps building under clippy 1.95's
+  promoted lint without sacrificing the original intent.
+
+### Added (older entries)
+
 - **`data_rate` per-frame byte-ceiling knob on `SandboxedVfwEncoder`
   (round 178).** A third optional `CodecParameters.options` knob
   alongside the round-112 `quality` / `keyint` pair: `"data_rate"`

@@ -68,7 +68,15 @@ Results are cached at:
 
 keyed by `(absolute_path, mtime_unix, size_bytes)`. Cache writes
 are atomic (tempfile + rename); a corrupted cache is treated as
-empty rather than poisoning `register()`.
+empty rather than poisoning `register()`. Round 189 added an
+end-to-end integration test
+(`tests/round189_corrupted_cache_recovery.rs`) covering both the
+malformed-JSON and zero-byte cache cases — the existing unit
+test only exercised `Cache::load` in isolation; the new test wires
+the full `discover() → re-probe → atomic-overwrite → next-call hits
+the healed cache` round-trip with the cache file redirected via
+`XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
+never touched.
 
 ## Codec registration priority
 
