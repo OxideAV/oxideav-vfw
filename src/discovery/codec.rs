@@ -700,6 +700,19 @@ struct SandboxedVfwEncoder {
     /// from `CodecParameters.options["keyint"]` at construction
     /// time.
     keyint: u32,
+    /// Round 178 — bridge-knob: target per-frame byte ceiling
+    /// threaded into `ICCompress`'s `lFrameDataRate` slot
+    /// (Win32 SDK: `dwFrameSizeLimit`). `0` = "no per-frame
+    /// ceiling" (codec chooses; the default). The value is a raw
+    /// byte count passed through verbatim — VfW codecs that honour
+    /// it treat it as the maximum encoded payload for a single
+    /// frame, which an RTP/AVI muxer can use to cap MTU pressure
+    /// on a fixed-rate transport. Sourced from
+    /// `CodecParameters.options["data_rate"]` at construction
+    /// time; a malformed or absent value falls back to `0`
+    /// rather than failing construction (same best-effort policy
+    /// as `quality` / `keyint`).
+    data_rate: u32,
 }
 
 impl SandboxedVfwEncoder {
@@ -721,6 +734,12 @@ impl SandboxedVfwEncoder {
             .unwrap_or(0)
             .min(10_000);
         let keyint = parse_option_u32(&params, "keyint").unwrap_or(0);
+        // Round 178 — `data_rate` bridge knob: per-frame byte ceiling
+        // for `ICCompress`. Verbatim u32, no clamp (the codec is the
+        // arbiter of plausibility — over-large values just turn the
+        // hint into a no-op; zero is the "disabled" sentinel). Same
+        // best-effort fallback as the round-112 knobs.
+        let data_rate = parse_option_u32(&params, "data_rate").unwrap_or(0);
         // The output stream parameters mirror the input dims and
         // carry the codec's FourCC as the on-wire tag, so a muxer
         // re-emits the same FourCC the codec was opened for.
@@ -746,6 +765,7 @@ impl SandboxedVfwEncoder {
             prev_input_bytes: None,
             quality,
             keyint,
+            data_rate,
         })
     }
 
@@ -979,6 +999,7 @@ impl Encoder for SandboxedVfwEncoder {
         let hic = self.hic;
         let frame_num = self.frame_num;
         let quality = self.quality;
+        let data_rate = self.data_rate;
         // Round 112 — a frame is a forced keyframe at frame 0 and at
         // every `keyint`-th frame thereafter. Forced keyframes request
         // `ICCOMPRESS_KEYFRAME` (bit 0) and thread NO previous
@@ -1016,7 +1037,11 @@ impl Encoder for SandboxedVfwEncoder {
                 cap,
                 0,
                 frame_num,
-                0,
+                // Round 178 — `frame_size_limit` is the per-frame
+                // byte ceiling threaded from the `data_rate`
+                // bridge knob. `0` preserves the historical
+                // "codec chooses" behaviour.
+                data_rate,
                 quality,
                 prev_bih.as_ref(),
                 prev_bytes.as_deref(),
@@ -3117,6 +3142,51 @@ mod tests {
         let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs");
         assert_eq!(enc.quality, 0);
         assert_eq!(enc.keyint, 0);
+        // Round 178 — data_rate also defaults to the "disabled"
+        // sentinel when absent.
+        assert_eq!(enc.data_rate, 0);
+    }
+
+    #[test]
+    fn encoder_reads_data_rate_option_verbatim() {
+        // Round 178 — `data_rate` is a raw u32 byte ceiling that
+        // passes through verbatim (no clamp). A plausible MTU-sized
+        // value (1500 - IP/UDP/RTP overhead = ~1400 bytes) round-trips
+        // unchanged.
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_data_rate"));
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("data_rate", "1400");
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs");
+        assert_eq!(enc.data_rate, 1400);
+    }
+
+    #[test]
+    fn encoder_data_rate_is_not_clamped_unlike_quality() {
+        // Round 178 — over-large `data_rate` is preserved verbatim.
+        // Unlike `quality` (which has a defined VfW range of 0..10000),
+        // `data_rate` is a byte count whose only invariant is u32;
+        // the codec decides whether the value is plausible.
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_data_rate_large"));
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("data_rate", "1000000000"); // 1 GB/frame — codec decides
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs");
+        assert_eq!(enc.data_rate, 1_000_000_000);
+    }
+
+    #[test]
+    fn encoder_tolerates_malformed_data_rate() {
+        // Round 178 — same best-effort policy as the round-112 knobs:
+        // a malformed value falls back to the disabled sentinel rather
+        // than failing construction.
+        let mut params = CodecParameters::video(CodecId::new("vfw_opt_data_rate_bad"));
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("data_rate", "not-a-number");
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params)
+            .expect("malformed data_rate falls back, does not fail");
+        assert_eq!(enc.data_rate, 0);
     }
 
     #[test]

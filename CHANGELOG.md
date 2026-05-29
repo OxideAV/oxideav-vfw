@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`data_rate` per-frame byte-ceiling knob on `SandboxedVfwEncoder`
+  (round 178).** A third optional `CodecParameters.options` knob
+  alongside the round-112 `quality` / `keyint` pair: `"data_rate"`
+  (u32 bytes) is parsed once at construction time and threaded into
+  `ICCompress`'s `dwFrameSizeLimit` slot on every per-frame call.
+  `0` (default, and the value returned when the knob is absent or
+  malformed) preserves the historical "codec chooses" behaviour;
+  non-zero hints a per-frame byte cap, which an RTP / AVI muxer
+  can use to bound MTU pressure on a fixed-rate transport without
+  resorting to fragmentation. The knob is u32-verbatim (no clamp —
+  unlike `quality`'s VfW-defined `0..10000` range, `data_rate` is a
+  raw byte count whose only invariant is fitting in a `u32`; the
+  codec is the arbiter of plausibility for outsized values).
+  Replaces the pre-r178 hard-coded `frame_size_limit = 0` argument
+  to `ic_compress` with `self.data_rate`.
+  - New unit tests (`encoder_reads_data_rate_option_verbatim`,
+    `encoder_data_rate_is_not_clamped_unlike_quality`,
+    `encoder_tolerates_malformed_data_rate`) + the round-178
+    integration test file (`tests/round178_encoder_data_rate_knob.rs`)
+    cover the verbatim pass-through, the malformed-value fallback,
+    and the all-three-knobs-coexist case. The default-knob test
+    (`encoder_defaults_quality_and_keyint_to_zero`) now also asserts
+    `data_rate == 0` to lock the additive contract.
+
 - **Per-frame P-frame reference + quality / keyframe-interval
   knobs on `SandboxedVfwEncoder` (round 112).** The encoder now
   threads the previous raw input frame through `ICCompress`'s

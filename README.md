@@ -29,10 +29,13 @@ ud-emulator's software interpreter sandbox.
    ICCompress → ICCompressEnd` lifecycle on first `send_frame`.
    The encoder threads the previous raw input frame through
    `ICCompress`'s `lpPrev` reference slot on non-keyframe encodes
-   and honours two optional `CodecParameters.options` knobs:
-   `"quality"` (u32 `0..10000`) and `"keyint"` (u32 frames; force
-   every Nth frame to a keyframe). DirectShow (`Kind::DirectShow`)
-   filters are decode-only through this bridge.
+   and honours three optional `CodecParameters.options` knobs:
+   `"quality"` (u32 `0..10000`), `"keyint"` (u32 frames; force
+   every Nth frame to a keyframe), and `"data_rate"` (u32 bytes;
+   per-frame byte ceiling threaded into `ICCompress`'s
+   `dwFrameSizeLimit` slot, useful for MTU-bounded transports).
+   DirectShow (`Kind::DirectShow`) filters are decode-only through
+   this bridge.
 
 Everything below that — the i386 interpreter, the PE32 loader,
 the kernel32 / user32 / gdi32 / vfw32 / msvfw32 / ole32 / winmm
