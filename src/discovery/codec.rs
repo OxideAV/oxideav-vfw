@@ -338,6 +338,15 @@ impl SandboxedVfwDecoder {
     /// stubbed to 0 here; per-packet `ic_decompress` overrides the
     /// field with the actual encoded byte count.
     fn build_input_bih(&self, size_image: u32) -> Bih {
+        // ud-emulator 0.1.5 grew a `tail` field on `Bih` (codec-private
+        // extension bytes past the canonical 40-byte header — HuffYUV
+        // and friends stash per-instance config there). Use the
+        // `..Default::default()` tail so this initializer compiles
+        // against any `Bih` shape ud-emulator 0.1.x may ship; the
+        // canonical 40-byte header continues to set `bi_size = 40` so
+        // the extension area stays empty for our format-negotiation
+        // path, which is what the round-24+ trace records show real
+        // mpg4c32 / Indeo / Cinepak codecs accept.
         Bih {
             bi_size: 40,
             width: self.width as i32,
@@ -350,6 +359,7 @@ impl SandboxedVfwDecoder {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            ..Default::default()
         }
     }
 
@@ -370,6 +380,7 @@ impl SandboxedVfwDecoder {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            ..Default::default()
         }
     }
 
@@ -783,6 +794,9 @@ impl SandboxedVfwEncoder {
     /// the byte order VfW codecs reliably accept and the mirror of
     /// the decoder's BGR24 output convention).
     fn build_input_bih(&self) -> Bih {
+        // See `SandboxedVfwDecoder::build_input_bih` for the
+        // `..Default::default()` rationale (ud-emulator 0.1.5+ added
+        // the `tail` extension-bytes field).
         Bih {
             bi_size: 40,
             width: self.width as i32,
@@ -795,6 +809,7 @@ impl SandboxedVfwEncoder {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            ..Default::default()
         }
     }
 
@@ -814,6 +829,7 @@ impl SandboxedVfwEncoder {
             y_pels_per_meter: 0,
             clr_used: 0,
             clr_important: 0,
+            ..Default::default()
         }
     }
 
