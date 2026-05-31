@@ -8,6 +8,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **On-disk cache schema versioning + legacy-shape seamless upgrade
+  (round 197).** The discovery cache file now carries a versioned
+  envelope `{"version": N, "entries": [CacheEntry, ...]}` instead
+  of a bare top-level JSON array. The new public
+  `discovery::CURRENT_SCHEMA_VERSION = 1` constant pins what this
+  crate writes; `Cache::load` accepts the envelope only when the
+  version matches and any mismatch (older OR newer) is funneled
+  into the round-189 corruption-recovery path — `load` returns
+  `None`, `discover()` re-probes, and the next `save_atomic`
+  overwrites the file with the current shape. Pre-round-197
+  caches (bare arrays, no version field) are still loadable
+  exactly once; the same `discover()` call's atomic-write tail
+  promotes them to the versioned envelope, so a user upgrading
+  through this round sees one harmless cache rewrite and zero
+  re-probe storms.
+  - Three new integration tests in
+    `tests/round197_cache_schema_versioning.rs` cover
+    legacy-bare-array upgrade-and-promote, future-version refusal,
+    and older-version refusal. Each pre-seeds a synthetic
+    `*.dll` candidate + a hand-rolled cache file, then verifies
+    that `discover()` honoured (legacy path) or discarded (future
+    / older path) the cached row and that the post-call on-disk
+    shape is the envelope at `CURRENT_SCHEMA_VERSION`.
+  - Six new unit tests in `discovery::cache::tests` lock the
+    envelope's serialised shape (`{"version": N, "entries":
+    [...]}`), the round-trip stability through `save_atomic +
+    load`, the legacy-bare-array fallback path, the
+    legacy-to-envelope promotion via a single load+save cycle,
+    and the negative paths (unknown version, older version,
+    structurally-wrong `entries` value all surface as `None`
+    rather than panicking).
+  - Same-binary test race in `tests/round189_corrupted_cache_recovery.rs`
+    closed: both round-189 tests, and all three new round-197
+    tests, now serialise their `XDG_CACHE_HOME` / `LOCALAPPDATA`
+    mutations through a process-global `Mutex`. Without the
+    lock, parallel test execution (cargo's default) raced two
+    same-binary tests against the same process-global env var;
+    the failure was latent in round 189's two-test binary and
+    surfaced as soon as round 197 added a third
+    cache-dir-overriding test alongside.
+
 - **End-to-end corrupted-cache recovery integration test (round 189).**
   New `tests/round189_corrupted_cache_recovery.rs` locks in the hard
   contract documented on `discovery::Cache::load` and the

@@ -93,6 +93,26 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Process-global serialiser for tests in this binary that mutate
+/// the shared cache-dir env var (`XDG_CACHE_HOME` / `LOCALAPPDATA`).
+/// `cargo test` defaults to parallel test execution and env vars
+/// are process-global — without this lock, sibling tests in the
+/// same binary race each other into reading one another's cache
+/// directory. The latent shape of this race in r189's original
+/// two-test binary surfaced under `--test-threads=2` and was
+/// noticed during the r197 cache-versioning work (the new test
+/// binary parallels this one verbatim).
+fn cache_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    // Poisoned-mutex tolerance: an earlier test panicked while
+    // holding the lock; subsequent tests still need the env-var
+    // serialisation guarantee.
+}
+
 /// Resolve the platform cache-dir env-var name that the discovery
 /// layer honours when picking
 /// `<cache>/oxideav/vfw-discovery.json`. UNIX uses
@@ -139,6 +159,7 @@ fn corrupted_cache_is_treated_as_empty_and_overwritten() {
     // read.
     let cache_root = tmp.path().join("cache-root");
     fs::create_dir_all(&cache_root).unwrap();
+    let _serial = cache_env_lock();
     let _cache_env = EnvGuard::set(cache_dir_env_var(), &cache_root);
     let cache_file = expected_cache_file(&cache_root);
     fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
@@ -180,12 +201,24 @@ fn corrupted_cache_is_treated_as_empty_and_overwritten() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&post)
         .expect("overwritten cache must parse as JSON (atomic write produced valid JSON)");
+    // Round-197 promoted the on-disk schema to a versioned envelope
+    // `{"version": N, "entries": [...]}`. Round-189's original
+    // assertion (top-level array) is relaxed to "either the legacy
+    // array OR the versioned envelope" so the test stays valid
+    // across the schema transition; the round-197 unit tests in
+    // `discovery::cache::tests` lock in the strict envelope shape.
+    let entries_value = parsed
+        .get("entries")
+        .cloned()
+        .unwrap_or_else(|| parsed.clone());
     assert!(
-        parsed.is_array(),
-        "schema: top-level cache document is a JSON array of CacheEntry",
+        entries_value.is_array(),
+        "schema: cache document carries a JSON array of CacheEntry (\
+         either as the top-level value (legacy) or under the \
+         `entries` key (versioned envelope))",
     );
     assert_eq!(
-        parsed.as_array().map(|a| a.len()),
+        entries_value.as_array().map(|a| a.len()),
         Some(1),
         "exactly one entry written for the one synthetic DLL",
     );
@@ -215,6 +248,7 @@ fn empty_cache_file_is_treated_as_empty_not_a_panic() {
 
     let cache_root = tmp.path().join("cache-root");
     fs::create_dir_all(&cache_root).unwrap();
+    let _serial = cache_env_lock();
     let _cache_env = EnvGuard::set(cache_dir_env_var(), &cache_root);
     let cache_file = expected_cache_file(&cache_root);
     fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
@@ -236,5 +270,11 @@ fn empty_cache_file_is_treated_as_empty_not_a_panic() {
     );
     let parsed: serde_json::Value =
         serde_json::from_slice(&after).expect("post-recovery cache parses cleanly");
-    assert!(parsed.is_array());
+    // Round-197 schema: versioned envelope OR (for ancient seeds)
+    // a bare array.
+    let entries_value = parsed
+        .get("entries")
+        .cloned()
+        .unwrap_or_else(|| parsed.clone());
+    assert!(entries_value.is_array());
 }

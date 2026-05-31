@@ -78,6 +78,38 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Schema versioning (round 197)
+
+The on-disk cache is now a **versioned envelope**:
+
+```json
+{
+  "version": 1,
+  "entries": [ /* CacheEntry, ... */ ]
+}
+```
+
+The `version` field is stamped at `discovery::CURRENT_SCHEMA_VERSION`
+on every save. Readers refuse any file whose version doesn't match
+their own — both downgrades (a `v2` file read by a `v1` reader) and
+forward-incompatible upgrades fall into the round-189
+corruption-recovery path: discard, re-probe, heal on next save.
+Pre-round-197 caches (top-level JSON array, no version field) are
+still loadable on first call, then promoted to the envelope shape
+on the same call's atomic-write tail — no user intervention
+required. Three integration tests in
+`tests/round197_cache_schema_versioning.rs` cover legacy-upgrade,
+future-version refusal, and the round-trip stability invariant; six
+new unit tests in `discovery::cache::tests` lock in the envelope
+shape, the version stamp, and the negative paths
+(unknown/older/malformed envelope = `None`).
+
+Round 197 also closed a long-latent same-binary test race in the
+round-189 corrupted-cache test pair: parallel test execution +
+process-global `XDG_CACHE_HOME` made the two tests' env-var writes
+interleave under `--test-threads >= 2`. Both binaries now serialise
+their env-var mutations through a process-global `Mutex`.
+
 ## Codec registration priority
 
 All discovered codecs land at **priority 200** — VfW is a

@@ -65,7 +65,7 @@ mod codec;
 mod paths;
 mod probe;
 
-pub use cache::{Cache, CacheEntry};
+pub use cache::{Cache, CacheEntry, CURRENT_SCHEMA_VERSION};
 pub use codec::{
     codec_id_for, last_codec_allocator_negotiation, lookup_record, make_decoder, make_encoder,
     output_pixel_format, register_factory_for_id, CodecAllocatorNegotiation, DiscoveryRecord,
