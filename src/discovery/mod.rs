@@ -159,8 +159,15 @@ pub fn discover(paths: &[PathBuf]) -> Vec<DiscoveryEntry> {
         }
     }
     // Best-effort write — never let a cache I/O failure poison
-    // discovery itself.
-    let _ = cache.save_atomic(&cache_path);
+    // discovery itself.  Round 204: only fire when something
+    // changed (a cache miss re-probed a candidate, or `load`
+    // consumed a legacy bare-array shape that wants
+    // envelope-promotion).  Steady-state `register()` calls against
+    // a fully-cached, stable codec directory now skip the atomic
+    // rewrite entirely.
+    if cache.is_dirty() {
+        let _ = cache.save_atomic(&cache_path);
+    }
     out
 }
 

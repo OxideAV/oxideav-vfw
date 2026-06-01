@@ -8,6 +8,55 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Steady-state no-op cache-save skip (round 204).**
+  `super::discover` now skips its tail-end `Cache::save_atomic`
+  call when nothing actually changed. An interior `dirty` flag on
+  `Cache` (a `Cell<bool>` so the pre-r204 `save_atomic(&self)`
+  signature is preserved — no breaking API change) tracks
+  divergence between the in-memory state and the last-loaded
+  on-disk file:
+  - `Cache::upsert` sets it unconditionally — every cache-miss
+    re-probe flips it from `false` to `true`.
+  - `Cache::load` sets it ONLY when the file was the pre-r197
+    legacy bare-array shape (whose on-disk representation differs
+    from what `save_atomic` would now write — the dirty flag
+    is what keeps the legacy → versioned-envelope promotion
+    firing under the new skip gate). A current-version envelope
+    load starts clean.
+  - `Cache::save_atomic` clears the flag on success.
+  - New public accessor `Cache::is_dirty(&self) -> bool` exposes
+    the state for `discover()` and for downstream introspection.
+
+  Net effect on the hot path: `register()` against a stable codec
+  directory with an already-current envelope on disk performs
+  **zero filesystem writes** instead of one full pretty-printed
+  `vfw-discovery.json` rewrite per call. Cross-mount cache dirs
+  (NFS, tmpfs-backed `XDG_CACHE_HOME`) and embedded targets with
+  flash-wear constraints get a measurable startup-IO reduction;
+  every other consumer gets one fewer `create + write + fsync +
+  rename` syscall chain per call.
+  - Five new unit tests in `discovery::cache::tests`
+    (`default_cache_is_not_dirty`, `upsert_marks_cache_dirty`,
+    `save_atomic_clears_dirty_flag`,
+    `load_versioned_envelope_starts_clean`,
+    `load_legacy_bare_array_starts_dirty`) lock the flag's
+    individual transitions.
+  - Three new integration tests in
+    `tests/round204_cache_noop_save_skip.rs` pin the end-to-end
+    behaviour through the public `discovery::discover` surface:
+    1. `steady_state_discover_does_not_rewrite_cache_file` —
+       two `discover()` calls against the same dir; the file's
+       mtime + bytes must be identical after the second call.
+    2. `legacy_bare_array_still_promoted_under_noop_skip` —
+       pre-seed a bare-array cache, verify the FIRST `discover()`
+       call rewrites the file as a versioned envelope (proves
+       the load-time dirty flag is load-bearing for the legacy
+       upgrade path under the new skip gate).
+    3. `cache_miss_still_triggers_save_under_noop_skip` — symmetric
+       guard: drop a new DLL between two `discover()` calls and
+       verify mtime advances on the second (the skip must NOT be
+       overly aggressive).
+
 - **On-disk cache schema versioning + legacy-shape seamless upgrade
   (round 197).** The discovery cache file now carries a versioned
   envelope `{"version": N, "entries": [CacheEntry, ...]}` instead

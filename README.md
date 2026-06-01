@@ -78,6 +78,23 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Steady-state no-op-save skip (round 204)
+
+`discover()` now skips its tail-end `Cache::save_atomic` call when
+nothing actually changed. An interior dirty flag on `Cache`
+tracks divergence between the in-memory state and the
+last-loaded on-disk file: every `Cache::upsert` (cache-miss
+re-probe) sets it; loading the pre-r197 legacy bare-array shape
+also sets it (so the legacy → envelope promotion still fires);
+a successful `Cache::save_atomic` clears it. Steady-state
+`register()` against a stable codec directory therefore costs
+**zero filesystem writes** instead of one full pretty-printed
+`vfw-discovery.json` rewrite per call. Cache-miss writes and
+legacy-shape promotions are unaffected — symmetric guards in
+`tests/round204_cache_noop_save_skip.rs` pin both directions:
+no rewrite when nothing changed, mtime advances when a new
+candidate landed.
+
 ### Schema versioning (round 197)
 
 The on-disk cache is now a **versioned envelope**:
