@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`OXIDEAV_VFW_CODEC_PATH` whitespace strip on each path-list
+  component (round 211).** `discovery::paths::parse_path_list`
+  now strips leading and trailing ASCII whitespace from every
+  component before filtering empties — so a value pasted from a
+  `.env` file, a systemd `Environment=` line, a Docker / k8s
+  YAML manifest, or a Windows registry string with a stray space
+  / tab / newline around each path resolves to the underlying
+  paths rather than silently producing unreadable entries. The
+  strip is `trim_matches`, scoped to the seven ASCII whitespace
+  characters (`\t \n \v \f \r space`) and only at the component
+  edges — interior whitespace inside a directory name
+  (`~/Library/Application Support/...`,
+  `C:\Program Files\...`) round-trips untouched. Behaviour for
+  any already-well-formed input is unchanged.
+  - Five new unit tests in `discovery::paths::tests` lock the
+    contract: `parse_strips_surrounding_whitespace`,
+    `parse_whitespace_only_components_skipped`,
+    `parse_preserves_interior_whitespace_in_path`,
+    `parse_trims_trailing_newline_on_single_component`,
+    `discovery_paths_strips_whitespace_via_env_var`.
+  - Shared `env_lock()` `OnceLock<Mutex<()>>` introduced in the
+    `paths::tests` module so the new
+    `discovery_paths_strips_whitespace_via_env_var` test and
+    the existing `discovery_paths_honours_override` test can
+    mutate the process-global env var without racing under
+    cargo's default multi-threaded executor — same shape of fix
+    the round-189 / round-197 cache-dir tests applied to
+    `XDG_CACHE_HOME` / `LOCALAPPDATA`.
+  - Public `discovery_paths()` rustdoc updated to document the
+    new contract, including the explicit ASCII-whitespace
+    list and the rationale for the strip.
+
 - **Steady-state no-op cache-save skip (round 204).**
   `super::discover` now skips its tail-end `Cache::save_atomic`
   call when nothing actually changed. An interior `dirty` flag on

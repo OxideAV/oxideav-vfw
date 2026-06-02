@@ -60,6 +60,21 @@ or recognisable `DllGetClassObject` CLSID, are recorded as
 `Kind::Unsupported` (so re-probe is skipped) and otherwise
 silently ignored.
 
+When `OXIDEAV_VFW_CODEC_PATH` is honoured, each path-list
+component has leading and trailing ASCII whitespace stripped
+before use, and components that are empty (or whitespace-only)
+after the strip are filtered out. This makes the env var
+forgiving of `.env` files, systemd `Environment=` lines, and
+Docker / Kubernetes container manifests where shell expansion
+doesn't run and YAML quoting frequently leaves stray whitespace
+around each value — `OXIDEAV_VFW_CODEC_PATH="  /p1 : /p2\n"`
+now resolves to `["/p1", "/p2"]` instead of two unreadable
+paths. Interior whitespace inside a path (`~/Library/Application
+Support/...`, `C:\Program Files\...`) is preserved untouched —
+the strip is `trim_matches`, not a global `replace`. Round 211
+added the strip and five new unit tests in
+`discovery::paths::tests`.
+
 Results are cached at:
 
 - Linux / macOS: `$XDG_CACHE_HOME/oxideav/vfw-discovery.json` or
