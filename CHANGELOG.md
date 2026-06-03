@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Sandbox instruction-budget ceiling deduped through a single
+  `SANDBOX_INSTR_LIMIT` constant (round 224).** The
+  `8_000_000_000` instruction wall the long-lived per-codec
+  sandboxes hand to `ud_emulator::Cpu::set_instr_limit` was
+  previously hand-copied across three separate `ensure_open`
+  call sites (`SandboxedVfwDecoder::ensure_open`,
+  `SandboxedVfwEncoder::ensure_open`,
+  `SandboxedDshowDecoder::ensure_open`), and only the decoder
+  site carried the round-24 historical rationale that established
+  the value. A quiet edit to one site would have produced a
+  silently-divergent budget on a neighbouring path — exactly the
+  shape of drift the round-217 `matches` dedupe was guarding
+  against on the cache-staleness check. The constant lives at
+  the top of `discovery::codec` with the full round-24 rationale
+  and a single forward-edit point; the three `ensure_open` sites
+  now reference it.
+  - Two new tests in `discovery::codec::tests` pin the contract
+    as compile-time `const { ... }` assertions so a drift turns
+    into a build break rather than a silent test failure:
+    `sandbox_instr_limit_preserves_round24_value` locks the
+    numeric value at `8_000_000_000`;
+    `sandbox_instr_limit_is_finite_u64_ceiling` enforces that
+    the bound stays a positive finite ceiling well under
+    `u64::MAX / 2` (a hand-typo of `u64::MAX` or a "remove the
+    ceiling, the codec is well-behaved" edit would trip here).
+  - Public API: no surface change — the constant is module-private
+    on `discovery::codec`. The three `ensure_open` paths produce
+    bit-identical sandbox configurations to the pre-r224 lineage;
+    the dedupe is structural, not behavioural.
+  - Out of scope: the discovery-time probes in
+    `discovery::probe::{try_probe_vfw, try_probe_dshow}` still
+    run on `Sandbox::new`'s default budget — those are short
+    `ICOpen` / `DllGetClassObject` round-trips that never needed
+    the elevated ceiling. The constant's rustdoc spells out
+    where it does and doesn't apply.
+
 - **Cache staleness check deduped through per-type `matches`
   methods (round 217).** The `(path, mtime_unix, size_bytes)`
   triple-equality test that decides whether a stored discovery

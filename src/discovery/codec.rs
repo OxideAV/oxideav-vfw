@@ -24,6 +24,38 @@ use ud_emulator::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
 
 use super::probe::{fourcc_to_bytes, Kind};
 
+/// Per-codec-construction instruction budget handed to every
+/// long-lived ud-emulator [`ud_emulator::Sandbox`] this module
+/// spins up (the VfW decoder, the VfW encoder, and the DirectShow
+/// decoder all set this in their `ensure_open`).
+///
+/// Round 24's manual walk through `mpg4c32.dll`'s decode path
+/// used eight billion instructions to chew through the 5-6-frame
+/// 352x288 fixtures the test suite ships against, so that's the
+/// bound every `ensure_open` here has carried since. Lifting it
+/// to a single named constant in round 224 — the value was
+/// previously hand-copied across three separate
+/// `sb.cpu.set_instr_limit(8_000_000_000)` call sites
+/// (`SandboxedVfwDecoder::ensure_open`,
+/// `SandboxedVfwEncoder::ensure_open`,
+/// `SandboxedDshowDecoder::ensure_open`), and a quiet edit to any
+/// one would have produced a silently-divergent budget on a
+/// neighbouring path. Same shape of dedupe as the round-217
+/// `matches`-method consolidation: one source of truth for an
+/// invariant that has to hold identically across multiple sites.
+///
+/// The bound is deliberately oversized for healthy probes: it
+/// caps a runaway codec (intentionally malformed input that drives
+/// an infinite loop inside the sandboxed code) at a finite
+/// `Error::Other` rather than letting the host wait forever. Real
+/// decoder / encoder probes finish well below 1 G instructions
+/// in practice; the wall is the absolute ceiling, not the working
+/// budget. Discovery-time probes in [`super::probe`] DON'T set
+/// this — they walk a fresh sandbox per candidate and rely on
+/// `Sandbox::new`'s default budget, which is plenty for an
+/// `ICOpen` / `DllGetClassObject` round-trip.
+const SANDBOX_INSTR_LIMIT: u64 = 8_000_000_000;
+
 /// Backing-store record for one discovered codec. Stashed in the
 /// per-process [`record_table`] so the bare `fn`
 /// [`oxideav_core::DecoderFactory`] can reach it at
@@ -408,10 +440,11 @@ impl SandboxedVfwDecoder {
                 .map_err(|e| Error::other(format!("vfw discovery: read DLL failed: {e}")))?;
             let mut sb = ud_emulator::Sandbox::new();
             // VfW codecs (esp. mpg4c32) need a generous instruction
-            // budget to walk the larger fixtures' P-frames; the
-            // round-24 manual path uses 8 G instructions for the
-            // 5-6-frame 352×288 fixtures.
-            sb.cpu.set_instr_limit(8_000_000_000);
+            // budget to walk the larger fixtures' P-frames. The bound
+            // lives on [`SANDBOX_INSTR_LIMIT`] now — the encoder and
+            // the DirectShow decoder use the same constant so a tune
+            // here lands on all three.
+            sb.cpu.set_instr_limit(SANDBOX_INSTR_LIMIT);
             let img = sb
                 .load("codec.dll", &bytes)
                 .map_err(|e| Error::other(format!("vfw discovery: Sandbox::load failed: {e}")))?;
@@ -864,7 +897,9 @@ impl SandboxedVfwEncoder {
                 Error::other(format!("vfw discovery (encode): read DLL failed: {e}"))
             })?;
             let mut sb = ud_emulator::Sandbox::new();
-            sb.cpu.set_instr_limit(8_000_000_000);
+            // Same long-lived sandbox budget as the decoder side
+            // (round 224 — see [`SANDBOX_INSTR_LIMIT`]).
+            sb.cpu.set_instr_limit(SANDBOX_INSTR_LIMIT);
             let img = sb.load("codec.dll", &bytes).map_err(|e| {
                 Error::other(format!("vfw discovery (encode): Sandbox::load failed: {e}"))
             })?;
@@ -1322,7 +1357,9 @@ impl SandboxedDshowDecoder {
                 Error::other(format!("vfw discovery (DShow): read DLL failed: {e}"))
             })?;
             let mut sb = ud_emulator::Sandbox::new();
-            sb.cpu.set_instr_limit(8_000_000_000);
+            // Same long-lived sandbox budget as the VfW decoder
+            // / encoder (round 224 — see [`SANDBOX_INSTR_LIMIT`]).
+            sb.cpu.set_instr_limit(SANDBOX_INSTR_LIMIT);
             let img = sb.load("codec.ax", &bytes).map_err(|e| {
                 Error::other(format!("vfw discovery (DShow): Sandbox::load failed: {e}"))
             })?;
@@ -3241,5 +3278,39 @@ mod tests {
         assert!(enc4.is_keyframe(4));
         assert!(!enc4.is_keyframe(5));
         assert!(enc4.is_keyframe(8));
+    }
+
+    // ── Round 224 — SANDBOX_INSTR_LIMIT dedupe pin ─────────────────
+
+    #[test]
+    fn sandbox_instr_limit_preserves_round24_value() {
+        // The round-24 manual walk through `mpg4c32.dll`'s decode
+        // path established 8 G instructions as the working ceiling
+        // for the 5-6-frame 352x288 fixtures. The constant MUST stay
+        // pinned at that value — a quiet edit that halved the budget
+        // would silently start trapping `ic_decompress` mid-stream on
+        // the longer fixtures, and a doubled budget would mask a
+        // runaway codec for an extra 8 G instructions before
+        // surfacing as `Error::Other`. Lock the numeric value here
+        // so the dedupe can't drift unobserved from its historical
+        // baseline. `const { ... }` lifts the check into a
+        // compile-time assertion — a drift turns into a build break
+        // rather than a runtime test failure.
+        const _: () = assert!(SANDBOX_INSTR_LIMIT == 8_000_000_000);
+    }
+
+    #[test]
+    fn sandbox_instr_limit_is_finite_u64_ceiling() {
+        // Sanity: the ceiling must be a positive finite u64 and well
+        // under `u64::MAX` so the host loop's instruction counter
+        // can't trivially wrap into "no ceiling at all". The
+        // round-24 bound (8 G) sits at roughly 0.0000004% of u64
+        // headroom, so this is mostly a future-edit guard — a
+        // hand-typo of `u64::MAX` or an accidental "remove the
+        // ceiling, the codec is well-behaved" patch would trip
+        // here. Same `const { ... }` compile-time pin as the
+        // sibling round-24-value test above.
+        const _: () = assert!(SANDBOX_INSTR_LIMIT > 0);
+        const _: () = assert!(SANDBOX_INSTR_LIMIT < u64::MAX / 2);
     }
 }

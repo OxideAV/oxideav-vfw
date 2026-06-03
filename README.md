@@ -93,6 +93,28 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Sandbox instruction-budget dedupe (round 224)
+
+The `8_000_000_000` instruction wall the three long-lived
+`ensure_open` paths hand to `ud_emulator::Cpu::set_instr_limit`
+(VfW decoder, VfW encoder, DirectShow decoder) now lives on a
+single `SANDBOX_INSTR_LIMIT` module-private constant in
+`discovery::codec`. The round-24 historical rationale (the value
+matches the bound the manual `mpg4c32.dll` decode walk needed to
+chew through the 5-6-frame 352x288 fixtures) sits on the
+constant's rustdoc, in one place rather than partially-copied
+across three call sites. A future tune to the budget — say,
+because a longer fixture starts hitting the wall — lands on the
+decoder, encoder, and DirectShow paths simultaneously. Two new
+compile-time `const { ... }` pins (`SANDBOX_INSTR_LIMIT ==
+8_000_000_000`, `SANDBOX_INSTR_LIMIT < u64::MAX / 2`) turn a
+drift into a build break. Discovery-time probes in
+`discovery::probe::{try_probe_vfw, try_probe_dshow}` still run
+on the sandbox's default budget — they walk a fresh sandbox per
+candidate for short `ICOpen` / `DllGetClassObject` round-trips
+and never needed the elevated ceiling. No behavioural change to
+any of the three `ensure_open` paths.
+
 ### Staleness-check dedupe (round 217)
 
 The cache's `(path, mtime_unix, size_bytes)` triple-equality test
