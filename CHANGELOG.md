@@ -6,6 +6,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Cache staleness check deduped through per-type `matches`
+  methods (round 217).** The `(path, mtime_unix, size_bytes)`
+  triple-equality test that decides whether a stored discovery
+  entry is fresh now lives on each row type as its own `matches`
+  method instead of being hand-inlined into `Cache::lookup`. The
+  existing `DiscoveryEntry::matches(&path, mtime, size)` public
+  method (added at the cache layer's introduction but previously
+  uncalled within the crate) is now paired with a sibling
+  `CacheEntry::matches(&path, mtime, size)` on the on-disk row
+  type. `Cache::lookup` routes through `CacheEntry::matches` —
+  the previous `e.path == path && e.mtime_unix == mtime &&
+  e.size_bytes == size` chain was structurally correct but
+  duplicated the freshness rule in three places across the crate
+  (the `DiscoveryEntry` method, the `Cache::lookup` loop, and the
+  in-memory `position` predicate in `Cache::upsert`). A quiet
+  divergence between any two would have left a stale row reachable
+  by lookup while looking correct in the row-level method's unit
+  tests.
+  - Three new unit tests in `discovery::tests` pin
+    `DiscoveryEntry::matches`'s contract on each axis:
+    `discovery_entry_matches_returns_true_on_identical_triple`,
+    `discovery_entry_matches_false_on_path_change`,
+    `discovery_entry_matches_false_on_mtime_change`,
+    `discovery_entry_matches_false_on_size_change`.
+  - Three new unit tests in `discovery::cache::tests` pin
+    `CacheEntry::matches` and the `Cache::lookup` delegation
+    end-to-end: `cache_entry_matches_returns_true_on_identical_triple`,
+    `cache_entry_matches_false_on_any_field_mismatch`,
+    `cache_lookup_routes_through_cache_entry_matches`.
+  - Public API: `DiscoveryEntry::matches` is unchanged. The new
+    `CacheEntry::matches` mirrors it on the on-disk type. No
+    user-visible behaviour change — `Cache::lookup` returns the
+    same `Option<DiscoveryEntry>` on the same triples as before.
+
 ### Added
 
 - **`OXIDEAV_VFW_CODEC_PATH` whitespace strip on each path-list

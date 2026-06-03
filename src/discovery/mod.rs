@@ -92,9 +92,20 @@ pub struct DiscoveryEntry {
 }
 
 impl DiscoveryEntry {
-    /// True if `(absolute_path, mtime, size)` matches `path` —
-    /// used by the cache layer to decide whether to honour or
-    /// invalidate a stored entry.
+    /// True if this entry's `(absolute_path, mtime_unix,
+    /// size_bytes)` triple matches the supplied `(path, mtime,
+    /// size)`. Used by the cache layer to decide whether to honour
+    /// or invalidate a stored entry.
+    ///
+    /// Round 217 paired this with [`super::CacheEntry::matches`] —
+    /// the two methods share the exact same triple-equality
+    /// contract so an in-memory [`DiscoveryEntry`] and its on-disk
+    /// [`super::CacheEntry`] mirror image can be queried with the
+    /// same shape of staleness check. Drift between the two
+    /// previously had to be caught by hand-mirroring `==` chains in
+    /// `Cache::lookup` — the round-217 dedupe routes `Cache::lookup`
+    /// through `CacheEntry::matches`, so any future change to the
+    /// triple's definition only has to land in one place per type.
     pub fn matches(&self, path: &Path, mtime: i64, size: u64) -> bool {
         self.path == path && self.mtime_unix == mtime && self.size_bytes == size
     }
@@ -324,5 +335,54 @@ mod tests {
         assert!(is_codec_candidate(&dll));
         assert!(is_codec_candidate(&ax));
         assert!(!is_codec_candidate(&txt));
+    }
+
+    // ── Round 217: triple-equality contract for the staleness check ─
+
+    fn sample_disc_entry() -> DiscoveryEntry {
+        DiscoveryEntry {
+            path: PathBuf::from("/abs/codec.dll"),
+            mtime_unix: 1_700_000_000,
+            size_bytes: 524_288,
+            kind: probe::Kind::Vfw,
+            fourccs: vec!["MP43".into()],
+            clsid: None,
+        }
+    }
+
+    #[test]
+    fn discovery_entry_matches_returns_true_on_identical_triple() {
+        // The base case the cache layer hits on every steady-state
+        // `register()`: the exact `(path, mtime, size)` we stored
+        // last time, no DLL was touched between calls.
+        let e = sample_disc_entry();
+        assert!(e.matches(Path::new("/abs/codec.dll"), 1_700_000_000, 524_288));
+    }
+
+    #[test]
+    fn discovery_entry_matches_false_on_path_change() {
+        // A different absolute path under the same DLL basename
+        // (different codec dir, multiple discovery roots) is NOT
+        // the same entry — the cache table is keyed by absolute path.
+        let e = sample_disc_entry();
+        assert!(!e.matches(Path::new("/elsewhere/codec.dll"), 1_700_000_000, 524_288));
+    }
+
+    #[test]
+    fn discovery_entry_matches_false_on_mtime_change() {
+        // mtime tick → cache miss. The DLL was rewritten between
+        // calls; re-probe rather than honouring a stale entry.
+        let e = sample_disc_entry();
+        assert!(!e.matches(Path::new("/abs/codec.dll"), 1_700_000_001, 524_288));
+    }
+
+    #[test]
+    fn discovery_entry_matches_false_on_size_change() {
+        // Same path + mtime but the size advanced (rare: a tar
+        // extract that races the clock can hit this) → still a miss.
+        // The triple is "all three or nothing"; tolerating two of
+        // three would let stale rows survive after a partial rewrite.
+        let e = sample_disc_entry();
+        assert!(!e.matches(Path::new("/abs/codec.dll"), 1_700_000_000, 524_289));
     }
 }

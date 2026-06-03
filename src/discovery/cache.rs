@@ -91,6 +91,25 @@ impl CacheEntry {
             clsid: self.clsid.clone(),
         }
     }
+
+    /// True if this row's `(path, mtime_unix, size_bytes)` triple
+    /// matches the supplied `(path, mtime, size)`. Mirrors
+    /// [`super::DiscoveryEntry::matches`] on the on-disk row type
+    /// so the cache's staleness check has a single source of truth.
+    ///
+    /// Round 217 introduced this method to dedupe the triple
+    /// equality check previously inlined into [`Cache::lookup`].
+    /// The hand-written `e.path == path && e.mtime_unix == mtime &&
+    /// e.size_bytes == size` chain was structurally identical to
+    /// the [`super::DiscoveryEntry::matches`] body but lived in a
+    /// separate file, so a future change to the triple's
+    /// definition risked diverging silently between the in-memory
+    /// and on-disk types. Routing both through a sibling pair of
+    /// `matches` methods keeps the contract co-located with each
+    /// type's definition.
+    pub fn matches(&self, path: &Path, mtime: i64, size: u64) -> bool {
+        self.path == path && self.mtime_unix == mtime && self.size_bytes == size
+    }
 }
 
 fn kind_to_str(k: Kind) -> &'static str {
@@ -193,13 +212,21 @@ impl Cache {
 
     /// Look up by `(path, mtime, size)`. Stale entries (mtime or
     /// size mismatch) return `None`.
+    ///
+    /// Round 217 routes the triple equality check through
+    /// [`CacheEntry::matches`] (which mirrors
+    /// [`super::DiscoveryEntry::matches`]) so the cache's freshness
+    /// rule is defined in exactly one place per type. The previous
+    /// hand-inlined `e.path == path && e.mtime_unix == mtime &&
+    /// e.size_bytes == size` chain was structurally correct but
+    /// duplicated the contract three times across the crate
+    /// (`DiscoveryEntry::matches`, this loop, the in-memory dedupe
+    /// in `Cache::upsert`).
     pub fn lookup(&self, path: &Path, mtime: i64, size: u64) -> Option<DiscoveryEntry> {
-        for e in &self.entries {
-            if e.path == path && e.mtime_unix == mtime && e.size_bytes == size {
-                return Some(e.to_entry());
-            }
-        }
-        None
+        self.entries
+            .iter()
+            .find(|e| e.matches(path, mtime, size))
+            .map(|e| e.to_entry())
     }
 
     /// Insert or overwrite. If an entry for `entry.path` already
@@ -586,6 +613,60 @@ mod tests {
             !loaded.is_dirty(),
             "envelope shape already matches what save would write",
         );
+    }
+
+    // ── Round 217: CacheEntry::matches triple-equality contract ─
+
+    fn sample_cache_row() -> CacheEntry {
+        CacheEntry::from_entry(&sample_entry(Path::new("/abs/a.dll"), Kind::Vfw))
+    }
+
+    #[test]
+    fn cache_entry_matches_returns_true_on_identical_triple() {
+        // Round 217 — the on-disk row mirrors the in-memory
+        // `DiscoveryEntry::matches` contract so `Cache::lookup` can
+        // delegate to the row's own staleness check rather than
+        // hand-inlining a `&&` chain. The base hit case.
+        let row = sample_cache_row();
+        assert!(row.matches(Path::new("/abs/a.dll"), 1_700_000_000, 524_288));
+    }
+
+    #[test]
+    fn cache_entry_matches_false_on_any_field_mismatch() {
+        // All three components must agree — partial matches MUST
+        // miss, otherwise a stale row would survive after a DLL
+        // rewrite (the same trap `discover()` is defended against
+        // by routing the triple check through this method).
+        let row = sample_cache_row();
+        assert!(!row.matches(Path::new("/abs/b.dll"), 1_700_000_000, 524_288));
+        assert!(!row.matches(Path::new("/abs/a.dll"), 1_700_000_001, 524_288));
+        assert!(!row.matches(Path::new("/abs/a.dll"), 1_700_000_000, 524_289));
+    }
+
+    #[test]
+    fn cache_lookup_routes_through_cache_entry_matches() {
+        // Round 217 — end-to-end pin: `Cache::lookup` now delegates
+        // to `CacheEntry::matches`, so a row whose `matches` would
+        // return false MUST yield `None` here. Mirrors the existing
+        // `lookup_misses_on_mtime_change` / `lookup_misses_on_size_change`
+        // tests above but covers both axes in one assertion-rich
+        // shape after the refactor.
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/abs/x.dll"), Kind::Vfw));
+        // Triple matches → hit, returns the converted DiscoveryEntry.
+        let hit = c.lookup(Path::new("/abs/x.dll"), 1_700_000_000, 524_288);
+        assert!(hit.is_some(), "exact triple hits");
+        assert_eq!(hit.unwrap().kind, Kind::Vfw);
+        // Each individual field mismatch → miss.
+        assert!(c
+            .lookup(Path::new("/abs/y.dll"), 1_700_000_000, 524_288)
+            .is_none());
+        assert!(c
+            .lookup(Path::new("/abs/x.dll"), 1_700_000_001, 524_288)
+            .is_none());
+        assert!(c
+            .lookup(Path::new("/abs/x.dll"), 1_700_000_000, 999_999)
+            .is_none());
     }
 
     #[test]

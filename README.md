@@ -93,6 +93,28 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Staleness-check dedupe (round 217)
+
+The cache's `(path, mtime_unix, size_bytes)` triple-equality test
+now lives on each row type as its own `matches` method:
+`DiscoveryEntry::matches(&path, mtime, size)` for the in-memory
+type, `CacheEntry::matches(&path, mtime, size)` for the on-disk
+row. `Cache::lookup` routes through `CacheEntry::matches` rather
+than re-implementing the `&&` chain inline. A change to the
+freshness contract therefore only has to land once per type —
+previously the same triple-equality was hand-inlined in three
+places (the `DiscoveryEntry` method, the `Cache::lookup` loop, the
+in-memory dedupe in `Cache::upsert`'s `position`) and a quiet
+divergence between any two would have produced a cache that looked
+correct in isolated unit tests but missed stale entries in the
+real `discover()` flow. Seven new tests pin both directions of the
+contract: three in `discovery::tests` for `DiscoveryEntry::matches`
+(`identical_triple` / `path_change` / `mtime_change` /
+`size_change`), three in `discovery::cache::tests` for
+`CacheEntry::matches` and the `Cache::lookup` delegation
+(`identical_triple` / `any_field_mismatch` /
+`lookup_routes_through_cache_entry_matches`).
+
 ### Steady-state no-op-save skip (round 204)
 
 `discover()` now skips its tail-end `Cache::save_atomic` call when
