@@ -71,7 +71,7 @@ pub use codec::{
     output_pixel_format, register_factory_for_id, CodecAllocatorNegotiation, DiscoveryRecord,
 };
 pub use paths::{cache_file_path, discovery_paths};
-pub use probe::Kind;
+pub use probe::{probe_bytes, probe_dll, Kind, ProbeResult};
 
 /// Whether the `register()` cascade should silently skip a missing
 /// discovery directory (the default — true) or surface it as a

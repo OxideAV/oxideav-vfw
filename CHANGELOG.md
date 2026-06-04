@@ -6,6 +6,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`discovery::probe_dll(path)` — single-shot DLL classification
+  helper (round 235).** The directory-walking
+  `discover_and_register(ctx)` entry point has always been the
+  only public way to obtain a `ProbeResult` for a codec DLL —
+  callers that already held an absolute path (CLI tools, ad-hoc
+  integration tests, the `ud vfw probe <path>` UX) had to either
+  drop a candidate into the discovery dir and re-`register()` (an
+  unwanted side effect on the runtime context + on-disk cache) or
+  reach into private internals to call the
+  `probe::probe_bytes(bytes)` primitive directly.
+  - Round 235 lifts the primitive into the public surface as
+    `oxideav_vfw::discovery::probe_dll(&Path) -> Option<ProbeResult>`,
+    alongside re-exports of `ProbeResult` and the existing
+    `probe_bytes` byte-accepting form. `None` is reserved for
+    "the file could not be read at all" (missing path,
+    directory-not-file, permission denied); a file that reads
+    cleanly but doesn't classify lands on
+    `Some(ProbeResult { kind: Kind::Unsupported, .. })` so the
+    caller can distinguish I/O failure from "loaded, but no
+    `DriverProc` / `DllGetClassObject` we recognise."
+  - Internally the helper is `std::fs::read` then `probe_bytes` —
+    the same two-step `discover()` performs inline per
+    discovery-dir entry. The new public surface is the only
+    behaviour change; `discover()` still drives the inline
+    `fs::read` + `probe_bytes` path so its `log::debug!` on
+    per-DLL read errors stays intact (the helper drops the
+    underlying error on the floor by design: the `Option`
+    return is the contract).
+  - Coverage: four new unit tests in `discovery::probe::tests`
+    (`probe_dll_missing_path_returns_none`,
+    `probe_dll_garbage_file_classified_unsupported`,
+    `probe_dll_matches_probe_bytes_on_minimal_synthetic_dll`,
+    `probe_dll_directory_path_returns_none`) and three new
+    integration tests in
+    `tests/round235_probe_dll_public_surface.rs` exercising the
+    crate-root re-export from a downstream-consumer perspective.
+    The roundtrip test pins the structural equality
+    `probe_dll(path) == Some(probe_bytes(&bytes))` for the same
+    DLL bytes, so a future divergence between the two surfaces
+    fails the build rather than silently shifting downstream
+    classification.
+
 ### Changed
 
 - **Sandbox instruction-budget ceiling deduped through a single

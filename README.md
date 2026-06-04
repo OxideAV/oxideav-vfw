@@ -93,6 +93,32 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Single-shot DLL probe helper (round 235)
+
+`oxideav_vfw::discovery::probe_dll(&Path) -> Option<ProbeResult>`
+is the single-shot companion to `discover_and_register(ctx)`. A
+consumer that already holds an absolute DLL path — a CLI tool,
+an integration-test fixture, or the `ud vfw probe <path>` UX —
+can now classify the entry-point surface (VfW
+`DriverProc` + FourCC sweep; DirectShow `DllGetClassObject` +
+CLSID match; or `Unsupported`) without walking the configured
+discovery directory, mutating a `RuntimeContext`, or touching
+the on-disk cache.
+
+The helper returns `None` only when the file cannot be read
+(missing, directory-not-file, permission denied). A file that
+reads cleanly but doesn't load as PE32 / lacks both recognised
+entry-point surfaces lands on `Some(ProbeResult { kind:
+Kind::Unsupported, .. })` — the same classification the inline
+branch of `discover()` would record. The structural equality
+`probe_dll(path) == Some(probe_bytes(&bytes))` is pinned by a
+unit test so a future divergence between the two surfaces
+fails the build rather than silently shifting downstream
+classification. Round 235 also re-exports the previously
+module-private `probe_bytes` byte-accepting form and the
+`ProbeResult` type from `crate::discovery`, so the full probe
+surface is now reachable without reaching into private internals.
+
 ### Sandbox instruction-budget dedupe (round 224)
 
 The `8_000_000_000` instruction wall the three long-lived

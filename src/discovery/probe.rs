@@ -17,6 +17,8 @@
 //! permutation — false positives on synthetic VIDC handlers
 //! would just inflate the on-disk cache.
 
+use std::path::Path;
+
 use ud_emulator::Sandbox;
 
 /// Static list of FourCCs we sweep through `ICOpen` for every
@@ -96,6 +98,36 @@ pub fn probe_bytes(bytes: &[u8]) -> ProbeResult {
         fourccs: Vec::new(),
         clsid: None,
     }
+}
+
+/// Single-shot DLL probe — read the file at `path` and classify
+/// its entry-point surface via [`probe_bytes`].
+///
+/// This is the small-scope companion to
+/// [`super::discover_and_register`]: discovery walks every
+/// `*.dll` / `*.ax` under the configured discovery path, mints
+/// runtime registrations, and updates the on-disk cache. A
+/// consumer that already knows the absolute path of a single
+/// codec DLL (CLI tools, integration tests, the
+/// `ud vfw probe <path>` UX) can call this instead to obtain the
+/// same [`ProbeResult`] classification without the directory
+/// walk, the registry mutation, or the cache lifecycle.
+///
+/// Returns `None` only when the file cannot be read (missing,
+/// unreadable, not a regular file). A file that reads
+/// successfully but doesn't load as PE32 / lacks a recognised
+/// entry-point surface returns `Some(ProbeResult { kind:
+/// Unsupported, .. })` — consistent with the inline branch in
+/// [`super::discover`] which records an Unsupported entry so a
+/// subsequent `register()` doesn't re-probe.
+///
+/// Hard contract: never panics. The underlying sandbox catches
+/// every malformed-PE / trapped-instruction path as a
+/// `Sandbox::load` / `call_*` `Err(_)` that classifies as
+/// [`Kind::Unsupported`].
+pub fn probe_dll(path: &Path) -> Option<ProbeResult> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(probe_bytes(&bytes))
 }
 
 /// Try VfW probe path. Returns `None` if the DLL doesn't even
@@ -277,5 +309,70 @@ mod tests {
         assert_eq!(g.data3, 0x11D2);
         assert_eq!(g.data4, [0xBB, 0x50, 0x00, 0x60, 0x08, 0x32, 0x00, 0x64]);
         assert_eq!(g, ud_emulator::MSADDS_AUDIO_DECODER_CLSID);
+    }
+
+    // ── Round 235: probe_dll — single-shot path-accepting helper ──
+
+    use crate::discovery::test_tmpdir::Tmp;
+    use std::io::Write;
+
+    #[test]
+    fn probe_dll_missing_path_returns_none() {
+        // The file does not exist — `std::fs::read` errors, we
+        // surface that as `None`. The caller distinguishes
+        // "couldn't read at all" from "read but unclassifiable"
+        // by matching on `Option`.
+        let missing = std::path::PathBuf::from("/this/does/not/exist/probe_dll.dll");
+        assert!(probe_dll(&missing).is_none());
+    }
+
+    #[test]
+    fn probe_dll_garbage_file_classified_unsupported() {
+        // The file reads cleanly but its bytes don't load as a
+        // PE32 — we land on `Some(Unsupported)` with an empty
+        // fourcc list, matching what `discover()` would record
+        // inline for the same file (so the cache layer and the
+        // single-shot helper agree on classification).
+        let tmp = Tmp::new("probe-dll-garbage");
+        let p = tmp.path().join("garbage.dll");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"this is not a PE32 file").unwrap();
+        drop(f);
+        let r = probe_dll(&p).expect("file reads cleanly → Some(_)");
+        assert_eq!(r.kind, Kind::Unsupported);
+        assert!(r.fourccs.is_empty());
+        assert!(r.clsid.is_none());
+    }
+
+    #[test]
+    fn probe_dll_matches_probe_bytes_on_minimal_synthetic_dll() {
+        // Roundtrip: `probe_dll(path)` and `probe_bytes(&bytes)`
+        // must return the same classification for the same DLL
+        // bytes. The minimal-DLL helper from ud-emulator produces
+        // a real PE32 with a single `DllMain` export — neither
+        // entry-point surface matches, so both paths land on
+        // `Unsupported`. The structural equality here is the
+        // contract that lets a downstream consumer pre-cache its
+        // own probe results without having to re-`fs::read` later
+        // through `discover()`.
+        let tmp = Tmp::new("probe-dll-minimal");
+        let dll = build_minimal_dll();
+        let p = tmp.path().join("minimal.dll");
+        std::fs::write(&p, &dll).unwrap();
+        let from_path = probe_dll(&p).expect("file reads cleanly → Some(_)");
+        let from_bytes = probe_bytes(&dll);
+        assert_eq!(from_path, from_bytes);
+        assert_eq!(from_path.kind, Kind::Unsupported);
+    }
+
+    #[test]
+    fn probe_dll_directory_path_returns_none() {
+        // A directory path is not a regular file — `std::fs::read`
+        // errors here on every platform we target, and the helper
+        // surfaces that as `None`. The single-shot helper is
+        // therefore safe to pass into a `WalkDir`-style iterator
+        // that hasn't already filtered out directories.
+        let tmp = Tmp::new("probe-dll-isdir");
+        assert!(probe_dll(tmp.path()).is_none());
     }
 }
