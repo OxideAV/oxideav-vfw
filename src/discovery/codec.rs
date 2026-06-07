@@ -22,7 +22,7 @@ use oxideav_core::{
 
 use ud_emulator::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
 
-use super::probe::{fourcc_to_bytes, Kind};
+use super::probe::{fourcc_to_bytes, Kind, FCC_TYPE_VIDC};
 
 /// Per-codec-construction instruction budget handed to every
 /// long-lived ud-emulator [`ud_emulator::Sandbox`] this module
@@ -454,7 +454,10 @@ impl SandboxedVfwDecoder {
             let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
             let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
-            let fcc_type = u32::from_le_bytes(*b"VIDC");
+            // `FCC_TYPE_VIDC` (= `u32::from_le_bytes(*b"VIDC")`) lives
+            // on `super::probe` since round 248 so the decoder, the
+            // encoder, and the discovery probe all share one source of
+            // truth for the VfW video-codec driver type.
             // Mode 2 = ICMODE_DECOMPRESS in vfw.h.  The round-24
             // manual path uses 2 here for MP43 because that IS the
             // decode-mode value; the round-29 byte-equality
@@ -468,7 +471,7 @@ impl SandboxedVfwDecoder {
             //  permissive about the mode word at DRV_OPEN, so even
             //  a wrong mode here would still mint a HIC.)
             let hic = sb
-                .ic_open(fcc_type, fcc_handler, 2)
+                .ic_open(FCC_TYPE_VIDC, fcc_handler, 2)
                 .map_err(|e| Error::other(format!("vfw discovery: ic_open failed: {e}")))?;
             if hic == 0 {
                 return Err(Error::other(
@@ -909,9 +912,11 @@ impl SandboxedVfwEncoder {
             let _ = sb.call_dll_main(&img, ud_emulator::DLL_PROCESS_ATTACH);
 
             let fcc_handler = u32::from_le_bytes(self.fourcc_bytes);
-            let fcc_type = u32::from_le_bytes(*b"VIDC");
-            // Mode 1 = ICMODE_COMPRESS in vfw.h.
-            let hic = sb.ic_open(fcc_type, fcc_handler, 1).map_err(|e| {
+            // Mode 1 = ICMODE_COMPRESS in vfw.h.  `FCC_TYPE_VIDC` is
+            // the round-248 single source of truth for the VfW
+            // video-codec driver type (see the constant's rustdoc on
+            // `super::probe`).
+            let hic = sb.ic_open(FCC_TYPE_VIDC, fcc_handler, 1).map_err(|e| {
                 Error::other(format!("vfw discovery (encode): ic_open failed: {e}"))
             })?;
             if hic == 0 {
@@ -3297,6 +3302,44 @@ mod tests {
         // compile-time assertion — a drift turns into a build break
         // rather than a runtime test failure.
         const _: () = assert!(SANDBOX_INSTR_LIMIT == 8_000_000_000);
+    }
+
+    // ── Round 248 — FCC_TYPE_VIDC dedupe pin ──────────────────────
+
+    #[test]
+    fn fcc_type_vidc_preserves_le_byte_order() {
+        // The VfW driver-type word is `mmioFOURCC('V','I','D','C')`,
+        // which on every architecture this crate targets is the
+        // little-endian read of the four bytes `b"VIDC"`. The two
+        // long-lived `ensure_open` paths (decoder + encoder) and the
+        // discovery-time `try_probe_vfw` all use the constant now, so
+        // a quiet change to either the byte order or the FourCC
+        // letters would silently break `ICOpen` on every codec
+        // simultaneously. Lock the numeric value here so the dedupe
+        // can't drift unobserved. `const { ... }` lifts the check
+        // into a compile-time assertion — a drift turns into a build
+        // break rather than a runtime test failure.
+        const _: () = assert!(FCC_TYPE_VIDC == u32::from_le_bytes(*b"VIDC"));
+        // Sanity: the constant is non-zero — a hand-typo that nulled
+        // all four bytes would mint codec handles against a wildcard
+        // driver type, which is exactly the foot-gun the dedupe is
+        // meant to make impossible.
+        const _: () = assert!(FCC_TYPE_VIDC != 0);
+    }
+
+    #[test]
+    fn fcc_type_vidc_matches_runtime_recomputation() {
+        // Runtime mirror of the compile-time pin above. A future
+        // refactor that swapped the constant's wire form for an
+        // `mmioFOURCC` helper macro / `const fn` would still need to
+        // produce the same `u32` here — the pin catches a drift
+        // between the lifted constant and the hand-typed recompute
+        // pattern that the dedupe replaced.
+        assert_eq!(FCC_TYPE_VIDC, u32::from_le_bytes(*b"VIDC"));
+        // Direct byte equivalence — `'V' = 0x56`, `'I' = 0x49`,
+        // `'D' = 0x44`, `'C' = 0x43`; the little-endian word is
+        // `0x43444956`.
+        assert_eq!(FCC_TYPE_VIDC, 0x43444956);
     }
 
     #[test]

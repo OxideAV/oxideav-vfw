@@ -119,6 +119,33 @@ module-private `probe_bytes` byte-accepting form and the
 `ProbeResult` type from `crate::discovery`, so the full probe
 surface is now reachable without reaching into private internals.
 
+### VfW driver-type constant dedupe (round 248)
+
+The `mmioFOURCC('V','I','D','C')` driver-type word that every
+`ICOpen` call hands as `fccType` now lives on a single
+`FCC_TYPE_VIDC` constant in `discovery::probe`. Previously the
+discovery-time probe held a module-private `const FCC_TYPE_VIDC`
+while the long-lived per-codec sandboxes in `discovery::codec`
+each carried their own `let fcc_type = u32::from_le_bytes(*b"VIDC")`
+recompute (one in `SandboxedVfwDecoder::ensure_open`, one in
+`SandboxedVfwEncoder::ensure_open`); three sites total spelled out
+the same byte-equality contract independently. Round 248 promotes
+the probe's constant to `pub(super)` and routes both `ensure_open`
+sites through it, so a future change to the driver-type word (an
+adversarial test FourCC, an audio-codec sibling that needs a `vidS`
+/ `acm` companion, …) lands on every `ICOpen` simultaneously rather
+than producing a silent driver-type divergence on a neighbouring
+path. Two new tests in `discovery::codec::tests` pin the value as
+a compile-time `const { ... }` assertion
+(`fcc_type_vidc_preserves_le_byte_order` locks the little-endian
+read of `b"VIDC"` at `0x43444956`;
+`fcc_type_vidc_matches_runtime_recomputation` is the runtime
+mirror) so a drift turns into a build break rather than a runtime
+test failure. Same shape of dedupe as the round-217
+`matches`-method consolidation and the round-224
+`SANDBOX_INSTR_LIMIT` lift: one source of truth for an invariant
+that has to hold identically across multiple sites.
+
 ### Sandbox instruction-budget dedupe (round 224)
 
 The `8_000_000_000` instruction wall the three long-lived

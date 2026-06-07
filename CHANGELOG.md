@@ -6,6 +6,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **VfW driver-type constant deduped through a single
+  `FCC_TYPE_VIDC` source of truth (round 248).** The
+  `mmioFOURCC('V','I','D','C')` word that every `ICOpen` call
+  hands as its `fccType` argument was previously written in three
+  separate places: a module-private `const FCC_TYPE_VIDC` in
+  `discovery::probe` (driving `try_probe_vfw`), and two inline
+  `let fcc_type = u32::from_le_bytes(*b"VIDC")` recomputes in
+  `discovery::codec` (one in `SandboxedVfwDecoder::ensure_open`,
+  one in `SandboxedVfwEncoder::ensure_open`). The byte-equality
+  contract was structurally identical at all three sites, but a
+  quiet edit to any one would have produced a silently-divergent
+  driver-type word on a neighbouring path — exactly the shape of
+  drift the round-217 `matches`-method dedupe and the round-224
+  `SANDBOX_INSTR_LIMIT` lift were defending against on their own
+  invariants.
+  - Round 248 promotes the probe's constant from module-private
+    to `pub(super) const FCC_TYPE_VIDC: u32` and routes both
+    `ensure_open` sites through it, so a future change to the
+    driver-type word lands on every `ICOpen` simultaneously
+    instead of producing a silent divergence on a neighbouring
+    path. The constant's rustdoc spells out the round-248 lift
+    rationale alongside the existing `mmioFOURCC('V','I','D','C')`
+    derivation note.
+  - Two new tests in `discovery::codec::tests` pin the contract
+    as compile-time `const { ... }` assertions so a drift turns
+    into a build break rather than a runtime test failure:
+    `fcc_type_vidc_preserves_le_byte_order` locks both the
+    structural equality `FCC_TYPE_VIDC == u32::from_le_bytes(*b"VIDC")`
+    and the non-zero guard (a hand-typo that nulled the four
+    bytes would mint codec handles against a wildcard driver
+    type — the foot-gun the dedupe is meant to make impossible);
+    `fcc_type_vidc_matches_runtime_recomputation` is the runtime
+    mirror, locking the explicit hex `0x43444956` value
+    (`'V' = 0x56`, `'I' = 0x49`, `'D' = 0x44`, `'C' = 0x43`;
+    little-endian word).
+  - Public API: no surface change — the constant is module-private
+    on `discovery::probe` (lifted from `const` to
+    `pub(super) const`, still not exported from the crate root).
+    Both `ensure_open` paths produce byte-identical `ICOpen`
+    arguments to the pre-r248 lineage; the dedupe is structural,
+    not behavioural. The discovery-time `try_probe_vfw` is
+    unchanged — it was already routing through the constant.
+
 ### Added
 
 - **`discovery::probe_dll(path)` — single-shot DLL classification

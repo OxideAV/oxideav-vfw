@@ -29,7 +29,19 @@ const VFW_FOURCC_CANDIDATES: &[&[u8; 4]] = &[
 ];
 
 /// `mmioFOURCC('V','I','D','C')` — VfW video-codec driver type.
-const FCC_TYPE_VIDC: u32 = u32::from_le_bytes(*b"VIDC");
+///
+/// Round 248 — promoted from module-private to `pub(super) const` so
+/// the long-lived per-codec sandbox sites in [`super::codec`] share a
+/// single source of truth with the discovery probe. Previously
+/// hand-typed as `let fcc_type = u32::from_le_bytes(*b"VIDC");` at
+/// two separate `ensure_open` sites (`SandboxedVfwDecoder` and
+/// `SandboxedVfwEncoder`); a quiet edit to either would have produced
+/// a silently-divergent driver-type word on a neighbouring path.
+/// Same shape of dedupe as the round-217 `matches`-method
+/// consolidation and the round-224 `SANDBOX_INSTR_LIMIT` lift:
+/// one source of truth for an invariant that has to hold identically
+/// across multiple sites.
+pub(super) const FCC_TYPE_VIDC: u32 = u32::from_le_bytes(*b"VIDC");
 
 /// Static list of CLSIDs we try with `DllGetClassObject` when the
 /// VfW probe fails. Round-28 seeded this with wmpcdcs8-2001's
