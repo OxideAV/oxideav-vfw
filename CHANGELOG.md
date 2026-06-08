@@ -6,6 +6,59 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Typed encoder-knobs query API (round 257).** The encoder
+  honours three optional `CodecParameters.options` bridge
+  knobs — `"quality"` (clamped to `0..=10_000`), `"keyint"`
+  (force every Nth frame keyframe), and `"data_rate"`
+  (per-frame byte ceiling for `ICCompress`'s `dwFrameSizeLimit`
+  slot). Before round 257 the parsing lived inline inside
+  `SandboxedVfwEncoder::new`; a downstream caller (CLI tool,
+  integration test, pipeline pre-validator that wants to surface
+  resolved values in a UI before committing to construction) had
+  no public way to ask "what would the encoder resolve my
+  options to?" without calling `make_encoder` and then reaching
+  into private fields.
+  - New public surface on `oxideav_vfw::discovery`:
+    - `pub fn resolve_encoder_knobs(&CodecParameters)
+      -> EncoderKnobs` — single source of truth for the
+      option-parsing surface. `SandboxedVfwEncoder::new` now
+      routes through it, so the construction path and the
+      query API can't drift apart on parsing behaviour.
+    - `pub struct EncoderKnobs { pub quality, pub keyint,
+      pub data_rate: u32 }` — typed view of the three knobs
+      with `Copy + Default + PartialEq + Eq`.
+      `EncoderKnobs::default()` is the "no opt-in" sentinel
+      (all three fields at `0`), so a caller can diff against
+      it to detect whether the user supplied any knob.
+    - `pub const ENCODER_QUALITY_MAX: u32 = 10_000` — lifted
+      from the round-112 inline `min(10_000)` literal so the
+      clamp ceiling lives in one named place rather than as a
+      magic number. Pinned by a compile-time
+      `const { ... }` assertion in `discovery::codec::tests`
+      so a quiet edit to either the constant or the lifted
+      clamp turns into a build break rather than a runtime
+      drift (same shape as the round-224 `SANDBOX_INSTR_LIMIT`
+      pin and the round-248 `FCC_TYPE_VIDC` pin).
+  - Eight new unit tests in `discovery::codec::tests` cover
+    the empty / fully-populated / clamp-at-ceiling / over-large
+    `data_rate` / malformed-fallback / encoder-construction-mirror
+    /`ENCODER_QUALITY_MAX`-pin / `Default`-zero-sentinel
+    branches. A seven-test integration suite in
+    `tests/round257_encoder_knobs_query.rs` exercises the same
+    branches through the crate-root re-exports, including a
+    whitespace-tolerance test (the underlying `parse_option_u32`
+    already calls `.trim()`, which lets the resolver tolerate
+    `.env` files / systemd `Environment=` lines / YAML quoting
+    — same forgiving-input policy as the round-211 strip on
+    `OXIDEAV_VFW_CODEC_PATH` components) and a `Copy`-trait
+    test that locks the by-value semantics.
+  - Public API: additive (no existing surface changed).
+    The encoder's per-frame `ICCompress` arguments are
+    byte-identical to the pre-r257 lineage; the dedupe is
+    structural, not behavioural.
+
 ### Changed
 
 - **VfW driver-type constant deduped through a single

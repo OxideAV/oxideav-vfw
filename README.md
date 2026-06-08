@@ -93,6 +93,40 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Typed encoder-knobs query API (round 257)
+
+`oxideav_vfw::discovery::resolve_encoder_knobs(&CodecParameters)
+-> EncoderKnobs` is the typed pre-construction companion to
+`make_encoder(&CodecParameters)`. The encoder honours three
+optional `CodecParameters.options` bridge knobs (`"quality"`,
+`"keyint"`, `"data_rate"`); round 257 lifts the parsing surface
+into a public helper so downstream callers (CLI tools,
+integration tests, pipeline pre-validators) can introspect the
+*resolved* values — what the encoder will actually see after
+best-effort `u32` parsing + the `quality` clamp — without
+constructing an encoder and reaching into private fields.
+
+The returned `EncoderKnobs` is `Copy + Default + PartialEq`;
+`EncoderKnobs::default()` is the "no opt-in" sentinel (all three
+fields at `0`), so a caller can diff against it to decide
+whether the user supplied any knob. The clamp ceiling for
+`quality` lives on a sibling `ENCODER_QUALITY_MAX = 10_000`
+constant (also re-exported) — a future change to the ceiling
+lands on both the construction path and the query API
+simultaneously. `keyint` and `data_rate` are unclamped; the
+codec is the arbiter of plausibility for both. Same best-effort
+parsing policy as the round-112 inline path: a missing or
+unparseable value falls back to the per-knob default rather
+than failing.
+
+`SandboxedVfwEncoder::new` now routes through the same helper,
+so the construction path and the query API can't drift apart
+on parsing behaviour. Eight new tests in `discovery::codec::tests`
+and a seven-test integration suite
+(`tests/round257_encoder_knobs_query.rs`) cover the empty /
+fully-populated / clamp-at-ceiling / over-large / malformed /
+whitespace / `Copy`-trait branches.
+
 ### Single-shot DLL probe helper (round 235)
 
 `oxideav_vfw::discovery::probe_dll(&Path) -> Option<ProbeResult>`

@@ -180,6 +180,124 @@ fn parse_option_u32(params: &CodecParameters, key: &str) -> Option<u32> {
     params.options.get(key).and_then(|v| v.trim().parse().ok())
 }
 
+/// Upper bound the VfW `quality` knob is clamped to before being
+/// passed into `ICCompress`. Mirrors the historical
+/// `0..=10000` range every Microsoft codec accepts at the trait
+/// surface. Lifted to a named constant in round 257 so the
+/// [`EncoderKnobs`] resolver and the [`SandboxedVfwEncoder::new`]
+/// construction path can't drift apart on the clamp ceiling.
+pub const ENCODER_QUALITY_MAX: u32 = 10_000;
+
+/// Round 257 — typed view of the optional `CodecParameters.options`
+/// knobs the [`SandboxedVfwEncoder`] honours.
+///
+/// The encoder reads three string-keyed `u32` knobs at construction
+/// time (`"quality"`, `"keyint"`, `"data_rate"`) and applies them
+/// per-frame inside `ICCompress`. This struct is the **resolved**
+/// view of those knobs — what the encoder actually sees after
+/// best-effort parsing + clamping — so callers (CLI tools,
+/// integration tests, pipelines that pre-validate codec options
+/// before constructing an encoder) can introspect the values
+/// without having to call [`make_encoder`] and then poke private
+/// fields.
+///
+/// Build one with [`resolve_encoder_knobs`]; the parser is the
+/// single source of truth shared with [`SandboxedVfwEncoder::new`].
+///
+/// ### Semantics
+/// * `quality` — VfW quality slot, clamped to
+///   `0..=`[`ENCODER_QUALITY_MAX`]. `0` (the default) means "codec
+///   chooses"; higher = better quality / larger frames.
+/// * `keyint` — every Nth frame is forced to a keyframe (frame 0
+///   is always a keyframe). `0` (the default) disables periodic
+///   keyframes; only frame 0 is forced.
+/// * `data_rate` — per-frame byte ceiling threaded into
+///   `ICCompress`'s `dwFrameSizeLimit` slot. `0` (the default)
+///   leaves the codec to its own pacing; a non-zero value hints
+///   the codec to keep each encoded frame at or below `data_rate`
+///   bytes (useful for MTU-bounded transports like RTP-over-UDP).
+///
+/// ### Best-effort policy
+/// A missing key, an empty value, a value with whitespace, or a
+/// value that doesn't parse as `u32` all fall back to the
+/// per-knob default rather than failing. The encoder treats
+/// these as bridge hints, not codec invariants — a typo'd knob
+/// should not block the codec from running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderKnobs {
+    /// `"quality"` — VfW quality slot, clamped to `0..=`
+    /// [`ENCODER_QUALITY_MAX`]. `0` = "codec chooses".
+    pub quality: u32,
+    /// `"keyint"` — every Nth frame forced to a keyframe.
+    /// `0` = disabled (only frame 0 is forced).
+    pub keyint: u32,
+    /// `"data_rate"` — per-frame byte ceiling, raw `u32` (no
+    /// clamp). `0` = disabled (codec chooses).
+    pub data_rate: u32,
+}
+
+impl Default for EncoderKnobs {
+    /// All three knobs default to `0` — the "codec chooses /
+    /// disabled" sentinel each one uses. An [`EncoderKnobs`]
+    /// produced by [`resolve_encoder_knobs`] on a
+    /// [`CodecParameters`] whose `options` map is empty is
+    /// byte-identical to `EncoderKnobs::default()`.
+    fn default() -> Self {
+        EncoderKnobs {
+            quality: 0,
+            keyint: 0,
+            data_rate: 0,
+        }
+    }
+}
+
+/// Round 257 — parse the three optional encoder knobs out of
+/// [`CodecParameters::options`] into a typed [`EncoderKnobs`].
+///
+/// This is the **single source of truth** for the encoder's
+/// option-parsing surface: [`SandboxedVfwEncoder::new`] routes
+/// through it, and downstream callers (CLI / integration tests /
+/// pipeline pre-validators) can call it directly without first
+/// constructing an encoder. The struct is `Copy`, so it round-trips
+/// cheaply.
+///
+/// Same best-effort policy as the inline parsing the encoder used
+/// before: a missing or unparseable knob falls back to the per-knob
+/// default sentinel (see [`EncoderKnobs`] for the per-field
+/// semantics). `quality` is clamped to
+/// `0..=`[`ENCODER_QUALITY_MAX`]; `keyint` and `data_rate` pass
+/// through verbatim.
+///
+/// ### Example
+/// ```ignore
+/// use oxideav_core::{CodecId, CodecParameters};
+/// use oxideav_vfw::discovery::{resolve_encoder_knobs, EncoderKnobs, ENCODER_QUALITY_MAX};
+///
+/// let mut params = CodecParameters::video(CodecId::new("vfw_mp43_demo"));
+/// params.options.insert("quality", "8000");
+/// params.options.insert("keyint", "30");
+/// let knobs = resolve_encoder_knobs(&params);
+/// assert_eq!(knobs.quality, 8000);
+/// assert_eq!(knobs.keyint, 30);
+/// assert_eq!(knobs.data_rate, 0); // unset → default
+///
+/// // Over-large quality clamps to ENCODER_QUALITY_MAX.
+/// params.options.insert("quality", "999999");
+/// assert_eq!(resolve_encoder_knobs(&params).quality, ENCODER_QUALITY_MAX);
+/// ```
+pub fn resolve_encoder_knobs(params: &CodecParameters) -> EncoderKnobs {
+    let quality = parse_option_u32(params, "quality")
+        .unwrap_or(0)
+        .min(ENCODER_QUALITY_MAX);
+    let keyint = parse_option_u32(params, "keyint").unwrap_or(0);
+    let data_rate = parse_option_u32(params, "data_rate").unwrap_or(0);
+    EncoderKnobs {
+        quality,
+        keyint,
+        data_rate,
+    }
+}
+
 /// Register one [`CodecInfo`] for a discovered DLL+FourCC pair.
 ///
 /// Priority is fixed at 200 — VfW is a last-resort path that
@@ -777,21 +895,20 @@ impl SandboxedVfwEncoder {
         })?;
         let width = params.width.unwrap_or(0);
         let height = params.height.unwrap_or(0);
-        // Round 112 — read the optional `quality` / `keyint` bridge
-        // knobs out of `CodecParameters.options`. Best-effort: an
-        // absent or unparseable value falls back to `0` (the
-        // "codec chooses" / "disabled" sentinel) rather than failing
-        // construction. Quality is clamped to the VfW 0..10000 range.
-        let quality = parse_option_u32(&params, "quality")
-            .unwrap_or(0)
-            .min(10_000);
-        let keyint = parse_option_u32(&params, "keyint").unwrap_or(0);
-        // Round 178 — `data_rate` bridge knob: per-frame byte ceiling
-        // for `ICCompress`. Verbatim u32, no clamp (the codec is the
-        // arbiter of plausibility — over-large values just turn the
-        // hint into a no-op; zero is the "disabled" sentinel). Same
-        // best-effort fallback as the round-112 knobs.
-        let data_rate = parse_option_u32(&params, "data_rate").unwrap_or(0);
+        // Round 112 wired the `quality` / `keyint` knobs out of
+        // `CodecParameters.options`; round 178 added `data_rate`.
+        // Round 257 routes all three through the typed
+        // [`resolve_encoder_knobs`] helper so a downstream caller
+        // (CLI / integration tests / pipeline pre-validator) can
+        // introspect the same resolved values without constructing
+        // an encoder, and so the parser is the single source of
+        // truth for the option surface (a future knob can't drift
+        // between the construction path and the public query API
+        // because they call the same function).
+        let knobs = resolve_encoder_knobs(&params);
+        let quality = knobs.quality;
+        let keyint = knobs.keyint;
+        let data_rate = knobs.data_rate;
         // The output stream parameters mirror the input dims and
         // carry the codec's FourCC as the on-wire tag, so a muxer
         // re-emits the same FourCC the codec was opened for.
@@ -3340,6 +3457,121 @@ mod tests {
         // `'D' = 0x44`, `'C' = 0x43`; the little-endian word is
         // `0x43444956`.
         assert_eq!(FCC_TYPE_VIDC, 0x43444956);
+    }
+
+    // ── Round 257 — typed encoder-knobs query API ──────────────────
+
+    #[test]
+    fn resolve_encoder_knobs_empty_options_returns_defaults() {
+        // The base case: an empty `options` map produces an
+        // `EncoderKnobs::default()`-equivalent value. Locks the
+        // historical "absent knob == 0 sentinel" contract every
+        // caller relies on.
+        let params = CodecParameters::video(CodecId::new("vfw_knobs_empty"));
+        assert_eq!(resolve_encoder_knobs(&params), EncoderKnobs::default());
+    }
+
+    #[test]
+    fn resolve_encoder_knobs_reads_all_three_keys() {
+        // A fully-populated `options` map round-trips through the
+        // typed view with each value preserved verbatim (modulo the
+        // `quality` clamp tested separately below).
+        let mut params = CodecParameters::video(CodecId::new("vfw_knobs_full"));
+        params.options.insert("quality", "8000");
+        params.options.insert("keyint", "30");
+        params.options.insert("data_rate", "1400");
+        let knobs = resolve_encoder_knobs(&params);
+        assert_eq!(knobs.quality, 8000);
+        assert_eq!(knobs.keyint, 30);
+        assert_eq!(knobs.data_rate, 1400);
+    }
+
+    #[test]
+    fn resolve_encoder_knobs_clamps_quality_to_max() {
+        // The `quality` knob is the only one with a defined clamp
+        // ceiling (the VfW 0..10000 range). An over-large value
+        // saturates at `ENCODER_QUALITY_MAX` rather than wrapping
+        // or being passed through verbatim.
+        let mut params = CodecParameters::video(CodecId::new("vfw_knobs_clamp"));
+        params.options.insert("quality", "999999");
+        assert_eq!(resolve_encoder_knobs(&params).quality, ENCODER_QUALITY_MAX);
+        // The exact maximum is preserved (the clamp is `min`, not
+        // `<`, so the boundary is inclusive).
+        params.options.insert("quality", "10000");
+        assert_eq!(resolve_encoder_knobs(&params).quality, ENCODER_QUALITY_MAX);
+    }
+
+    #[test]
+    fn resolve_encoder_knobs_data_rate_not_clamped() {
+        // `data_rate` is a raw byte count whose only invariant is
+        // `u32`; the codec decides whether the value is plausible.
+        // A value well past `ENCODER_QUALITY_MAX` therefore passes
+        // through untouched.
+        let mut params = CodecParameters::video(CodecId::new("vfw_knobs_dr_large"));
+        params.options.insert("data_rate", "1000000000"); // 1 GB/frame
+        assert_eq!(resolve_encoder_knobs(&params).data_rate, 1_000_000_000);
+    }
+
+    #[test]
+    fn resolve_encoder_knobs_tolerates_malformed_values() {
+        // Best-effort policy mirror: a malformed value on any knob
+        // falls back to the per-knob default rather than failing.
+        // The remaining well-formed knobs still parse cleanly —
+        // a single bad key never poisons the others.
+        let mut params = CodecParameters::video(CodecId::new("vfw_knobs_bad"));
+        params.options.insert("quality", "not-a-number");
+        params.options.insert("keyint", "10");
+        params.options.insert("data_rate", "also-not-a-number");
+        let knobs = resolve_encoder_knobs(&params);
+        assert_eq!(knobs.quality, 0);
+        assert_eq!(knobs.keyint, 10);
+        assert_eq!(knobs.data_rate, 0);
+    }
+
+    #[test]
+    fn resolve_encoder_knobs_matches_encoder_construction_state() {
+        // The typed query API must produce the exact same resolved
+        // values that `SandboxedVfwEncoder::new` stores internally.
+        // This is the contract that lets a caller pre-validate
+        // options without having to construct an encoder + reach
+        // into private fields — drift between the two paths would
+        // make `resolve_encoder_knobs` lie.
+        let mut params = CodecParameters::video(CodecId::new("vfw_knobs_mirror"));
+        params.width = Some(16);
+        params.height = Some(16);
+        params.options.insert("quality", "7500");
+        params.options.insert("keyint", "12");
+        params.options.insert("data_rate", "2048");
+        let knobs = resolve_encoder_knobs(&params);
+        let enc = SandboxedVfwEncoder::new(vfw_record(), params).expect("constructs cleanly");
+        assert_eq!(enc.quality, knobs.quality);
+        assert_eq!(enc.keyint, knobs.keyint);
+        assert_eq!(enc.data_rate, knobs.data_rate);
+    }
+
+    #[test]
+    fn encoder_quality_max_constant_pins_round112_clamp_ceiling() {
+        // The clamp ceiling lifted from the round-112 inline
+        // `min(10_000)` literal in round 257 — pin the numeric
+        // value as a compile-time assertion so a quiet edit to
+        // either the constant OR the lifted clamp can't drift
+        // unobserved from the historical baseline. Same shape as
+        // the round-224 `SANDBOX_INSTR_LIMIT` and round-248
+        // `FCC_TYPE_VIDC` pins.
+        const _: () = assert!(ENCODER_QUALITY_MAX == 10_000);
+    }
+
+    #[test]
+    fn encoder_knobs_default_matches_zero_sentinel() {
+        // The `Default` impl is the contract that the per-knob
+        // sentinel for "absent" is `0` for all three knobs —
+        // callers diff against `EncoderKnobs::default()` to decide
+        // whether the user actually opted into any knob, so a
+        // surprise non-zero default would invert that test.
+        let d = EncoderKnobs::default();
+        assert_eq!(d.quality, 0);
+        assert_eq!(d.keyint, 0);
+        assert_eq!(d.data_rate, 0);
     }
 
     #[test]
