@@ -188,6 +188,42 @@ fn parse_option_u32(params: &CodecParameters, key: &str) -> Option<u32> {
 /// construction path can't drift apart on the clamp ceiling.
 pub const ENCODER_QUALITY_MAX: u32 = 10_000;
 
+/// `CodecParameters.options` key for the VfW quality slot
+/// ([`EncoderKnobs::quality`]). Round 258 lifted the key spelling
+/// out of the [`resolve_encoder_knobs`] string literal so callers
+/// that *write* the bag (CLI flag plumbing, pipeline JSON mappers)
+/// and the resolver that *reads* it share one source of truth —
+/// same dedupe shape as the round-248 `FCC_TYPE_VIDC` and
+/// round-257 [`ENCODER_QUALITY_MAX`] lifts.
+pub const ENCODER_KNOB_QUALITY: &str = "quality";
+
+/// `CodecParameters.options` key for the keyframe-interval knob
+/// ([`EncoderKnobs::keyint`]). See [`ENCODER_KNOB_QUALITY`] for the
+/// round-258 lift rationale.
+pub const ENCODER_KNOB_KEYINT: &str = "keyint";
+
+/// `CodecParameters.options` key for the per-frame byte-ceiling
+/// knob ([`EncoderKnobs::data_rate`]). See [`ENCODER_KNOB_QUALITY`]
+/// for the round-258 lift rationale.
+pub const ENCODER_KNOB_DATA_RATE: &str = "data_rate";
+
+/// Every `CodecParameters.options` key the encoder bridge reads,
+/// in [`EncoderKnobs`] field order. This is the bridge's complete
+/// option vocabulary: a key absent from this list is silently
+/// ignored by [`resolve_encoder_knobs`] (and therefore by
+/// [`SandboxedVfwEncoder::new`]) under the best-effort policy.
+/// [`unrecognized_encoder_knobs`] diffs a caller's bag against this
+/// list so a typo'd key can be surfaced as a warning instead of
+/// vanishing. A future fourth knob must be appended here in the
+/// same change that teaches the resolver to read it — the
+/// round-258 mirror test pins the list length against the
+/// [`EncoderKnobs`] field count.
+pub const ENCODER_KNOB_KEYS: [&str; 3] = [
+    ENCODER_KNOB_QUALITY,
+    ENCODER_KNOB_KEYINT,
+    ENCODER_KNOB_DATA_RATE,
+];
+
 /// Round 257 — typed view of the optional `CodecParameters.options`
 /// knobs the [`SandboxedVfwEncoder`] honours.
 ///
@@ -286,16 +322,55 @@ impl Default for EncoderKnobs {
 /// assert_eq!(resolve_encoder_knobs(&params).quality, ENCODER_QUALITY_MAX);
 /// ```
 pub fn resolve_encoder_knobs(params: &CodecParameters) -> EncoderKnobs {
-    let quality = parse_option_u32(params, "quality")
+    let quality = parse_option_u32(params, ENCODER_KNOB_QUALITY)
         .unwrap_or(0)
         .min(ENCODER_QUALITY_MAX);
-    let keyint = parse_option_u32(params, "keyint").unwrap_or(0);
-    let data_rate = parse_option_u32(params, "data_rate").unwrap_or(0);
+    let keyint = parse_option_u32(params, ENCODER_KNOB_KEYINT).unwrap_or(0);
+    let data_rate = parse_option_u32(params, ENCODER_KNOB_DATA_RATE).unwrap_or(0);
     EncoderKnobs {
         quality,
         keyint,
         data_rate,
     }
+}
+
+/// Round 258 — advisory companion to [`resolve_encoder_knobs`]:
+/// the option keys in `params.options` that the encoder bridge
+/// will **silently ignore**.
+///
+/// [`resolve_encoder_knobs`] is deliberately best-effort — a
+/// missing or malformed knob falls back to its default rather than
+/// failing — which means a typo'd key (`"qality"`, `"key_int"`,
+/// `"Quality"`) produces no error, no log line, and no effect.
+/// Round 257 gave callers the *positive* view ("what will the
+/// encoder see?"); this helper is the *negative* view ("which of
+/// my keys will it never look at?"), so a CLI tool or pipeline
+/// pre-validator can pair the two and warn the user before
+/// constructing an encoder.
+///
+/// Returned keys borrow from `params` and preserve the bag's
+/// insertion order (the order `CodecOptions::iter` walks). An
+/// empty `Vec` means every key in the bag is part of the bridge's
+/// vocabulary ([`ENCODER_KNOB_KEYS`]).
+///
+/// ### Scope + caveats
+/// * Matching is **exact and case-sensitive**, mirroring the
+///   resolver's `options.get(key)` lookups — `"Quality"` is
+///   unrecognized even though `"quality"` is a knob.
+/// * "Recognized" means *the key will be read*, not *the value is
+///   well-formed*: a recognized key carrying a malformed value is
+///   NOT reported here (it falls back per the best-effort policy;
+///   value-level diagnostics would be a separate surface).
+/// * The verdict is scoped to **this bridge's encoder path**. A
+///   consumer that layers its own option keys into the same bag
+///   for a different component should pre-filter before asking.
+pub fn unrecognized_encoder_knobs(params: &CodecParameters) -> Vec<&str> {
+    params
+        .options
+        .iter()
+        .map(|(k, _)| k)
+        .filter(|k| !ENCODER_KNOB_KEYS.contains(k))
+        .collect()
 }
 
 /// Register one [`CodecInfo`] for a discovered DLL+FourCC pair.
@@ -3572,6 +3647,122 @@ mod tests {
         assert_eq!(d.quality, 0);
         assert_eq!(d.keyint, 0);
         assert_eq!(d.data_rate, 0);
+    }
+
+    // ── Round 258 — knob-key constants + unrecognized-key advisory ─
+
+    #[test]
+    fn encoder_knob_key_constants_pin_historical_spellings() {
+        // The three key spellings have been the bridge's wire
+        // vocabulary since round 112 (`quality` / `keyint`) and
+        // round 178 (`data_rate`). The round-258 lift to named
+        // constants must NOT change what callers already store in
+        // their options bags — pin the exact strings so a quiet
+        // rename turns into a test failure rather than every
+        // existing caller's knobs silently going dark.
+        assert_eq!(ENCODER_KNOB_QUALITY, "quality");
+        assert_eq!(ENCODER_KNOB_KEYINT, "keyint");
+        assert_eq!(ENCODER_KNOB_DATA_RATE, "data_rate");
+        // The vocabulary list carries exactly the three constants,
+        // in `EncoderKnobs` field order, with no duplicates.
+        assert_eq!(
+            ENCODER_KNOB_KEYS,
+            [
+                ENCODER_KNOB_QUALITY,
+                ENCODER_KNOB_KEYINT,
+                ENCODER_KNOB_DATA_RATE
+            ]
+        );
+    }
+
+    #[test]
+    fn resolver_reads_keys_inserted_via_constants() {
+        // Drift guard between the constants (what a caller writes
+        // into the bag) and the resolver (what it reads back out).
+        // Inserting through the named constants must land on the
+        // matching `EncoderKnobs` field — a divergence in either
+        // direction (constant renamed, resolver keyed off a stale
+        // literal) trips here.
+        let mut params = CodecParameters::video(CodecId::new("vfw_knob_consts"));
+        params.options.insert(ENCODER_KNOB_QUALITY, "7000");
+        params.options.insert(ENCODER_KNOB_KEYINT, "25");
+        params.options.insert(ENCODER_KNOB_DATA_RATE, "1300");
+        let knobs = resolve_encoder_knobs(&params);
+        assert_eq!(knobs.quality, 7000);
+        assert_eq!(knobs.keyint, 25);
+        assert_eq!(knobs.data_rate, 1300);
+    }
+
+    #[test]
+    fn unrecognized_knobs_empty_bag_is_empty() {
+        // The trivial base case: nothing in the bag, nothing to
+        // warn about.
+        let params = CodecParameters::video(CodecId::new("vfw_unrec_empty"));
+        assert!(unrecognized_encoder_knobs(&params).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_knobs_all_recognized_is_empty() {
+        // A bag holding exactly the bridge's vocabulary produces no
+        // warnings — the happy path a well-configured CLI hits on
+        // every run must stay silent.
+        let mut params = CodecParameters::video(CodecId::new("vfw_unrec_clean"));
+        params.options.insert(ENCODER_KNOB_QUALITY, "8000");
+        params.options.insert(ENCODER_KNOB_KEYINT, "30");
+        params.options.insert(ENCODER_KNOB_DATA_RATE, "1400");
+        assert!(unrecognized_encoder_knobs(&params).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_knobs_reports_typo_key() {
+        // The motivating case: a typo'd knob name silently does
+        // nothing under the best-effort policy ("qality" parses as
+        // no knob at all and quality stays 0). The advisory helper
+        // is what lets a pre-validator catch it before encode time.
+        let mut params = CodecParameters::video(CodecId::new("vfw_unrec_typo"));
+        params.options.insert("qality", "8000"); // typo'd "quality"
+        params.options.insert(ENCODER_KNOB_KEYINT, "30");
+        assert_eq!(unrecognized_encoder_knobs(&params), vec!["qality"]);
+        // And the resolver indeed never saw the typo'd value.
+        assert_eq!(resolve_encoder_knobs(&params).quality, 0);
+    }
+
+    #[test]
+    fn unrecognized_knobs_is_case_sensitive() {
+        // Matching mirrors the resolver's exact `options.get(key)`
+        // lookups: `"Quality"` is NOT the `"quality"` knob, so it
+        // must be reported (the resolver would never read it).
+        let mut params = CodecParameters::video(CodecId::new("vfw_unrec_case"));
+        params.options.insert("Quality", "8000");
+        assert_eq!(unrecognized_encoder_knobs(&params), vec!["Quality"]);
+        assert_eq!(resolve_encoder_knobs(&params).quality, 0);
+    }
+
+    #[test]
+    fn unrecognized_knobs_preserves_insertion_order() {
+        // `CodecOptions` preserves insertion order and the helper
+        // walks `iter()` directly, so the report comes back in the
+        // order the caller set the keys — deterministic output a
+        // CLI can print verbatim.
+        let mut params = CodecParameters::video(CodecId::new("vfw_unrec_order"));
+        params.options.insert("zeta", "1");
+        params.options.insert(ENCODER_KNOB_QUALITY, "5000");
+        params.options.insert("alpha", "2");
+        assert_eq!(unrecognized_encoder_knobs(&params), vec!["zeta", "alpha"]);
+    }
+
+    #[test]
+    fn unrecognized_knobs_does_not_report_malformed_values_on_known_keys() {
+        // "Recognized" is a key-level verdict, not a value-level
+        // one: a knob key carrying a malformed value IS read by the
+        // resolver (and falls back to the default per the
+        // best-effort policy), so it must not show up in the
+        // unrecognized list. Value diagnostics are a separate
+        // concern from vocabulary membership.
+        let mut params = CodecParameters::video(CodecId::new("vfw_unrec_badval"));
+        params.options.insert(ENCODER_KNOB_QUALITY, "not-a-number");
+        assert!(unrecognized_encoder_knobs(&params).is_empty());
+        assert_eq!(resolve_encoder_knobs(&params).quality, 0);
     }
 
     #[test]

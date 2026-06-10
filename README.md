@@ -93,6 +93,34 @@ the healed cache` round-trip with the cache file redirected via
 `XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
 never touched.
 
+### Encoder knob-key vocabulary + unrecognized-key advisory (round 258)
+
+Round 258 adds the negative companion to round 257's positive
+query view. The three knob-key spellings now live on named public
+constants — `ENCODER_KNOB_QUALITY` (`"quality"`),
+`ENCODER_KNOB_KEYINT` (`"keyint"`), `ENCODER_KNOB_DATA_RATE`
+(`"data_rate"`) — collected in `ENCODER_KNOB_KEYS`, the bridge's
+complete option vocabulary in `EncoderKnobs` field order.
+`resolve_encoder_knobs` routes through the constants, so the
+caller-side spelling (CLI flag plumbing, pipeline JSON mappers)
+and the resolver-side lookup share one source of truth — same
+dedupe shape as the round-248 `FCC_TYPE_VIDC` lift.
+
+`oxideav_vfw::discovery::unrecognized_encoder_knobs(&CodecParameters)
+-> Vec<&str>` reports, in insertion order, the option keys the
+encoder bridge will silently ignore. Under the best-effort policy
+a typo'd knob (`"qality"`, `"Quality"` — matching is exact and
+case-sensitive) produces no error and no effect; pairing this
+helper with `resolve_encoder_knobs` lets a CLI / pipeline
+pre-validator warn before encode time. The verdict is key-level
+only: a recognized key carrying a malformed value is *read* (and
+falls back per the best-effort policy), so it is not reported.
+Eight new unit tests in `discovery::codec::tests` plus a six-test
+integration suite (`tests/round258_encoder_knob_vocabulary.rs`)
+pin the spellings, the vocabulary list, the constants↔resolver
+drift guard, and the empty / typo / case / insertion-order /
+malformed-value branches.
+
 ### Typed encoder-knobs query API (round 257)
 
 `oxideav_vfw::discovery::resolve_encoder_knobs(&CodecParameters)

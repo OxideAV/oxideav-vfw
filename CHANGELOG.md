@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Encoder knob-key vocabulary constants + unrecognized-key
+  advisory helper (round 258).** Round 257 gave callers the
+  *positive* query view of the encoder's option surface
+  (`resolve_encoder_knobs` → "what will the encoder see?"); the
+  best-effort policy's flip side remained invisible — a typo'd
+  knob key (`"qality"`, `"key_int"`, `"Quality"`) produces no
+  error, no log line, and no effect, so a misconfigured encode
+  shipped silently with default knobs.
+  - New public surface on `oxideav_vfw::discovery`:
+    - `pub const ENCODER_KNOB_QUALITY / ENCODER_KNOB_KEYINT /
+      ENCODER_KNOB_DATA_RATE: &str` — the three key spellings
+      callers have stored in their options bags since round 112
+      (`"quality"` / `"keyint"`) and round 178 (`"data_rate"`),
+      lifted out of `resolve_encoder_knobs`'s string literals so
+      the caller-side writes and the resolver-side reads share
+      one source of truth (same dedupe shape as the round-248
+      `FCC_TYPE_VIDC` and round-257 `ENCODER_QUALITY_MAX` lifts).
+    - `pub const ENCODER_KNOB_KEYS: [&str; 3]` — the bridge's
+      complete option vocabulary, in `EncoderKnobs` field order.
+      A future fourth knob must be appended in the same change
+      that teaches the resolver to read it.
+    - `pub fn unrecognized_encoder_knobs(&CodecParameters)
+      -> Vec<&str>` — advisory negative view: the option keys in
+      the bag that the encoder bridge will silently ignore, in
+      insertion order (borrowing from `params`). Matching is
+      exact and case-sensitive, mirroring the resolver's
+      `options.get(key)` lookups. Key-level verdict only: a
+      recognized key carrying a malformed value is *read* (and
+      falls back per the best-effort policy), so it is not
+      reported — value-level diagnostics would be a separate
+      surface.
+  - `resolve_encoder_knobs` now routes through the constants; the
+    resolved values are byte-identical to the pre-r258 lineage
+    (the dedupe is structural, not behavioural).
+  - Eight new unit tests in `discovery::codec::tests` pin the
+    historical spellings, the vocabulary list shape, the
+    constants↔resolver drift guard, and the empty /
+    all-recognized / typo / case-sensitivity / insertion-order /
+    malformed-value-not-reported branches. A six-test integration
+    suite in `tests/round258_encoder_knob_vocabulary.rs`
+    exercises the same surface through the
+    `oxideav_vfw::discovery` re-exports, including the canonical
+    CLI pre-validator flow (constants → resolver → advisory) the
+    surface exists for.
+  - Public API: additive (no existing surface changed).
+
 - **Typed encoder-knobs query API (round 257).** The encoder
   honours three optional `CodecParameters.options` bridge
   knobs — `"quality"` (clamped to `0..=10_000`), `"keyint"`
