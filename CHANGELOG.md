@@ -6,6 +6,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.1...v0.2.0) - 2026-06-10
+
+### Other
+
+- vfw r258: encoder knob-key vocabulary constants + unrecognized-key advisory helper
+- vfw r257: typed encoder-knobs query API + resolve_encoder_knobs helper
+- drop release-plz.toml — use release-plz defaults across the workspace
+- vfw r248: dedupe FCC_TYPE_VIDC driver-type word through pub(super) const
+- vfw r235: expose probe_dll(&Path) single-shot DLL classifier
+- vfw r224: dedupe sandbox instr-budget through SANDBOX_INSTR_LIMIT constant
+- vfw r217: dedupe cache (path, mtime, size) staleness check through per-type matches methods
+- vfw r211: OXIDEAV_VFW_CODEC_PATH whitespace strip on each path-list component
+- vfw r204: steady-state discover() skips no-op cache rewrite
+- vfw r197: cache schema versioning + same-binary test race fix
+- vfw r189: end-to-end corrupted-cache recovery integration test
+- vfw r178 followup: Bih initializers use ..Default::default() for ud-emulator 0.1.5 compat
+- vfw r178: add data_rate per-frame byte-ceiling bridge knob on SandboxedVfwEncoder
+- vfw r112: thread P-frame reference + quality/keyint knobs into SandboxedVfwEncoder
+- add SandboxedVfwEncoder — encode side of the ud-emulator bridge
+- rewrite as thin bridge over ud-emulator 0.1.3
+- vfw r70: Sandbox::ic_get_state / ic_set_state for VfW state surface
+- vfw r70: msadds32.ax E_FAIL bail JCC re-pinned to 0xe282 (loop overflow)
+- vfw r69 fmt: collapse for-loop header onto single line
+- vfw r69: msadds32.ax inner-decode NULL-arg-guard hypothesis FALSIFIED; E_FAIL traced to RVA 0xe2bb
+- surface cdecl size/pointer args on win32_call trace events for msvcrt heap
+- vfw r68: msadds32.ax HRESULT shifts from E_UNEXPECTED to E_FAIL with ffmpeg-derived codec-private-data preamble
+
 ### Added
 
 - **Encoder knob-key vocabulary constants + unrecognized-key
