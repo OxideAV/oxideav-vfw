@@ -71,9 +71,7 @@ around each value — `OXIDEAV_VFW_CODEC_PATH="  /p1 : /p2\n"`
 now resolves to `["/p1", "/p2"]` instead of two unreadable
 paths. Interior whitespace inside a path (`~/Library/Application
 Support/...`, `C:\Program Files\...`) is preserved untouched —
-the strip is `trim_matches`, not a global `replace`. Round 211
-added the strip and five new unit tests in
-`discovery::paths::tests`.
+the strip is `trim_matches`, not a global `replace`.
 
 Results are cached at:
 
@@ -82,224 +80,51 @@ Results are cached at:
 - Windows: `%LOCALAPPDATA%\oxideav\Cache\vfw-discovery.json`
 
 keyed by `(absolute_path, mtime_unix, size_bytes)`. Cache writes
-are atomic (tempfile + rename); a corrupted cache is treated as
-empty rather than poisoning `register()`. Round 189 added an
-end-to-end integration test
-(`tests/round189_corrupted_cache_recovery.rs`) covering both the
-malformed-JSON and zero-byte cache cases — the existing unit
-test only exercised `Cache::load` in isolation; the new test wires
-the full `discover() → re-probe → atomic-overwrite → next-call hits
-the healed cache` round-trip with the cache file redirected via
-`XDG_CACHE_HOME` / `LOCALAPPDATA` so the dev box's real cache is
-never touched.
+are atomic (tempfile + rename); a corrupted (malformed-JSON or
+zero-byte) cache is treated as empty rather than poisoning
+`register()`, and is healed (re-probe → atomic overwrite) on the
+next call. The on-disk cache is a versioned envelope
+(`{ "version": 1, "entries": [...] }`); readers refuse a file whose
+version doesn't match and fall into the corruption-recovery path.
+Steady-state `register()` against a stable codec directory performs
+zero filesystem writes (an interior dirty flag skips the no-op save).
 
-### Encoder knob-key vocabulary + unrecognized-key advisory (round 258)
+### Encoder-knobs query API
 
-Round 258 adds the negative companion to round 257's positive
-query view. The three knob-key spellings now live on named public
-constants — `ENCODER_KNOB_QUALITY` (`"quality"`),
-`ENCODER_KNOB_KEYINT` (`"keyint"`), `ENCODER_KNOB_DATA_RATE`
-(`"data_rate"`) — collected in `ENCODER_KNOB_KEYS`, the bridge's
-complete option vocabulary in `EncoderKnobs` field order.
-`resolve_encoder_knobs` routes through the constants, so the
-caller-side spelling (CLI flag plumbing, pipeline JSON mappers)
-and the resolver-side lookup share one source of truth — same
-dedupe shape as the round-248 `FCC_TYPE_VIDC` lift.
+The encoder honours three optional `CodecParameters.options` bridge
+knobs — `"quality"` (u32 `0..10000`, clamped at `ENCODER_QUALITY_MAX
+= 10_000`), `"keyint"` (u32 frames; force every Nth frame to a
+keyframe), and `"data_rate"` (u32 bytes; per-frame byte ceiling). The
+spellings live on named public constants (`ENCODER_KNOB_QUALITY` /
+`ENCODER_KNOB_KEYINT` / `ENCODER_KNOB_DATA_RATE`, collected in
+`ENCODER_KNOB_KEYS`), so the caller-side and resolver-side lookups
+share one source of truth.
 
-`oxideav_vfw::discovery::unrecognized_encoder_knobs(&CodecParameters)
--> Vec<&str>` reports, in insertion order, the option keys the
-encoder bridge will silently ignore. Under the best-effort policy
-a typo'd knob (`"qality"`, `"Quality"` — matching is exact and
-case-sensitive) produces no error and no effect; pairing this
-helper with `resolve_encoder_knobs` lets a CLI / pipeline
-pre-validator warn before encode time. The verdict is key-level
-only: a recognized key carrying a malformed value is *read* (and
-falls back per the best-effort policy), so it is not reported.
-Eight new unit tests in `discovery::codec::tests` plus a six-test
-integration suite (`tests/round258_encoder_knob_vocabulary.rs`)
-pin the spellings, the vocabulary list, the constants↔resolver
-drift guard, and the empty / typo / case / insertion-order /
-malformed-value branches.
+`discovery::resolve_encoder_knobs(&CodecParameters) -> EncoderKnobs`
+is the typed pre-construction companion to `make_encoder` — it returns
+the resolved values the encoder will see (after best-effort `u32`
+parsing + the `quality` clamp) without constructing an encoder.
+`EncoderKnobs` is `Copy + Default + PartialEq`; the default is the
+"no opt-in" sentinel (all fields `0`). Parsing is best-effort: a
+missing or unparseable value falls back to the per-knob default rather
+than failing. `discovery::unrecognized_encoder_knobs(&CodecParameters)
+-> Vec<&str>` reports, in insertion order, the option keys the encoder
+will silently ignore (exact, case-sensitive matching), so a CLI /
+pipeline pre-validator can warn about a typo'd knob before encode time.
 
-### Typed encoder-knobs query API (round 257)
+### Single-shot DLL probe helper
 
-`oxideav_vfw::discovery::resolve_encoder_knobs(&CodecParameters)
--> EncoderKnobs` is the typed pre-construction companion to
-`make_encoder(&CodecParameters)`. The encoder honours three
-optional `CodecParameters.options` bridge knobs (`"quality"`,
-`"keyint"`, `"data_rate"`); round 257 lifts the parsing surface
-into a public helper so downstream callers (CLI tools,
-integration tests, pipeline pre-validators) can introspect the
-*resolved* values — what the encoder will actually see after
-best-effort `u32` parsing + the `quality` clamp — without
-constructing an encoder and reaching into private fields.
-
-The returned `EncoderKnobs` is `Copy + Default + PartialEq`;
-`EncoderKnobs::default()` is the "no opt-in" sentinel (all three
-fields at `0`), so a caller can diff against it to decide
-whether the user supplied any knob. The clamp ceiling for
-`quality` lives on a sibling `ENCODER_QUALITY_MAX = 10_000`
-constant (also re-exported) — a future change to the ceiling
-lands on both the construction path and the query API
-simultaneously. `keyint` and `data_rate` are unclamped; the
-codec is the arbiter of plausibility for both. Same best-effort
-parsing policy as the round-112 inline path: a missing or
-unparseable value falls back to the per-knob default rather
-than failing.
-
-`SandboxedVfwEncoder::new` now routes through the same helper,
-so the construction path and the query API can't drift apart
-on parsing behaviour. Eight new tests in `discovery::codec::tests`
-and a seven-test integration suite
-(`tests/round257_encoder_knobs_query.rs`) cover the empty /
-fully-populated / clamp-at-ceiling / over-large / malformed /
-whitespace / `Copy`-trait branches.
-
-### Single-shot DLL probe helper (round 235)
-
-`oxideav_vfw::discovery::probe_dll(&Path) -> Option<ProbeResult>`
-is the single-shot companion to `discover_and_register(ctx)`. A
-consumer that already holds an absolute DLL path — a CLI tool,
-an integration-test fixture, or the `ud vfw probe <path>` UX —
-can now classify the entry-point surface (VfW
-`DriverProc` + FourCC sweep; DirectShow `DllGetClassObject` +
-CLSID match; or `Unsupported`) without walking the configured
-discovery directory, mutating a `RuntimeContext`, or touching
-the on-disk cache.
-
-The helper returns `None` only when the file cannot be read
-(missing, directory-not-file, permission denied). A file that
-reads cleanly but doesn't load as PE32 / lacks both recognised
-entry-point surfaces lands on `Some(ProbeResult { kind:
-Kind::Unsupported, .. })` — the same classification the inline
-branch of `discover()` would record. The structural equality
-`probe_dll(path) == Some(probe_bytes(&bytes))` is pinned by a
-unit test so a future divergence between the two surfaces
-fails the build rather than silently shifting downstream
-classification. Round 235 also re-exports the previously
-module-private `probe_bytes` byte-accepting form and the
-`ProbeResult` type from `crate::discovery`, so the full probe
-surface is now reachable without reaching into private internals.
-
-### VfW driver-type constant dedupe (round 248)
-
-The `mmioFOURCC('V','I','D','C')` driver-type word that every
-`ICOpen` call hands as `fccType` now lives on a single
-`FCC_TYPE_VIDC` constant in `discovery::probe`. Previously the
-discovery-time probe held a module-private `const FCC_TYPE_VIDC`
-while the long-lived per-codec sandboxes in `discovery::codec`
-each carried their own `let fcc_type = u32::from_le_bytes(*b"VIDC")`
-recompute (one in `SandboxedVfwDecoder::ensure_open`, one in
-`SandboxedVfwEncoder::ensure_open`); three sites total spelled out
-the same byte-equality contract independently. Round 248 promotes
-the probe's constant to `pub(super)` and routes both `ensure_open`
-sites through it, so a future change to the driver-type word (an
-adversarial test FourCC, an audio-codec sibling that needs a `vidS`
-/ `acm` companion, …) lands on every `ICOpen` simultaneously rather
-than producing a silent driver-type divergence on a neighbouring
-path. Two new tests in `discovery::codec::tests` pin the value as
-a compile-time `const { ... }` assertion
-(`fcc_type_vidc_preserves_le_byte_order` locks the little-endian
-read of `b"VIDC"` at `0x43444956`;
-`fcc_type_vidc_matches_runtime_recomputation` is the runtime
-mirror) so a drift turns into a build break rather than a runtime
-test failure. Same shape of dedupe as the round-217
-`matches`-method consolidation and the round-224
-`SANDBOX_INSTR_LIMIT` lift: one source of truth for an invariant
-that has to hold identically across multiple sites.
-
-### Sandbox instruction-budget dedupe (round 224)
-
-The `8_000_000_000` instruction wall the three long-lived
-`ensure_open` paths hand to `ud_emulator::Cpu::set_instr_limit`
-(VfW decoder, VfW encoder, DirectShow decoder) now lives on a
-single `SANDBOX_INSTR_LIMIT` module-private constant in
-`discovery::codec`. The round-24 historical rationale (the value
-matches the bound the manual `mpg4c32.dll` decode walk needed to
-chew through the 5-6-frame 352x288 fixtures) sits on the
-constant's rustdoc, in one place rather than partially-copied
-across three call sites. A future tune to the budget — say,
-because a longer fixture starts hitting the wall — lands on the
-decoder, encoder, and DirectShow paths simultaneously. Two new
-compile-time `const { ... }` pins (`SANDBOX_INSTR_LIMIT ==
-8_000_000_000`, `SANDBOX_INSTR_LIMIT < u64::MAX / 2`) turn a
-drift into a build break. Discovery-time probes in
-`discovery::probe::{try_probe_vfw, try_probe_dshow}` still run
-on the sandbox's default budget — they walk a fresh sandbox per
-candidate for short `ICOpen` / `DllGetClassObject` round-trips
-and never needed the elevated ceiling. No behavioural change to
-any of the three `ensure_open` paths.
-
-### Staleness-check dedupe (round 217)
-
-The cache's `(path, mtime_unix, size_bytes)` triple-equality test
-now lives on each row type as its own `matches` method:
-`DiscoveryEntry::matches(&path, mtime, size)` for the in-memory
-type, `CacheEntry::matches(&path, mtime, size)` for the on-disk
-row. `Cache::lookup` routes through `CacheEntry::matches` rather
-than re-implementing the `&&` chain inline. A change to the
-freshness contract therefore only has to land once per type —
-previously the same triple-equality was hand-inlined in three
-places (the `DiscoveryEntry` method, the `Cache::lookup` loop, the
-in-memory dedupe in `Cache::upsert`'s `position`) and a quiet
-divergence between any two would have produced a cache that looked
-correct in isolated unit tests but missed stale entries in the
-real `discover()` flow. Seven new tests pin both directions of the
-contract: three in `discovery::tests` for `DiscoveryEntry::matches`
-(`identical_triple` / `path_change` / `mtime_change` /
-`size_change`), three in `discovery::cache::tests` for
-`CacheEntry::matches` and the `Cache::lookup` delegation
-(`identical_triple` / `any_field_mismatch` /
-`lookup_routes_through_cache_entry_matches`).
-
-### Steady-state no-op-save skip (round 204)
-
-`discover()` now skips its tail-end `Cache::save_atomic` call when
-nothing actually changed. An interior dirty flag on `Cache`
-tracks divergence between the in-memory state and the
-last-loaded on-disk file: every `Cache::upsert` (cache-miss
-re-probe) sets it; loading the pre-r197 legacy bare-array shape
-also sets it (so the legacy → envelope promotion still fires);
-a successful `Cache::save_atomic` clears it. Steady-state
-`register()` against a stable codec directory therefore costs
-**zero filesystem writes** instead of one full pretty-printed
-`vfw-discovery.json` rewrite per call. Cache-miss writes and
-legacy-shape promotions are unaffected — symmetric guards in
-`tests/round204_cache_noop_save_skip.rs` pin both directions:
-no rewrite when nothing changed, mtime advances when a new
-candidate landed.
-
-### Schema versioning (round 197)
-
-The on-disk cache is now a **versioned envelope**:
-
-```json
-{
-  "version": 1,
-  "entries": [ /* CacheEntry, ... */ ]
-}
-```
-
-The `version` field is stamped at `discovery::CURRENT_SCHEMA_VERSION`
-on every save. Readers refuse any file whose version doesn't match
-their own — both downgrades (a `v2` file read by a `v1` reader) and
-forward-incompatible upgrades fall into the round-189
-corruption-recovery path: discard, re-probe, heal on next save.
-Pre-round-197 caches (top-level JSON array, no version field) are
-still loadable on first call, then promoted to the envelope shape
-on the same call's atomic-write tail — no user intervention
-required. Three integration tests in
-`tests/round197_cache_schema_versioning.rs` cover legacy-upgrade,
-future-version refusal, and the round-trip stability invariant; six
-new unit tests in `discovery::cache::tests` lock in the envelope
-shape, the version stamp, and the negative paths
-(unknown/older/malformed envelope = `None`).
-
-Round 197 also closed a long-latent same-binary test race in the
-round-189 corrupted-cache test pair: parallel test execution +
-process-global `XDG_CACHE_HOME` made the two tests' env-var writes
-interleave under `--test-threads >= 2`. Both binaries now serialise
-their env-var mutations through a process-global `Mutex`.
+`discovery::probe_dll(&Path) -> Option<ProbeResult>` is the single-shot
+companion to `discover_and_register(ctx)`. A consumer that already holds
+an absolute DLL path can classify the entry-point surface (VfW
+`DriverProc` + FourCC sweep; DirectShow `DllGetClassObject` + CLSID
+match; or `Unsupported`) without walking the configured discovery
+directory, mutating a `RuntimeContext`, or touching the on-disk cache.
+It returns `None` only when the file cannot be read; a file that reads
+cleanly but doesn't load as PE32 / lacks both recognised entry-point
+surfaces lands on `Some(ProbeResult { kind: Kind::Unsupported, .. })`.
+The byte-accepting form `probe_bytes` and the `ProbeResult` type are
+re-exported from `crate::discovery`.
 
 ## Codec registration priority
 
