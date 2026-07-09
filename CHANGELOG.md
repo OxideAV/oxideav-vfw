@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Cache rows for deleted DLLs are now pruned (round 401).** The
+  discovery cache only ever grew: a DLL removed from a codec
+  directory left its row in `vfw-discovery.json` forever (every
+  temp-dir test run on a dev box added permanent dead rows). A
+  discovery cycle now prunes rows whose file vanished — scoped
+  strictly to roots the cycle **successfully walked** (exact parent
+  match; the walk is non-recursive). Rows under roots absent from
+  the current `OXIDEAV_VFW_CODEC_PATH` (unmounted removable drive,
+  different configuration) and rows under roots whose `read_dir`
+  failed survive untouched, so a transiently missing mount can't
+  cause a re-probe storm. Candidates whose stat fails mid-walk
+  count as seen (a transient metadata error must not evict a row).
+  A no-op prune does not dirty the cache, preserving the round-204
+  zero-write steady state. New public surface:
+  `Cache::prune_vanished(&mut self, roots, seen) -> usize`. Four
+  cache-unit tests (unseen-row removal, unwalked-root survival,
+  exact-parent-not-prefix scoping, dirty-only-when-removed) plus
+  three end-to-end tests (delete→prune, B-only-cycle keeps A's row
+  then hits again, unreadable root immune).
+
 - **Duplicate discovery roots no longer double-register codecs
   (round 401).** A directory listed twice in
   `OXIDEAV_VFW_CODEC_PATH` (easy to produce when a deploy script

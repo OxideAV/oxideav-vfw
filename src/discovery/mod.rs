@@ -171,6 +171,11 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
     // because that would also rewrite the paths users see in logs
     // and cache keys.
     let mut walked: Vec<&Path> = Vec::with_capacity(paths.len());
+    // Roots this cycle successfully iterated + every candidate the
+    // walk saw in them — the inputs to the vanished-row prune
+    // below (round 401).
+    let mut walked_ok: Vec<&Path> = Vec::with_capacity(paths.len());
+    let mut seen: Vec<PathBuf> = Vec::new();
     for dir in paths {
         if walked.contains(&dir.as_path()) {
             log::debug!("vfw discovery: skipping duplicate root {:?}", dir);
@@ -186,6 +191,7 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
                 continue;
             }
         };
+        walked_ok.push(dir.as_path());
         // Deterministic walk order (round 401): `fs::read_dir`
         // yields entries in filesystem-internal order (inode /
         // B-tree / hash order depending on the FS), which varies
@@ -206,6 +212,11 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
             .filter(|p| is_codec_candidate(p))
             .collect();
         candidates.sort();
+        // Every candidate the walk encountered counts as "seen"
+        // for prune purposes — including ones whose stat fails
+        // below (the file exists; a transient metadata error must
+        // not evict its row).
+        seen.extend(candidates.iter().cloned());
         for path in candidates {
             let (mtime, size) = match file_meta(&path) {
                 Some(m) => m,
@@ -237,13 +248,23 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
             out.push(entry);
         }
     }
+    // Vanished-row prune (round 401): rows whose DLL was deleted
+    // from a root we successfully walked this cycle are dead — the
+    // file is gone, the row can never hit again, and before this
+    // prune it lingered in the JSON forever (the cache only ever
+    // grew). Rows under roots NOT walked this cycle are kept; see
+    // `Cache::prune_vanished` for the exact scoping contract.
+    let pruned = cache.prune_vanished(&walked_ok, &seen);
+    if pruned > 0 {
+        log::debug!("vfw discovery: pruned {pruned} vanished cache row(s)");
+    }
     // Best-effort write — never let a cache I/O failure poison
     // discovery itself.  Round 204: only fire when something
-    // changed (a cache miss re-probed a candidate, or `load`
-    // consumed a legacy bare-array shape that wants
-    // envelope-promotion).  Steady-state `register()` calls against
-    // a fully-cached, stable codec directory now skip the atomic
-    // rewrite entirely.
+    // changed (a cache miss re-probed a candidate, a vanished row
+    // was pruned, or `load` consumed a legacy bare-array shape that
+    // wants envelope-promotion).  Steady-state `register()` calls
+    // against a fully-cached, stable codec directory still skip the
+    // atomic rewrite entirely.
     if cache.is_dirty() {
         let _ = cache.save_atomic(cache_path);
     }
@@ -581,6 +602,88 @@ mod tests {
 
         let v = discover_with_cache(&[r1, r2], &cache_path);
         assert_eq!(v.len(), 2, "distinct roots each walked");
+    }
+
+    // ── Round 401: vanished-row prune, end-to-end ───────────────
+
+    #[test]
+    fn deleted_dll_row_is_pruned_from_cache_on_next_discover() {
+        // Probe a DLL, delete it, discover again: the second cycle
+        // must return nothing AND rewrite the cache without the
+        // dead row (pre-r401 the row lingered in the JSON forever).
+        let tmp = Tmp::new("prune-e2e");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        let dll = codec_dir.join("synth.dll");
+        fs::write(&dll, b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v1 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert_eq!(v1.len(), 1);
+        let loaded = Cache::load(&cache_path).expect("cache written");
+        assert_eq!(loaded.len(), 1);
+
+        fs::remove_file(&dll).unwrap();
+        let v2 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert!(v2.is_empty(), "deleted DLL yields no entries");
+        let reloaded = Cache::load(&cache_path).expect("cache still parseable");
+        assert!(
+            reloaded.is_empty(),
+            "dead row pruned from the on-disk cache",
+        );
+    }
+
+    #[test]
+    fn rows_under_roots_not_in_this_cycle_survive() {
+        // Probe root A, then discover root B only — A's row must
+        // survive in the cache (shared across path configurations)
+        // and hit again when A comes back into the path list.
+        let tmp = Tmp::new("prune-scope");
+        let root_a = tmp.path().join("a");
+        let root_b = tmp.path().join("b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_a.join("keep.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let va = discover_with_cache(std::slice::from_ref(&root_a), &cache_path);
+        assert_eq!(va.len(), 1);
+
+        // Walk B only; A's row must not be pruned.
+        let vb = discover_with_cache(std::slice::from_ref(&root_b), &cache_path);
+        assert!(vb.is_empty());
+        let loaded = Cache::load(&cache_path).expect("cache parseable");
+        assert_eq!(loaded.len(), 1, "row under unwalked root A survives");
+
+        // A returns to the path list: pure cache hit, same entry.
+        let va2 = discover_with_cache(std::slice::from_ref(&root_a), &cache_path);
+        assert_eq!(va2, va, "root A's row hits again after the B-only cycle");
+    }
+
+    #[test]
+    fn unreadable_root_does_not_trigger_prune() {
+        // A root that fails read_dir this cycle (deleted,
+        // unmounted) must not evict its rows — only successfully
+        // walked roots participate in the prune.
+        let tmp = Tmp::new("prune-unreadable");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        fs::write(codec_dir.join("synth.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v1 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert_eq!(v1.len(), 1);
+
+        // Whole root vanishes (unmount-shaped, not file-delete-shaped).
+        fs::remove_dir_all(&codec_dir).unwrap();
+        let v2 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert!(v2.is_empty());
+        let loaded = Cache::load(&cache_path).expect("cache parseable");
+        assert_eq!(
+            loaded.len(),
+            1,
+            "rows under an unreadable root survive the cycle",
+        );
     }
 
     // ── Round 217: triple-equality contract for the staleness check ─

@@ -282,6 +282,49 @@ impl Cache {
         Ok(())
     }
 
+    /// Drop rows for DLLs that vanished from a walked discovery
+    /// root (round 401).
+    ///
+    /// `roots` is the set of directories the current discovery
+    /// cycle **successfully iterated**; `seen` is every candidate
+    /// path that walk encountered (cache hits and misses alike). A
+    /// row is removed iff its file's parent directory is one of
+    /// `roots` *and* the walk didn't see the file — i.e. the DLL
+    /// was deleted (or renamed away from `*.dll` / `*.ax`) since
+    /// the row was written. Rows under directories that were NOT
+    /// walked this cycle are always kept: the cache file is shared
+    /// across `OXIDEAV_VFW_CODEC_PATH` configurations, and a row
+    /// belonging to an unmounted removable drive or a root that's
+    /// simply absent from the current path list must survive so
+    /// the next cycle that walks it again gets its hits back.
+    /// Unreadable roots never reach `roots` (the walk skips them
+    /// before iterating), so a transiently unmountable directory
+    /// can't trigger a prune storm.
+    ///
+    /// Root matching is exact parent equality — the walk is
+    /// non-recursive, so a cached row's file can only have been
+    /// produced by the root that is its direct parent.
+    ///
+    /// Returns the number of rows removed; sets the
+    /// [`is_dirty`](Cache::is_dirty) flag iff that count is
+    /// non-zero (a no-op prune must not defeat the round-204
+    /// no-op-save skip).
+    pub fn prune_vanished(&mut self, roots: &[&Path], seen: &[PathBuf]) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            let under_walked_root = e
+                .path
+                .parent()
+                .is_some_and(|parent| roots.contains(&parent));
+            !under_walked_root || seen.contains(&e.path)
+        });
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.dirty.set(true);
+        }
+        removed
+    }
+
     /// True when the in-memory state diverges from what the
     /// last-loaded on-disk file held.  Set by [`Cache::upsert`] and
     /// by [`Cache::load`] when it consumed a pre-r197 legacy
@@ -667,6 +710,64 @@ mod tests {
         assert!(c
             .lookup(Path::new("/abs/x.dll"), 1_700_000_000, 999_999)
             .is_none());
+    }
+
+    // ── Round 401: vanished-row prune ───────────────────────────
+
+    #[test]
+    fn prune_vanished_removes_unseen_row_under_walked_root() {
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/root/gone.dll"), Kind::Vfw));
+        c.upsert(sample_entry(Path::new("/root/still.dll"), Kind::Vfw));
+        let seen = vec![PathBuf::from("/root/still.dll")];
+        let removed = c.prune_vanished(&[Path::new("/root")], &seen);
+        assert_eq!(removed, 1, "the unseen row under the walked root goes");
+        assert_eq!(c.len(), 1);
+        assert!(c
+            .lookup(Path::new("/root/still.dll"), 1_700_000_000, 524_288)
+            .is_some());
+    }
+
+    #[test]
+    fn prune_vanished_keeps_rows_under_unwalked_roots() {
+        // The cache is shared across OXIDEAV_VFW_CODEC_PATH
+        // configurations — a row for a root absent from THIS
+        // cycle's path list (unmounted drive, different config)
+        // must survive untouched.
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/other/keep.dll"), Kind::Vfw));
+        c.save_atomic(&Tmp::new("prune-unwalked").path().join("c.json"))
+            .unwrap();
+        assert!(!c.is_dirty());
+        let removed = c.prune_vanished(&[Path::new("/root")], &[]);
+        assert_eq!(removed, 0);
+        assert_eq!(c.len(), 1, "row under unwalked root kept");
+        assert!(!c.is_dirty(), "no-op prune must not dirty the cache");
+    }
+
+    #[test]
+    fn prune_vanished_root_match_is_exact_parent_not_prefix() {
+        // The walk is non-recursive: walking `/root` says nothing
+        // about `/root/sub`, so a row under the subdirectory is
+        // out of scope even though `/root` is its path prefix.
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/root/sub/nested.dll"), Kind::Vfw));
+        let removed = c.prune_vanished(&[Path::new("/root")], &[]);
+        assert_eq!(removed, 0, "prefix match must not evict nested rows");
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn prune_vanished_sets_dirty_only_when_rows_removed() {
+        let tmp = Tmp::new("prune-dirty");
+        let cache_path = tmp.path().join("c.json");
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/root/gone.dll"), Kind::Vfw));
+        c.save_atomic(&cache_path).unwrap();
+        assert!(!c.is_dirty());
+        let removed = c.prune_vanished(&[Path::new("/root")], &[]);
+        assert_eq!(removed, 1);
+        assert!(c.is_dirty(), "a real prune marks the cache for rewrite");
     }
 
     #[test]
