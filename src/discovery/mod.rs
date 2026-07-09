@@ -10,7 +10,9 @@
 //! - `OXIDEAV_VFW_CODEC_PATH=/p1:/p2` (colon-separated on UNIX,
 //!   `;`-separated on Windows) **replaces** the default — empty
 //!   strings between separators and unreadable directories are
-//!   skipped silently.
+//!   skipped silently. Each component gets a leading/trailing
+//!   ASCII-whitespace strip (round 211) and leading-`~` home
+//!   expansion (round 401).
 //! - Default (env var unset):
 //!     - UNIX: `$XDG_DATA_HOME/oxideav/codecs/` or
 //!       `$HOME/.local/share/oxideav/codecs/`.
@@ -20,6 +22,11 @@
 //! Files that aren't valid PE32 (or that simply lack the codec
 //! entry points we know how to drive) are skipped silently with a
 //! `log::debug!` — discovery never panics at register time.
+//! Duplicate roots (component-wise path equality) are walked once
+//! in first-occurrence order; within each root, candidates are
+//! processed in lexical path order, so a given directory layout
+//! always produces the same entry and registration order
+//! (round 401).
 //!
 //! ### Probe priority
 //!
@@ -47,11 +54,19 @@
 //! Discovery results are cached at
 //! `$XDG_CACHE_HOME/oxideav/vfw-discovery.json`
 //! (or `$HOME/.cache/oxideav/vfw-discovery.json`,
-//! or `%LOCALAPPDATA%\oxideav\Cache\vfw-discovery.json`),
-//! keyed by `(absolute_path, mtime, size_bytes)`. A stale entry
-//! (mtime or size mismatch) is treated as a cache miss; on miss
-//! we re-probe and overwrite the entry. The cache is written
-//! atomically (tempfile + rename).
+//! or `%LOCALAPPDATA%\oxideav\Cache\vfw-discovery.json`) —
+//! overridable file-precisely via `OXIDEAV_VFW_CACHE_PATH`, or
+//! programmatically via [`discover_with_cache`] (both round 401).
+//! Rows are keyed by `(absolute_path, mtime, size_bytes)`. A stale
+//! entry (mtime or size mismatch) is treated as a cache miss; on
+//! miss we re-probe and overwrite the entry. The cache is written
+//! atomically (tempfile + rename; a failed rename cleans up its
+//! tempfile), only when something actually changed (round 204),
+//! and rows whose DLL vanished from a successfully-walked root are
+//! pruned (round 401 — see [`Cache::prune_vanished`] for the
+//! scoping rules). An existing-but-corrupt cache file is healed on
+//! the next cycle even if that cycle probes nothing
+//! ([`Cache::load_or_heal`]).
 //!
 //! See `docs/winmf/winmf-emulator.md` for the broader sandbox
 //! design contract.

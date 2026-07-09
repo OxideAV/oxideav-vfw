@@ -105,6 +105,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process-global home var (which would race parallel tests). Seven
   new tests.
 
+- **Round-401 end-to-end lifecycle suite + module-doc refresh.**
+  `tests/round401_discovery_cache_lifecycle.rs` drives the round's
+  contracts through the outermost public surface (`register()` and
+  `discovery::discover`) with the cache redirected via
+  `OXIDEAV_VFW_CACHE_PATH`: override honoured file-precisely (and
+  nothing else written in the state dir), corrupt override cache
+  healed by a zero-probe `register()`, deleted-DLL row pruned
+  through the public `discover`, and a duplicated
+  `OXIDEAV_VFW_CODEC_PATH` component yielding each candidate once.
+  The `discovery` module docs now describe the round-197/204/401
+  cache lifecycle (override, prune, heal, deterministic order)
+  instead of the round-28 snapshot.
+
 - **`OXIDEAV_VFW_CACHE_PATH` — explicit cache-file override
   (round 401).** The discovery cache location was only steerable
   through `XDG_CACHE_HOME` / `LOCALAPPDATA`, which redirect the
