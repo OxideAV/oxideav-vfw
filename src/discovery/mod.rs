@@ -68,8 +68,8 @@
 //! the next cycle even if that cycle probes nothing
 //! ([`Cache::load_or_heal`]).
 //!
-//! See `docs/winmf/winmf-emulator.md` for the broader sandbox
-//! design contract.
+//! See the workspace's `docs/winmf-emulator.md` for the broader
+//! sandbox design contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};

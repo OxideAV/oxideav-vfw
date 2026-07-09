@@ -133,6 +133,32 @@ than failing. `discovery::unrecognized_encoder_knobs(&CodecParameters)
 will silently ignore (exact, case-sensitive matching), so a CLI /
 pipeline pre-validator can warn about a typo'd knob before encode time.
 
+### Cache lifecycle
+
+Rows are keyed by `(absolute_path, mtime_unix, size_bytes)`; any
+mismatch is a miss and the DLL is re-probed. Writes are atomic
+(tempfile + rename — a failed rename cleans up its tempfile) and
+only happen when something changed, so a steady-state `register()`
+against a stable codec directory performs zero filesystem writes.
+Rows whose DLL vanished from a **successfully walked** root are
+pruned; rows under roots absent from the current path list (an
+unmounted drive, a different configuration) or whose directory
+could not be read survive untouched. An existing-but-corrupt cache
+file — including one written by an unknown future schema version —
+is healed (rewritten as a valid envelope) on the next `register()`
+call, even if that call probes nothing. Duplicate-path rows in a
+hand-edited or badly-merged cache file collapse on load, keeping
+the last occurrence.
+
+### Hermetic discovery
+
+`discovery::discover_with_cache(paths, cache_path)` runs the same
+walk / probe / cache cycle against a caller-supplied cache **file**
+instead of the platform default — for embedders that own their
+state directory and for tests that must not touch the developer's
+real cache. `discover(paths)` is exactly
+`discover_with_cache(paths, &cache_file_path())`.
+
 ### Single-shot DLL probe helper
 
 `discovery::probe_dll(&Path) -> Option<ProbeResult>` is the single-shot
