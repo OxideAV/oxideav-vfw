@@ -109,7 +109,31 @@ fn parse_path_list(value: &std::ffi::OsStr) -> Vec<PathBuf> {
 }
 
 /// Resolve the on-disk JSON cache file location.
+///
+/// Resolution order (round 401 added step 1):
+///
+/// 1. `OXIDEAV_VFW_CACHE_PATH=<file>` — an explicit cache **file**
+///    path (not a directory), used verbatim after the same
+///    leading/trailing-ASCII-whitespace strip the round-211 codec
+///    path list gets. This is the hermetic knob for containers and
+///    CI: `XDG_CACHE_HOME` / `LOCALAPPDATA` redirect the whole
+///    cache tree of every XDG-aware program in the process, while
+///    this variable moves only oxideav-vfw's discovery cache. A
+///    set-but-empty (or whitespace-only) value is ignored and
+///    resolution falls through to the platform default.
+/// 2. UNIX: `$XDG_CACHE_HOME/oxideav/vfw-discovery.json` or
+///    `$HOME/.cache/oxideav/vfw-discovery.json`.
+///    Windows: `%LOCALAPPDATA%\oxideav\Cache\vfw-discovery.json`.
+/// 3. Pathological fallback (no env at all): `vfw-discovery.json`
+///    in the current working directory.
 pub fn cache_file_path() -> PathBuf {
+    if let Some(over) = env::var_os("OXIDEAV_VFW_CACHE_PATH") {
+        let s = over.to_string_lossy();
+        let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     if let Some(p) = platform_cache_dir() {
         p.join("vfw-discovery.json")
     } else {
@@ -280,10 +304,84 @@ mod tests {
 
     #[test]
     fn cache_file_path_basename() {
+        let _serial = env_lock();
+        let _guard = CacheEnvGuard::unset();
         let p = cache_file_path();
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some("vfw-discovery.json")
+        );
+    }
+
+    // ── Round 401: OXIDEAV_VFW_CACHE_PATH override ──────────────
+
+    /// Save/restore guard for `OXIDEAV_VFW_CACHE_PATH` mutations.
+    /// Always take `env_lock()` first — env vars are process-global.
+    struct CacheEnvGuard(Option<std::ffi::OsString>);
+
+    impl CacheEnvGuard {
+        fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let saved = env::var_os("OXIDEAV_VFW_CACHE_PATH");
+            env::set_var("OXIDEAV_VFW_CACHE_PATH", value);
+            CacheEnvGuard(saved)
+        }
+        fn unset() -> Self {
+            let saved = env::var_os("OXIDEAV_VFW_CACHE_PATH");
+            env::remove_var("OXIDEAV_VFW_CACHE_PATH");
+            CacheEnvGuard(saved)
+        }
+    }
+
+    impl Drop for CacheEnvGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => env::set_var("OXIDEAV_VFW_CACHE_PATH", v),
+                None => env::remove_var("OXIDEAV_VFW_CACHE_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn cache_file_path_honours_explicit_override() {
+        // The override names the cache FILE verbatim — no
+        // `oxideav/` subdir, no forced basename. That's the
+        // hermetic-container contract: exactly the path you set is
+        // exactly the file that gets written.
+        let _serial = env_lock();
+        let _guard = CacheEnvGuard::set("/custom/state/my-vfw-cache.json");
+        assert_eq!(
+            cache_file_path(),
+            PathBuf::from("/custom/state/my-vfw-cache.json"),
+        );
+    }
+
+    #[test]
+    fn cache_file_path_override_strips_surrounding_whitespace() {
+        // Same forgiveness as the round-211 codec-path strip:
+        // `.env` / systemd / container-manifest loaders leave stray
+        // whitespace around values.
+        let _serial = env_lock();
+        let _guard = CacheEnvGuard::set("  /custom/cache.json\n");
+        assert_eq!(cache_file_path(), PathBuf::from("/custom/cache.json"));
+    }
+
+    #[test]
+    fn cache_file_path_empty_override_falls_back_to_default() {
+        // Set-but-empty (or whitespace-only) is treated as unset —
+        // an empty `Environment=OXIDEAV_VFW_CACHE_PATH=` stanza
+        // must not resolve the cache to the current directory.
+        let _serial = env_lock();
+        let _guard = CacheEnvGuard::set("   ");
+        let p = cache_file_path();
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some("vfw-discovery.json"),
+            "fell back to the platform default",
+        );
+        assert_ne!(
+            p,
+            PathBuf::from("vfw-discovery.json"),
+            "not the bare-CWD pathological fallback (HOME/XDG is set on test boxes)",
         );
     }
 }

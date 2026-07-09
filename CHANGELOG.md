@@ -90,6 +90,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`OXIDEAV_VFW_CACHE_PATH` — explicit cache-file override
+  (round 401).** The discovery cache location was only steerable
+  through `XDG_CACHE_HOME` / `LOCALAPPDATA`, which redirect the
+  whole cache tree of every XDG-aware program in the process. The
+  new variable names oxideav-vfw's cache **file** verbatim (after
+  the round-211 leading/trailing-whitespace strip), moving only
+  this crate's state — the hermetic knob for containers and CI. A
+  set-but-empty or whitespace-only value is ignored and resolution
+  falls through to the platform default. `discover()` /
+  `register()` pick it up automatically via `cache_file_path()`.
+  Three unit tests pin the verbatim-file contract, the whitespace
+  strip, and the empty-value fallback.
+
 - **Deterministic discovery walk order (round 401).** `discover` /
   `discover_with_cache` used to process candidates in raw
   `fs::read_dir` order — filesystem-internal (inode / B-tree / hash)

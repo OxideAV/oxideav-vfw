@@ -77,6 +77,11 @@ the strip is `trim_matches`, not a global `replace`.
 
 Results are cached at:
 
+- `OXIDEAV_VFW_CACHE_PATH=<file>` (if set) — an explicit cache
+  **file** path used verbatim (after the same whitespace strip as
+  above); the hermetic knob for containers/CI where redirecting
+  `XDG_CACHE_HOME` would move every XDG-aware program's cache. A
+  set-but-empty value falls through to the platform default.
 - Linux / macOS: `$XDG_CACHE_HOME/oxideav/vfw-discovery.json` or
   `$HOME/.cache/oxideav/vfw-discovery.json`
 - Windows: `%LOCALAPPDATA%\oxideav\Cache\vfw-discovery.json`
