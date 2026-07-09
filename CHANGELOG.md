@@ -8,6 +8,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Failed atomic cache saves no longer strand tempfiles
+  (round 401).** `Cache::save_atomic` writes a
+  `vfw-discovery.json.tmp.<pid>.<nanos>` sibling and renames it
+  into place; when the rename failed (cache path occupied by a
+  directory, cross-device symlinked cache dir), the tempfile was
+  left behind — and because the name embeds a nanosecond stamp,
+  every retry leaked a fresh one. Failures between tempfile
+  creation and rename now remove the tempfile (best-effort) before
+  surfacing the error; the dirty flag deliberately stays set so a
+  later save attempt still fires, and the original cache file is
+  untouched either way. Two unit tests pin the failed-save cleanup
+  (rename-onto-directory) and the already-clean happy path.
+
 - **Corrupt cache files are now healed even by zero-probe cycles
   (round 401).** The round-189 heal contract ("a corrupted cache is
   re-probed and overwritten on the next call") silently depended on

@@ -301,12 +301,28 @@ impl Cache {
             entries: self.entries.clone(),
         };
         let json = serde_json::to_vec_pretty(&envelope).map_err(io_err)?;
-        {
+        // Round 401: on ANY failure between tempfile creation and
+        // the rename, remove the tempfile before surfacing the
+        // error. Pre-r401 a failed rename (e.g. the cache path
+        // occupied by a directory, or a cross-device link error
+        // when a symlinked cache dir points at another filesystem)
+        // stranded one `vfw-discovery.json.tmp.<pid>.<nanos>`
+        // sibling per attempt — and since the tempfile name embeds
+        // a nanosecond stamp, every retry leaked a fresh one.
+        let write_then_rename = (|| -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
             f.write_all(&json)?;
             f.sync_all()?;
+            fs::rename(&tmp, path)
+        })();
+        if let Err(e) = write_then_rename {
+            // Best-effort cleanup; the original cache file (if any)
+            // is untouched either way. The dirty flag deliberately
+            // stays set — the in-memory state still diverges from
+            // disk, so a later save attempt must fire.
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        fs::rename(&tmp, path)?;
         self.dirty.set(false);
         Ok(())
     }
@@ -794,6 +810,60 @@ mod tests {
         let healed = Cache::load_or_heal(&path);
         assert_eq!(healed.len(), 1);
         assert!(!healed.is_dirty());
+    }
+
+    // ── Round 401: failed-save tempfile cleanup ─────────────────
+
+    #[test]
+    fn failed_save_removes_tempfile_and_keeps_dirty() {
+        // Occupy the cache path with a DIRECTORY: the tempfile
+        // write succeeds but the rename-over-a-directory fails on
+        // every platform we target. The failure must surface as
+        // Err, leave no `.tmp.*` sibling behind, and keep the
+        // dirty flag set so a later save attempt still fires.
+        let tmp = Tmp::new("save-fail-cleanup");
+        let cache_path = tmp.path().join("occupied");
+        fs::create_dir_all(&cache_path).unwrap();
+
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
+        assert!(c.is_dirty());
+
+        let res = c.save_atomic(&cache_path);
+        assert!(res.is_err(), "rename onto a directory fails");
+        assert!(c.is_dirty(), "failed save must not clear the dirty flag");
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no stranded tempfiles after a failed save: {leftovers:?}",
+        );
+    }
+
+    #[test]
+    fn successful_save_leaves_no_tempfile_sibling() {
+        // The happy path never leaked (rename consumes the
+        // tempfile) — pinned here so the cleanup refactor can't
+        // regress it.
+        let tmp = Tmp::new("save-ok-clean");
+        let cache_path = tmp.path().join("ok.json");
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
+        c.save_atomic(&cache_path).unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no tempfiles after success");
+        assert!(cache_path.is_file());
     }
 
     // ── Round 401: vanished-row prune ───────────────────────────
