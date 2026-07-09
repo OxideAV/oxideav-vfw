@@ -118,13 +118,43 @@ impl DiscoveryEntry {
 /// `*.dll` / `*.ax` in each, consults / updates the on-disk
 /// cache, and returns the merged list.
 ///
+/// The cache lives at [`cache_file_path()`] — the platform
+/// default cache location. Callers that need an explicit,
+/// hermetic cache file (CI sandboxes, parallel test binaries,
+/// embedders with their own state directory) should use
+/// [`discover_with_cache`] instead; this function is exactly
+/// `discover_with_cache(paths, &cache_file_path())`.
+///
 /// Hard contract: never panics, never returns an error type. A
 /// single bad DLL is silently skipped with `log::debug!`. The
 /// outer caller (`crate::register`) is therefore safe to chain
 /// multiple `register` calls without a panic-aborting path.
 pub fn discover(paths: &[PathBuf]) -> Vec<DiscoveryEntry> {
-    let cache_path = cache_file_path();
-    let mut cache = Cache::load(&cache_path).unwrap_or_default();
+    discover_with_cache(paths, &cache_file_path())
+}
+
+/// [`discover`] with an explicit on-disk cache file.
+///
+/// Identical walk / probe / cache semantics to [`discover`], but
+/// the JSON cache is read from and written to `cache_path`
+/// instead of the platform-default [`cache_file_path()`]. This is
+/// the hermetic entry point: a consumer that owns its state
+/// directory (or a test that must not race the developer's real
+/// `~/.cache/oxideav/vfw-discovery.json` across parallel test
+/// binaries) passes its own path and gets a fully self-contained
+/// discovery cycle — no environment-variable redirection
+/// required.
+///
+/// `cache_path` names the cache **file**, not its directory.
+/// Parent directories are created on the first save; a missing or
+/// unreadable cache file starts the cycle from an empty cache
+/// (identical to the corrupted-cache recovery contract on
+/// [`Cache::load`]).
+///
+/// Hard contract: never panics, never returns an error type —
+/// same as [`discover`].
+pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<DiscoveryEntry> {
+    let mut cache = Cache::load(cache_path).unwrap_or_default();
 
     let mut out: Vec<DiscoveryEntry> = Vec::new();
     for dir in paths {
@@ -180,7 +210,7 @@ pub fn discover(paths: &[PathBuf]) -> Vec<DiscoveryEntry> {
     // a fully-cached, stable codec directory now skip the atomic
     // rewrite entirely.
     if cache.is_dirty() {
-        let _ = cache.save_atomic(&cache_path);
+        let _ = cache.save_atomic(cache_path);
     }
     out
 }
@@ -338,6 +368,76 @@ mod tests {
         assert!(is_codec_candidate(&dll));
         assert!(is_codec_candidate(&ax));
         assert!(!is_codec_candidate(&txt));
+    }
+
+    // ── Round 401: discover_with_cache — hermetic cache-file entry ──
+
+    #[test]
+    fn discover_with_cache_writes_cache_at_given_path() {
+        // The explicit-cache entry point must confine ALL cache
+        // I/O to the path the caller supplied — the whole point of
+        // the hermetic variant. One probe miss → dirty cache →
+        // save lands exactly at `cache_path` (parent dirs created
+        // on the way).
+        let tmp = Tmp::new("withcache-write");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        fs::write(codec_dir.join("synth.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("state").join("disc.json");
+        assert!(!cache_path.exists());
+
+        let v1 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert_eq!(v1.len(), 1);
+        assert_eq!(v1[0].kind, Kind::Unsupported);
+        assert!(
+            cache_path.is_file(),
+            "cache written at the caller-supplied path (parent dir auto-created)",
+        );
+
+        // Second cycle against the same explicit cache: pure hit,
+        // identical entries.
+        let v2 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert_eq!(v2, v1, "second call hits the hermetic cache");
+    }
+
+    #[test]
+    fn discover_with_cache_missing_cache_file_and_empty_dir_writes_nothing() {
+        // Zero candidates + no pre-existing cache → the cache
+        // stays clean and the no-op-save skip (round 204) must
+        // hold for the explicit-path variant too: no file is
+        // created at `cache_path`.
+        let tmp = Tmp::new("withcache-noop");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert!(v.is_empty());
+        assert!(
+            !cache_path.exists(),
+            "steady-state no-op cycle creates no cache file",
+        );
+    }
+
+    #[test]
+    fn discover_delegates_to_with_cache_shape() {
+        // `discover` is documented as exactly
+        // `discover_with_cache(paths, &cache_file_path())`. We
+        // can't hermetically assert on the default cache path from
+        // a unit test (it's the user's real cache), but we CAN pin
+        // that both functions classify the same directory
+        // identically — the walk/probe halves share one body.
+        let tmp = Tmp::new("withcache-delegate");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        fs::write(codec_dir.join("synth.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let via_explicit = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        let via_default = discover(&[codec_dir]);
+        assert_eq!(via_explicit.len(), via_default.len());
+        assert_eq!(via_explicit[0].kind, via_default[0].kind);
+        assert_eq!(via_explicit[0].path, via_default[0].path);
     }
 
     // ── Round 217: triple-equality contract for the staleness check ─

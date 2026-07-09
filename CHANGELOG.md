@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`discovery::discover_with_cache(paths, cache_path)` — hermetic
+  explicit-cache discovery entry point (round 401).** `discover()`
+  always read and wrote the platform-default cache file
+  (`~/.cache/oxideav/vfw-discovery.json` or the `XDG_CACHE_HOME` /
+  `LOCALAPPDATA` equivalents), so a consumer that owns its own state
+  directory — or a test binary that must not race the developer's
+  real cache across parallel test processes — had to redirect the
+  cache through environment variables, which are process-global and
+  unsafe to mutate under a threaded test runner. The new function
+  runs the identical walk / probe / cache cycle against a
+  caller-supplied cache **file** path (parent directories created on
+  first save; missing/corrupt file starts empty per the round-189
+  recovery contract). `discover(paths)` is now exactly
+  `discover_with_cache(paths, &cache_file_path())` — no behaviour
+  change on the default path. Three unit tests pin the hermetic
+  write location, the round-204 no-op-save skip on the explicit
+  path, and the delegate relationship.
+
 - **Encoder knob-key vocabulary constants + unrecognized-key
   advisory helper (round 258).** Round 257 gave callers the
   *positive* query view of the encoder's option surface
