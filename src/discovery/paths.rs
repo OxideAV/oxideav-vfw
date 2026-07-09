@@ -104,8 +104,55 @@ fn parse_path_list(value: &std::ffi::OsStr) -> Vec<PathBuf> {
     s.split(PATH_SEP)
         .map(|s| s.trim_matches(|c: char| c.is_ascii_whitespace()))
         .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+        .map(expand_leading_tilde)
         .collect()
+}
+
+/// Expand a leading `~` in a single path component to the user's
+/// home directory (round 401).
+///
+/// Env vars set outside a shell (`.env` files, systemd
+/// `Environment=` lines, container manifests) never get shell
+/// tilde expansion, so `OXIDEAV_VFW_CODEC_PATH=~/codecs` used to
+/// resolve to a literal `./~/codecs` — an unreadable directory
+/// that discovery skipped silently, giving the user no signal at
+/// all. Expansion is deliberately narrow:
+///
+/// - a bare `~`, or a leading `~/` (also `~\` on Windows), maps
+///   to the home directory (`HOME` on UNIX, `USERPROFILE` on
+///   Windows);
+/// - `~user` forms are NOT expanded (no passwd lookup — same
+///   restriction most non-shell tooling applies);
+/// - a `~` anywhere else in the component is untouched (`/a/~b`
+///   is a legitimate file name);
+/// - if the home env var is unset the component passes through
+///   verbatim, preserving the pre-r401 behaviour.
+fn expand_leading_tilde(component: &str) -> PathBuf {
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    expand_leading_tilde_with(component, env::var_os(home_var))
+}
+
+/// Pure core of [`expand_leading_tilde`] — `home` is the value of
+/// the platform home env var, threaded as a parameter so unit
+/// tests can exercise every branch without mutating process-global
+/// environment (test binaries run multi-threaded; a transiently
+/// unset `HOME` would race sibling tests that resolve the default
+/// cache dir).
+fn expand_leading_tilde_with(component: &str, home: Option<std::ffi::OsString>) -> PathBuf {
+    let rest = if component == "~" {
+        Some("")
+    } else if let Some(r) = component.strip_prefix("~/") {
+        Some(r)
+    } else if cfg!(windows) {
+        component.strip_prefix("~\\")
+    } else {
+        None
+    };
+    match (rest, home) {
+        (Some(""), Some(home)) => PathBuf::from(home),
+        (Some(r), Some(home)) => PathBuf::from(home).join(r),
+        _ => PathBuf::from(component),
+    }
 }
 
 /// Resolve the on-disk JSON cache file location.
@@ -131,7 +178,10 @@ pub fn cache_file_path() -> PathBuf {
         let s = over.to_string_lossy();
         let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            // Same leading-tilde expansion as the codec path list
+            // (round 401) — `.env` / systemd / container manifests
+            // don't run shell expansion.
+            return expand_leading_tilde(trimmed);
         }
     }
     if let Some(p) = platform_cache_dir() {
@@ -310,6 +360,103 @@ mod tests {
         assert_eq!(
             p.file_name().and_then(|s| s.to_str()),
             Some("vfw-discovery.json")
+        );
+    }
+
+    // ── Round 401: leading-tilde expansion ──────────────────────
+    //
+    // The pure core (`expand_leading_tilde_with`) takes the home
+    // value as a parameter, so every branch is testable WITHOUT
+    // mutating the process-global `HOME` / `USERPROFILE` — a
+    // transiently unset home var would race sibling tests (test
+    // binaries run multi-threaded) that resolve the default cache
+    // directory through the same variable.
+
+    fn fake_home() -> Option<OsString> {
+        Some(OsString::from("/home/vfwtest"))
+    }
+
+    #[test]
+    fn tilde_slash_component_expands_to_home() {
+        assert_eq!(
+            expand_leading_tilde_with("~/codecs", fake_home()),
+            PathBuf::from("/home/vfwtest/codecs"),
+        );
+    }
+
+    #[test]
+    fn bare_tilde_component_expands_to_home() {
+        assert_eq!(
+            expand_leading_tilde_with("~", fake_home()),
+            PathBuf::from("/home/vfwtest"),
+        );
+    }
+
+    #[test]
+    fn tilde_user_form_is_not_expanded() {
+        // No passwd lookup — `~alice/codecs` passes through
+        // verbatim, same restriction most non-shell tooling applies.
+        assert_eq!(
+            expand_leading_tilde_with("~alice/codecs", fake_home()),
+            PathBuf::from("~alice/codecs"),
+        );
+    }
+
+    #[test]
+    fn interior_tilde_is_not_expanded() {
+        // `~` is a legitimate file-name character anywhere but the
+        // leading position.
+        assert_eq!(
+            expand_leading_tilde_with("/a/~b/c", fake_home()),
+            PathBuf::from("/a/~b/c"),
+        );
+    }
+
+    #[test]
+    fn tilde_with_home_unset_passes_through_verbatim() {
+        // No home to expand against → pre-r401 behaviour preserved.
+        assert_eq!(
+            expand_leading_tilde_with("~/codecs", None),
+            PathBuf::from("~/codecs"),
+        );
+        assert_eq!(expand_leading_tilde_with("~", None), PathBuf::from("~"));
+    }
+
+    #[test]
+    fn parse_path_list_expands_tilde_using_real_home() {
+        // End-to-end through `parse_path_list` against the REAL
+        // home var (read, never mutated). Skips silently on the
+        // pathological no-home box — the pure-core tests above
+        // still cover the logic there.
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let Some(home) = env::var_os(home_var) else {
+            return;
+        };
+        let s = OsString::from(format!("  ~/r401-codecs \n{PATH_SEP}/abs/dir"));
+        let v = parse_path_list(&s);
+        assert_eq!(
+            v,
+            vec![
+                PathBuf::from(&home).join("r401-codecs"),
+                PathBuf::from("/abs/dir"),
+            ],
+            "strip-then-expand composes; second component untouched",
+        );
+    }
+
+    #[test]
+    fn cache_path_override_expands_leading_tilde() {
+        // Only the (already-serialised) cache override var is
+        // mutated; home is read, never touched.
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let Some(home) = env::var_os(home_var) else {
+            return;
+        };
+        let _serial = env_lock();
+        let _guard = CacheEnvGuard::set("~/state/vfw-cache.json");
+        assert_eq!(
+            cache_file_path(),
+            PathBuf::from(&home).join("state").join("vfw-cache.json"),
         );
     }
 

@@ -90,6 +90,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Leading-`~` expansion in `OXIDEAV_VFW_CODEC_PATH` and
+  `OXIDEAV_VFW_CACHE_PATH` (round 401).** Env vars set outside a
+  shell (`.env` files, systemd `Environment=` lines, container
+  manifests) never get tilde expansion, so `~/codecs` resolved to a
+  literal `./~/codecs` — an unreadable directory discovery skipped
+  with no signal. After the round-211 whitespace strip, a bare `~`
+  or leading `~/` (also `~\` on Windows) now expands to `HOME` /
+  `USERPROFILE`. Deliberately narrow: `~user` forms are not
+  expanded (no passwd lookup), an interior `~` is untouched, and
+  with no home var set the component passes through verbatim. The
+  expansion core is a pure function taking the home value as a
+  parameter, so all branches are unit-tested without mutating the
+  process-global home var (which would race parallel tests). Seven
+  new tests.
+
 - **`OXIDEAV_VFW_CACHE_PATH` — explicit cache-file override
   (round 401).** The discovery cache location was only steerable
   through `XDG_CACHE_HOME` / `LOCALAPPDATA`, which redirect the

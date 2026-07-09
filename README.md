@@ -75,6 +75,20 @@ paths. Interior whitespace inside a path (`~/Library/Application
 Support/...`, `C:\Program Files\...`) is preserved untouched —
 the strip is `trim_matches`, not a global `replace`.
 
+After the strip, a **leading `~`** in a component (bare `~`, or
+`~/rest`; also `~\rest` on Windows) expands to the home directory
+(`HOME` / `USERPROFILE`) — `.env` files, systemd units, and
+container manifests never run shell tilde expansion, so
+`OXIDEAV_VFW_CODEC_PATH=~/codecs` used to resolve to a literal
+(unreadable) `./~/codecs`. `~user` forms are not expanded, an
+interior `~` is untouched, and with no home var set the component
+passes through verbatim. The same expansion applies to
+`OXIDEAV_VFW_CACHE_PATH`. Duplicate components (component-wise
+path equality, so a trailing separator doesn't count as different)
+are walked once, in first-occurrence order; within each directory,
+candidates are probed and registered in lexical path order, so a
+given codec-dir layout always yields the same registration order.
+
 Results are cached at:
 
 - `OXIDEAV_VFW_CACHE_PATH=<file>` (if set) — an explicit cache
