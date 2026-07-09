@@ -167,11 +167,27 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
                 continue;
             }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_codec_candidate(&path) {
-                continue;
-            }
+        // Deterministic walk order (round 401): `fs::read_dir`
+        // yields entries in filesystem-internal order (inode /
+        // B-tree / hash order depending on the FS), which varies
+        // between machines and even between runs after a file is
+        // rewritten. Registration order — and therefore which DLL
+        // wins when two codecs in the same directory claim the
+        // same FourCC at equal priority — used to inherit that
+        // nondeterminism. Sort candidates by path within each
+        // directory so a given codec-dir layout always produces
+        // the same DiscoveryEntry order, the same registration
+        // order, and the same cache-row order. Directories
+        // themselves are walked in caller order (the configured
+        // path-list order is meaningful: earlier roots register
+        // first).
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_codec_candidate(p))
+            .collect();
+        candidates.sort();
+        for path in candidates {
             let (mtime, size) = match file_meta(&path) {
                 Some(m) => m,
                 None => continue,
@@ -438,6 +454,62 @@ mod tests {
         assert_eq!(via_explicit.len(), via_default.len());
         assert_eq!(via_explicit[0].kind, via_default[0].kind);
         assert_eq!(via_explicit[0].path, via_default[0].path);
+    }
+
+    // ── Round 401: deterministic walk order ─────────────────────
+
+    #[test]
+    fn discover_orders_candidates_by_path_within_directory() {
+        // Creation order is deliberately shuffled relative to the
+        // lexical order; the walk must return lexical (path) order
+        // regardless of what `fs::read_dir` yields. This is the
+        // determinism guarantee: same directory layout → same
+        // DiscoveryEntry order → same registration order.
+        let tmp = Tmp::new("det-order");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        for name in ["cc.dll", "aa.dll", "bb.ax", "zz.txt"] {
+            fs::write(codec_dir.join(name), b"not a PE32 file").unwrap();
+        }
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        let names: Vec<_> = v
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["aa.dll", "bb.ax", "cc.dll"],
+            "candidates sorted by path; non-candidates (zz.txt) excluded",
+        );
+
+        // Second cycle (all cache hits) preserves the same order —
+        // ordering must not depend on hit-vs-miss.
+        let v2 = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert_eq!(v2, v, "cache-hit cycle returns the identical ordered list");
+    }
+
+    #[test]
+    fn discover_walks_directories_in_caller_order() {
+        // Root order is meaningful (earlier roots register first, so
+        // they win FourCC ties at equal priority) — only the files
+        // WITHIN a root are sorted. Give root2 a lexically-smaller
+        // file than root1's and confirm root1's entries still come
+        // first.
+        let tmp = Tmp::new("det-roots");
+        let root1 = tmp.path().join("r1");
+        let root2 = tmp.path().join("r2");
+        fs::create_dir_all(&root1).unwrap();
+        fs::create_dir_all(&root2).unwrap();
+        fs::write(root1.join("zz.dll"), b"not a PE32 file").unwrap();
+        fs::write(root2.join("aa.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(&[root1.clone(), root2.clone()], &cache_path);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].path, root1.join("zz.dll"), "first root first");
+        assert_eq!(v[1].path, root2.join("aa.dll"), "second root second");
     }
 
     // ── Round 217: triple-equality contract for the staleness check ─

@@ -8,6 +8,18 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Deterministic discovery walk order (round 401).** `discover` /
+  `discover_with_cache` used to process candidates in raw
+  `fs::read_dir` order — filesystem-internal (inode / B-tree / hash)
+  order that varies between machines and runs. Registration order,
+  and therefore which DLL wins when two codecs in one directory claim
+  the same FourCC at equal priority, inherited that nondeterminism.
+  Candidates are now sorted by path within each directory; the
+  directories themselves keep caller order (the configured path-list
+  order stays meaningful — earlier roots register first). Two unit
+  tests pin the within-directory lexical order (including across
+  cache-hit cycles) and the roots-in-caller-order rule.
+
 - **`discovery::discover_with_cache(paths, cache_path)` — hermetic
   explicit-cache discovery entry point (round 401).** `discover()`
   always read and wrote the platform-default cache file
