@@ -188,16 +188,21 @@ impl Cache {
                 // path on the next `save_atomic` heal it.
                 return None;
             }
+            let (entries, removed) = dedupe_rows_keep_last(env.entries);
             // The on-disk shape already matches what we'd write —
-            // clean by construction (round 204).
+            // clean by construction (round 204) — UNLESS the file
+            // carried duplicate-path rows (round 401): then the
+            // deduped in-memory state diverges and the next save
+            // must fire to rewrite the file without the zombies.
             return Some(Cache {
-                entries: env.entries,
-                dirty: Cell::new(false),
+                entries,
+                dirty: Cell::new(removed > 0),
             });
         }
         // Legacy bare-array fallback — covers caches written by
         // rounds 28..189 (no envelope, no version field).
         let entries: Vec<CacheEntry> = serde_json::from_slice(&data).ok()?;
+        let (entries, _) = dedupe_rows_keep_last(entries);
         // Round 204: legacy bare-array shape is loadable but its
         // on-disk representation differs from what we'd write now.
         // Mark dirty so the next `save_atomic` actually fires and
@@ -399,6 +404,35 @@ impl Cache {
 
 fn io_err(e: serde_json::Error) -> std::io::Error {
     std::io::Error::other(e)
+}
+
+/// Collapse duplicate-path rows, keeping the **last** occurrence
+/// of each path (round 401). Returns the deduped rows plus the
+/// number removed.
+///
+/// The cache table is keyed by absolute path — [`Cache::upsert`]
+/// replaces in place, so this crate never *writes* duplicates. But
+/// a hand-edited file, a bad merge of two caches, or an external
+/// tool appending rows can produce them, and they were previously
+/// loaded verbatim: `upsert` then replaced only the FIRST matching
+/// row, leaving the later duplicate as a zombie that the
+/// vanished-row prune could never remove (its file still exists,
+/// so it always counts as seen). Keep-last matches the "later
+/// entry is the most recently written" convention of every
+/// append-shaped producer; the survivor keeps the last
+/// occurrence's position so relative order among distinct paths
+/// is preserved.
+fn dedupe_rows_keep_last(rows: Vec<CacheEntry>) -> (Vec<CacheEntry>, usize) {
+    let before = rows.len();
+    let mut out: Vec<CacheEntry> = Vec::with_capacity(before);
+    for row in rows {
+        if let Some(pos) = out.iter().position(|e| e.path == row.path) {
+            out.remove(pos);
+        }
+        out.push(row);
+    }
+    let removed = before - out.len();
+    (out, removed)
 }
 
 /// Build a tempfile path next to `target` for an atomic write.
@@ -810,6 +844,102 @@ mod tests {
         let healed = Cache::load_or_heal(&path);
         assert_eq!(healed.len(), 1);
         assert!(!healed.is_dirty());
+    }
+
+    // ── Round 401: duplicate-path row dedupe on load ────────────
+
+    /// Serialise a versioned envelope holding `rows` verbatim —
+    /// bypassing `save_atomic` (which can't produce duplicates) to
+    /// simulate a hand-edited / badly-merged cache file.
+    fn write_envelope_raw(path: &Path, rows: &[CacheEntry]) {
+        let env = serde_json::json!({
+            "version": CURRENT_SCHEMA_VERSION,
+            "entries": rows,
+        });
+        fs::write(path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn load_dedupes_duplicate_path_rows_keeping_last() {
+        // Two rows for one path (older mtime first, newer second):
+        // the newer row must win, the cache must load dirty so the
+        // next save rewrites the file without the zombie.
+        let tmp = Tmp::new("dedupe-load");
+        let path = tmp.path().join("dup.json");
+        let mut older = CacheEntry::from_entry(&sample_entry(Path::new("/abs/dup.dll"), Kind::Vfw));
+        older.mtime_unix = 1_600_000_000;
+        let newer = CacheEntry::from_entry(&sample_entry(Path::new("/abs/dup.dll"), Kind::Vfw));
+        write_envelope_raw(&path, &[older, newer]);
+
+        let loaded = Cache::load(&path).expect("envelope loads");
+        assert_eq!(loaded.len(), 1, "duplicate collapsed");
+        assert!(
+            loaded
+                .lookup(Path::new("/abs/dup.dll"), 1_700_000_000, 524_288)
+                .is_some(),
+            "the LAST (newer) row survives",
+        );
+        assert!(
+            loaded
+                .lookup(Path::new("/abs/dup.dll"), 1_600_000_000, 524_288)
+                .is_none(),
+            "the earlier duplicate is gone",
+        );
+        assert!(
+            loaded.is_dirty(),
+            "deduped state diverges from disk → next save must fire",
+        );
+    }
+
+    #[test]
+    fn load_dedupe_preserves_distinct_paths_and_stays_clean() {
+        // No duplicates → no behaviour change: all rows load, cache
+        // starts clean (round-204 no-op-skip intact).
+        let tmp = Tmp::new("dedupe-clean");
+        let path = tmp.path().join("ok.json");
+        let a = CacheEntry::from_entry(&sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
+        let b = CacheEntry::from_entry(&sample_entry(Path::new("/abs/b.ax"), Kind::DirectShow));
+        write_envelope_raw(&path, &[a, b]);
+
+        let loaded = Cache::load(&path).expect("envelope loads");
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded.is_dirty(), "distinct rows load clean");
+    }
+
+    #[test]
+    fn save_after_dedupe_writes_single_row() {
+        // End-to-end: duplicate file → load → save → the on-disk
+        // envelope now holds exactly one row for the path.
+        let tmp = Tmp::new("dedupe-heal");
+        let path = tmp.path().join("dup.json");
+        let row = CacheEntry::from_entry(&sample_entry(Path::new("/abs/dup.dll"), Kind::Vfw));
+        write_envelope_raw(&path, &[row.clone(), row]);
+
+        let loaded = Cache::load(&path).unwrap();
+        loaded.save_atomic(&path).unwrap();
+
+        let post: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            post.get("entries").and_then(|e| e.as_array()).map(Vec::len),
+            Some(1),
+            "rewritten file carries the deduped single row",
+        );
+    }
+
+    #[test]
+    fn legacy_bare_array_with_duplicates_also_dedupes() {
+        // The pre-r197 shape takes the same dedupe path (it's
+        // already dirty by definition, so only the row count needs
+        // pinning).
+        let tmp = Tmp::new("dedupe-legacy");
+        let path = tmp.path().join("legacy.json");
+        let row = CacheEntry::from_entry(&sample_entry(Path::new("/abs/dup.dll"), Kind::Vfw));
+        let rows = vec![row.clone(), row];
+        fs::write(&path, serde_json::to_vec_pretty(&rows).unwrap()).unwrap();
+
+        let loaded = Cache::load(&path).expect("legacy loads");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.is_dirty());
     }
 
     // ── Round 401: failed-save tempfile cleanup ─────────────────

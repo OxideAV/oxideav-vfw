@@ -8,6 +8,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Duplicate-path cache rows are collapsed on load (round 401).**
+  The cache table is keyed by absolute path and `Cache::upsert`
+  replaces in place, so this crate never writes duplicates — but a
+  hand-edited file, a bad merge of two caches, or an external tool
+  appending rows could produce them, and they loaded verbatim.
+  `upsert` then replaced only the first matching row, leaving the
+  later duplicate as a zombie the vanished-row prune could never
+  remove (its file still exists, so it always counts as seen).
+  `Cache::load` now keeps the **last** occurrence of each path
+  (matching the "later entry is most recent" convention of every
+  append-shaped producer), preserving relative order among distinct
+  paths, and marks the cache dirty so the next save rewrites the
+  file deduped. Duplicate-free files load clean — the round-204
+  no-op-save skip is untouched. Four unit tests (keep-last +
+  dirty, distinct-rows-stay-clean, save-rewrites-single-row,
+  legacy bare-array shape).
+
 - **Failed atomic cache saves no longer strand tempfiles
   (round 401).** `Cache::save_atomic` writes a
   `vfw-discovery.json.tmp.<pid>.<nanos>` sibling and renames it
