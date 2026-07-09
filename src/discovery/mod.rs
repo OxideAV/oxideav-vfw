@@ -154,7 +154,12 @@ pub fn discover(paths: &[PathBuf]) -> Vec<DiscoveryEntry> {
 /// Hard contract: never panics, never returns an error type —
 /// same as [`discover`].
 pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<DiscoveryEntry> {
-    let mut cache = Cache::load(cache_path).unwrap_or_default();
+    // `load_or_heal` (round 401): an existing-but-corrupt cache
+    // file starts the cycle empty AND dirty, so the save below
+    // rewrites it even when the walk itself makes no mutations —
+    // pre-r401 a corrupt cache next to an empty codec directory
+    // was never healed (nothing flipped the dirty flag).
+    let mut cache = Cache::load_or_heal(cache_path);
 
     let mut out: Vec<DiscoveryEntry> = Vec::new();
     // Duplicate-root dedupe (round 401): a directory listed twice
@@ -684,6 +689,58 @@ mod tests {
             1,
             "rows under an unreadable root survive the cycle",
         );
+    }
+
+    // ── Round 401: corrupt-cache heal on zero-probe cycles ──────
+
+    #[test]
+    fn corrupt_cache_healed_even_when_directory_is_empty() {
+        // The round-189 heal contract ("corrupted cache is
+        // re-probed and overwritten on the next call") used to
+        // depend on the walk producing at least one upsert.
+        // Against an EMPTY codec directory nothing flipped the
+        // dirty flag and the corrupt file survived forever.
+        // load_or_heal closes the hole: existing-but-corrupt →
+        // dirty → the save fires and writes a valid empty envelope.
+        let tmp = Tmp::new("heal-e2e");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        let cache_path = tmp.path().join("disc.json");
+        fs::write(&cache_path, b"{corrupt garbage,,,").unwrap();
+
+        let v = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert!(v.is_empty());
+
+        let post = fs::read(&cache_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&post).expect("corrupt cache healed to valid JSON");
+        assert_eq!(
+            parsed.get("version").and_then(|v| v.as_u64()),
+            Some(CURRENT_SCHEMA_VERSION as u64),
+            "healed file carries the current envelope",
+        );
+        assert_eq!(
+            parsed
+                .get("entries")
+                .and_then(|e| e.as_array())
+                .map(Vec::len),
+            Some(0),
+            "healed envelope is empty (nothing was discovered)",
+        );
+    }
+
+    #[test]
+    fn missing_cache_file_stays_missing_on_zero_probe_cycle() {
+        // The heal must not regress the no-op contract: a MISSING
+        // cache file plus an empty directory still writes nothing.
+        let tmp = Tmp::new("heal-noop");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(std::slice::from_ref(&codec_dir), &cache_path);
+        assert!(v.is_empty());
+        assert!(!cache_path.exists(), "no heal-write for a missing file");
     }
 
     // ── Round 217: triple-equality contract for the staleness check ─

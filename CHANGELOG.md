@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Corrupt cache files are now healed even by zero-probe cycles
+  (round 401).** The round-189 heal contract ("a corrupted cache is
+  re-probed and overwritten on the next call") silently depended on
+  the walk producing at least one upsert: `Cache::load(..)
+  .unwrap_or_default()` lost the existed-but-corrupt signal, so
+  against an empty codec directory the round-204 no-op-save skip
+  held and the corrupt file survived every subsequent `register()`
+  call. New `Cache::load_or_heal(path)` distinguishes the three
+  cases — parseable file (normal load, clean), existing-but-
+  unparseable file (empty cache marked dirty, so the save fires and
+  heals it), and missing file (clean empty; a cycle that discovers
+  nothing still writes nothing). `discover` / `discover_with_cache`
+  route through it. Four cache-unit tests plus two end-to-end tests
+  (corrupt-file-plus-empty-dir heals to a valid empty envelope;
+  missing-file no-op contract preserved).
+
 - **Cache rows for deleted DLLs are now pruned (round 401).** The
   discovery cache only ever grew: a DLL removed from a codec
   directory left its row in `vfw-discovery.json` forever (every

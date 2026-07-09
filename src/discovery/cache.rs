@@ -210,6 +210,35 @@ impl Cache {
         })
     }
 
+    /// [`Cache::load`] with an explicit heal marker for corrupt
+    /// files (round 401).
+    ///
+    /// - File parses (envelope at the current version, or the
+    ///   legacy bare array): behaves exactly like `load`.
+    /// - File **exists but doesn't parse** (corrupted JSON,
+    ///   zero-byte truncation, unknown envelope version,
+    ///   unreadable): returns an empty cache marked **dirty**, so
+    ///   the next [`save_atomic`](Cache::save_atomic) overwrites
+    ///   the bad file even when the discovery cycle itself makes
+    ///   no mutations. Pre-r401, `load(..).unwrap_or_default()`
+    ///   lost the existed-but-corrupt signal: against an empty (or
+    ///   all-`Unsupported`-free) codec directory nothing flipped
+    ///   the dirty flag, the round-204 no-op-skip held, and the
+    ///   corrupt file survived every subsequent `register()` call
+    ///   instead of being healed as the module docs promise.
+    /// - File is simply **missing**: clean empty cache (no file is
+    ///   created by a cycle that discovers nothing — the no-op
+    ///   contract stands).
+    pub fn load_or_heal(path: &Path) -> Self {
+        match Self::load(path) {
+            Some(c) => c,
+            None => Cache {
+                entries: Vec::new(),
+                dirty: Cell::new(path.exists()),
+            },
+        }
+    }
+
     /// Look up by `(path, mtime, size)`. Stale entries (mtime or
     /// size mismatch) return `None`.
     ///
@@ -710,6 +739,61 @@ mod tests {
         assert!(c
             .lookup(Path::new("/abs/x.dll"), 1_700_000_000, 999_999)
             .is_none());
+    }
+
+    // ── Round 401: load_or_heal — corrupt-file heal marker ──────
+
+    #[test]
+    fn load_or_heal_missing_file_is_clean_empty() {
+        // No file → nothing to heal; the cycle must stay zero-write
+        // if it discovers nothing.
+        let tmp = Tmp::new("heal-missing");
+        let c = Cache::load_or_heal(&tmp.path().join("absent.json"));
+        assert!(c.is_empty());
+        assert!(!c.is_dirty(), "missing file must not force a write");
+    }
+
+    #[test]
+    fn load_or_heal_corrupt_file_is_empty_and_dirty() {
+        // Existing-but-unparseable → empty cache that WANTS a
+        // rewrite, so the heal fires even on a zero-probe cycle.
+        let tmp = Tmp::new("heal-corrupt");
+        let path = tmp.path().join("bad.json");
+        fs::write(&path, b"{definitely not json").unwrap();
+        let c = Cache::load_or_heal(&path);
+        assert!(c.is_empty());
+        assert!(c.is_dirty(), "corrupt file marks the cache for healing");
+    }
+
+    #[test]
+    fn load_or_heal_unknown_version_is_empty_and_dirty() {
+        // Unknown envelope version is refused by `load`; through
+        // `load_or_heal` it takes the same heal path as corruption.
+        let tmp = Tmp::new("heal-version");
+        let path = tmp.path().join("future.json");
+        let future = serde_json::json!({
+            "version": CURRENT_SCHEMA_VERSION + 7,
+            "entries": [],
+        });
+        fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        let c = Cache::load_or_heal(&path);
+        assert!(c.is_empty());
+        assert!(c.is_dirty());
+    }
+
+    #[test]
+    fn load_or_heal_valid_envelope_matches_load() {
+        // The happy path is byte-for-byte `load`: entries come
+        // back, cache starts clean.
+        let tmp = Tmp::new("heal-valid");
+        let path = tmp.path().join("ok.json");
+        let mut c = Cache::default();
+        c.upsert(sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
+        c.save_atomic(&path).unwrap();
+
+        let healed = Cache::load_or_heal(&path);
+        assert_eq!(healed.len(), 1);
+        assert!(!healed.is_dirty());
     }
 
     // ── Round 401: vanished-row prune ───────────────────────────
