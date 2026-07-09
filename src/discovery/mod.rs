@@ -157,7 +157,26 @@ pub fn discover_with_cache(paths: &[PathBuf], cache_path: &Path) -> Vec<Discover
     let mut cache = Cache::load(cache_path).unwrap_or_default();
 
     let mut out: Vec<DiscoveryEntry> = Vec::new();
+    // Duplicate-root dedupe (round 401): a directory listed twice
+    // (an `OXIDEAV_VFW_CODEC_PATH` with a repeated component — easy
+    // to produce when a deploy script appends the same default dir
+    // a config file already names) used to be walked twice. The
+    // first pass probed and cached each DLL, the second pass
+    // cache-hit the same rows, and every codec came back — and got
+    // REGISTERED — twice. Walk each distinct root once, keeping
+    // first-occurrence order. Comparison is by `Path` equality
+    // (component-wise, so a trailing separator doesn't defeat it);
+    // two different spellings of one directory via symlinks are
+    // still walked twice — we deliberately don't canonicalise,
+    // because that would also rewrite the paths users see in logs
+    // and cache keys.
+    let mut walked: Vec<&Path> = Vec::with_capacity(paths.len());
     for dir in paths {
+        if walked.contains(&dir.as_path()) {
+            log::debug!("vfw discovery: skipping duplicate root {:?}", dir);
+            continue;
+        }
+        walked.push(dir.as_path());
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => {
@@ -510,6 +529,58 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].path, root1.join("zz.dll"), "first root first");
         assert_eq!(v[1].path, root2.join("aa.dll"), "second root second");
+    }
+
+    // ── Round 401: duplicate-root dedupe ────────────────────────
+
+    #[test]
+    fn discover_walks_duplicate_root_once() {
+        // The same directory listed twice must yield each codec
+        // once, not twice — pre-r401 the second pass cache-hit the
+        // same rows and double-registered every FourCC.
+        let tmp = Tmp::new("dup-root");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        fs::write(codec_dir.join("synth.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(&[codec_dir.clone(), codec_dir.clone()], &cache_path);
+        assert_eq!(v.len(), 1, "duplicate root walked once");
+        assert_eq!(v[0].path, codec_dir.join("synth.dll"));
+    }
+
+    #[test]
+    fn discover_dedupes_root_with_trailing_separator_spelling() {
+        // `Path` equality is component-wise, so `/dir` and `/dir/`
+        // are the same root. A path list that mixes the two
+        // spellings must still walk once.
+        let tmp = Tmp::new("dup-root-sep");
+        let codec_dir = tmp.path().join("codecs");
+        fs::create_dir_all(&codec_dir).unwrap();
+        fs::write(codec_dir.join("synth.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let mut with_sep = codec_dir.as_os_str().to_owned();
+        with_sep.push(std::path::MAIN_SEPARATOR.to_string());
+        let v = discover_with_cache(&[codec_dir.clone(), PathBuf::from(with_sep)], &cache_path);
+        assert_eq!(v.len(), 1, "trailing-separator spelling deduped");
+    }
+
+    #[test]
+    fn discover_distinct_roots_both_walked() {
+        // Dedupe must not over-trigger: two genuinely different
+        // directories both contribute their candidates.
+        let tmp = Tmp::new("dup-root-distinct");
+        let r1 = tmp.path().join("r1");
+        let r2 = tmp.path().join("r2");
+        fs::create_dir_all(&r1).unwrap();
+        fs::create_dir_all(&r2).unwrap();
+        fs::write(r1.join("a.dll"), b"not a PE32 file").unwrap();
+        fs::write(r2.join("b.dll"), b"not a PE32 file").unwrap();
+        let cache_path = tmp.path().join("disc.json");
+
+        let v = discover_with_cache(&[r1, r2], &cache_path);
+        assert_eq!(v.len(), 2, "distinct roots each walked");
     }
 
     // ── Round 217: triple-equality contract for the staleness check ─

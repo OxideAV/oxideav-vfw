@@ -6,6 +6,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Duplicate discovery roots no longer double-register codecs
+  (round 401).** A directory listed twice in
+  `OXIDEAV_VFW_CODEC_PATH` (easy to produce when a deploy script
+  appends the same default dir a config file already names) was
+  walked twice: the first pass probed and cached each DLL, the
+  second pass cache-hit the same rows, and every FourCC was
+  registered twice. `discover` / `discover_with_cache` now walk
+  each distinct root once, keeping first-occurrence order.
+  Comparison is component-wise `Path` equality (a trailing
+  separator doesn't defeat the dedupe); symlinked spellings are
+  deliberately not canonicalised, so they remain distinct roots.
+  Three unit tests pin the dedupe, the trailing-separator
+  spelling, and the distinct-roots-both-walked negative.
+
 ### Added
 
 - **Deterministic discovery walk order (round 401).** `discover` /
