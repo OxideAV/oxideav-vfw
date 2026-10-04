@@ -204,7 +204,7 @@ Downstream code that historically wrote `oxideav_vfw::Sandbox` /
 `oxideav_vfw::Guid` / `oxideav_vfw::Bih` / etc. continues to
 compile via re-exports:
 
-```rust
+```rust,ignore
 pub use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
 pub use ud_emulator::com::{Guid, IID_IBASEFILTER, /* … */};
 pub use ud_emulator::win32::vfw32::Bih;
