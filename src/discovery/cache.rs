@@ -34,8 +34,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::probe::Kind;
 use super::DiscoveryEntry;
+use super::probe::Kind;
 
 /// On-disk schema version stamped into every save. Bumped when the
 /// shape of [`CacheEntry`] changes in a way that would silently
@@ -486,18 +486,20 @@ mod tests {
         let mut c = Cache::default();
         c.upsert(sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
         // size matches but mtime is different → miss.
-        assert!(c
-            .lookup(Path::new("/abs/a.dll"), 1_700_000_001, 524_288)
-            .is_none());
+        assert!(
+            c.lookup(Path::new("/abs/a.dll"), 1_700_000_001, 524_288)
+                .is_none()
+        );
     }
 
     #[test]
     fn lookup_misses_on_size_change() {
         let mut c = Cache::default();
         c.upsert(sample_entry(Path::new("/abs/a.dll"), Kind::Vfw));
-        assert!(c
-            .lookup(Path::new("/abs/a.dll"), 1_700_000_000, 999_999)
-            .is_none());
+        assert!(
+            c.lookup(Path::new("/abs/a.dll"), 1_700_000_000, 999_999)
+                .is_none()
+        );
     }
 
     #[test]
@@ -780,15 +782,18 @@ mod tests {
         assert!(hit.is_some(), "exact triple hits");
         assert_eq!(hit.unwrap().kind, Kind::Vfw);
         // Each individual field mismatch → miss.
-        assert!(c
-            .lookup(Path::new("/abs/y.dll"), 1_700_000_000, 524_288)
-            .is_none());
-        assert!(c
-            .lookup(Path::new("/abs/x.dll"), 1_700_000_001, 524_288)
-            .is_none());
-        assert!(c
-            .lookup(Path::new("/abs/x.dll"), 1_700_000_000, 999_999)
-            .is_none());
+        assert!(
+            c.lookup(Path::new("/abs/y.dll"), 1_700_000_000, 524_288)
+                .is_none()
+        );
+        assert!(
+            c.lookup(Path::new("/abs/x.dll"), 1_700_000_001, 524_288)
+                .is_none()
+        );
+        assert!(
+            c.lookup(Path::new("/abs/x.dll"), 1_700_000_000, 999_999)
+                .is_none()
+        );
     }
 
     // ── Round 401: load_or_heal — corrupt-file heal marker ──────
@@ -1007,9 +1012,10 @@ mod tests {
         let removed = c.prune_vanished(&[Path::new("/root")], &seen);
         assert_eq!(removed, 1, "the unseen row under the walked root goes");
         assert_eq!(c.len(), 1);
-        assert!(c
-            .lookup(Path::new("/root/still.dll"), 1_700_000_000, 524_288)
-            .is_some());
+        assert!(
+            c.lookup(Path::new("/root/still.dll"), 1_700_000_000, 524_288)
+                .is_some()
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use oxideav_core::{
 
 use ud_emulator::win32::vfw32::{Bih, ICDECOMPRESS_NOTKEYFRAME};
 
-use super::probe::{fourcc_to_bytes, Kind, FCC_TYPE_VIDC};
+use super::probe::{FCC_TYPE_VIDC, Kind, fourcc_to_bytes};
 
 /// Per-codec-construction instruction budget handed to every
 /// long-lived ud-emulator [`ud_emulator::Sandbox`] this module
@@ -836,13 +836,13 @@ impl Decoder for SandboxedVfwDecoder {
 
 impl Drop for SandboxedVfwDecoder {
     fn drop(&mut self) {
-        if let Some(sb) = self.sandbox.as_mut() {
-            if self.hic != 0 {
-                if self.begin_done {
-                    let _ = sb.ic_decompress_end(self.hic);
-                }
-                let _ = sb.ic_close(self.hic);
+        if let Some(sb) = self.sandbox.as_mut()
+            && self.hic != 0
+        {
+            if self.begin_done {
+                let _ = sb.ic_decompress_end(self.hic);
             }
+            let _ = sb.ic_close(self.hic);
         }
     }
 }
@@ -1020,7 +1020,7 @@ impl SandboxedVfwEncoder {
         if frame_num == 0 {
             return true;
         }
-        self.keyint > 0 && (frame_num as u32) % self.keyint == 0
+        self.keyint > 0 && (frame_num as u32).is_multiple_of(self.keyint)
     }
 
     /// Input BIH — BI_RGB 24bpp, positive height (bottom-up storage,
@@ -1134,10 +1134,11 @@ impl SandboxedVfwEncoder {
         // codecs that don't implement GetFormat (ICERR_UNSUPPORTED)
         // fall back to our FourCC template, which most encoders
         // accept directly.
-        if let Ok((rc, out)) = sb.ic_compress_get_format(hic, &bih_in) {
-            if rc == 0 && out.bi_size >= 40 {
-                bih_out = out;
-            }
+        if let Ok((rc, out)) = sb.ic_compress_get_format(hic, &bih_in)
+            && rc == 0
+            && out.bi_size >= 40
+        {
+            bih_out = out;
         }
 
         // ICCompressQuery — does the codec accept this input→output
@@ -1204,7 +1205,7 @@ impl Encoder for SandboxedVfwEncoder {
             _ => {
                 return Err(Error::invalid(
                     "vfw discovery (encode): only video frames are encodable",
-                ))
+                ));
             }
         };
         self.ensure_open()?;
@@ -1349,13 +1350,13 @@ impl Encoder for SandboxedVfwEncoder {
 
 impl Drop for SandboxedVfwEncoder {
     fn drop(&mut self) {
-        if let Some(sb) = self.sandbox.as_mut() {
-            if self.hic != 0 {
-                if self.begin_done {
-                    let _ = sb.ic_compress_end(self.hic);
-                }
-                let _ = sb.ic_close(self.hic);
+        if let Some(sb) = self.sandbox.as_mut()
+            && self.hic != 0
+        {
+            if self.begin_done {
+                let _ = sb.ic_compress_end(self.hic);
             }
+            let _ = sb.ic_close(self.hic);
         }
     }
 }
@@ -2390,10 +2391,10 @@ fn pin_with_direction(
     // Pick the first pin matching `direction` (skipping `skip`).
     let mut chosen: Option<u32> = None;
     for &pin in &pins {
-        if let Some(s) = skip {
-            if pin == s {
-                continue;
-            }
+        if let Some(s) = skip
+            && pin == s
+        {
+            continue;
         }
         let dir_slot = sb.host.arena_alloc(4).ok()?;
         let _ = sb.mmu.write_initializer(dir_slot, &0xFFu32.to_le_bytes());

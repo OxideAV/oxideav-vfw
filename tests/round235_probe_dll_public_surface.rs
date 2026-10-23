@@ -26,7 +26,7 @@
 //!   for downstream consumers that want to log the two cases
 //!   differently.
 
-use oxideav_vfw::discovery::{probe_dll, Kind, ProbeResult};
+use oxideav_vfw::discovery::{Kind, ProbeResult, probe_dll};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

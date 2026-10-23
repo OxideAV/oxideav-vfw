@@ -260,6 +260,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- edition 2024, MSRV 1.95
 - **VfW driver-type constant deduped through a single
   `FCC_TYPE_VIDC` source of truth (round 248).** The
   `mmioFOURCC('V','I','D','C')` word that every `ICOpen` call

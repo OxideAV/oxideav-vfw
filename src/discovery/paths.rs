@@ -303,6 +303,7 @@ mod tests {
         assert_eq!(v, vec![PathBuf::from("/codec/dir")]);
     }
 
+    #[allow(unsafe_code)] // test-only env mutation, serialised by `env_lock()`
     #[test]
     fn discovery_paths_strips_whitespace_via_env_var() {
         // End-to-end: the public `discovery_paths()` honours the
@@ -311,10 +312,14 @@ mod tests {
         // the user-visible contract is on `discovery_paths`.
         let _serial = env_lock();
         let saved = env::var_os("OXIDEAV_VFW_CODEC_PATH");
-        env::set_var(
-            "OXIDEAV_VFW_CODEC_PATH",
-            format!(" /tmp/vfw-r211-a {0}\t/tmp/vfw-r211-b\n", PATH_SEP),
-        );
+        // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+        // touches this variable while the guard is held.
+        unsafe {
+            env::set_var(
+                "OXIDEAV_VFW_CODEC_PATH",
+                format!(" /tmp/vfw-r211-a {0}\t/tmp/vfw-r211-b\n", PATH_SEP),
+            )
+        };
         let paths = discovery_paths();
         assert_eq!(
             paths,
@@ -324,20 +329,29 @@ mod tests {
             ]
         );
         match saved {
-            Some(v) => env::set_var("OXIDEAV_VFW_CODEC_PATH", v),
-            None => env::remove_var("OXIDEAV_VFW_CODEC_PATH"),
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", v) },
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            None => unsafe { env::remove_var("OXIDEAV_VFW_CODEC_PATH") },
         }
     }
 
+    #[allow(unsafe_code)] // test-only env mutation, serialised by `env_lock()`
     #[test]
     fn discovery_paths_honours_override() {
         // Saved/restored manually so we don't poison sibling tests.
         let _serial = env_lock();
         let saved = env::var_os("OXIDEAV_VFW_CODEC_PATH");
-        env::set_var(
-            "OXIDEAV_VFW_CODEC_PATH",
-            format!("/dev/null{0}/tmp/nonexistent", PATH_SEP),
-        );
+        // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+        // touches this variable while the guard is held.
+        unsafe {
+            env::set_var(
+                "OXIDEAV_VFW_CODEC_PATH",
+                format!("/dev/null{0}/tmp/nonexistent", PATH_SEP),
+            )
+        };
         let paths = discovery_paths();
         assert_eq!(
             paths,
@@ -347,8 +361,12 @@ mod tests {
             ]
         );
         match saved {
-            Some(v) => env::set_var("OXIDEAV_VFW_CODEC_PATH", v),
-            None => env::remove_var("OXIDEAV_VFW_CODEC_PATH"),
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", v) },
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            None => unsafe { env::remove_var("OXIDEAV_VFW_CODEC_PATH") },
         }
     }
 
@@ -466,24 +484,34 @@ mod tests {
     /// Always take `env_lock()` first — env vars are process-global.
     struct CacheEnvGuard(Option<std::ffi::OsString>);
 
+    #[allow(unsafe_code)] // test-only env mutation, serialised by `env_lock()`
     impl CacheEnvGuard {
         fn set(value: impl AsRef<std::ffi::OsStr>) -> Self {
             let saved = env::var_os("OXIDEAV_VFW_CACHE_PATH");
-            env::set_var("OXIDEAV_VFW_CACHE_PATH", value);
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            unsafe { env::set_var("OXIDEAV_VFW_CACHE_PATH", value) };
             CacheEnvGuard(saved)
         }
         fn unset() -> Self {
             let saved = env::var_os("OXIDEAV_VFW_CACHE_PATH");
-            env::remove_var("OXIDEAV_VFW_CACHE_PATH");
+            // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+            // touches this variable while the guard is held.
+            unsafe { env::remove_var("OXIDEAV_VFW_CACHE_PATH") };
             CacheEnvGuard(saved)
         }
     }
 
+    #[allow(unsafe_code)] // test-only env mutation, serialised by `env_lock()`
     impl Drop for CacheEnvGuard {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(v) => env::set_var("OXIDEAV_VFW_CACHE_PATH", v),
-                None => env::remove_var("OXIDEAV_VFW_CACHE_PATH"),
+                // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+                // touches this variable while the guard is held.
+                Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CACHE_PATH", v) },
+                // SAFETY: env mutation is serialised by `env_lock()`; no other thread
+                // touches this variable while the guard is held.
+                None => unsafe { env::remove_var("OXIDEAV_VFW_CACHE_PATH") },
             }
         }
     }

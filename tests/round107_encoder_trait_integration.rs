@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Frame, VideoFrame, VideoPlane};
-use oxideav_vfw::discovery::{make_encoder, register_factory_for_id, DiscoveryRecord, Kind};
+use oxideav_vfw::discovery::{DiscoveryRecord, Kind, make_encoder, register_factory_for_id};
 
 /// `Kind::Vfw` records construct a `SandboxedVfwEncoder` lazily:
 /// `make_encoder` validates only the FourCC + the output-params

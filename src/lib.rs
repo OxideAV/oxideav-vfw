@@ -31,7 +31,12 @@
 //! work via the re-exports below. New code should depend on
 //! `ud-emulator` directly.
 
-#![forbid(unsafe_code)]
+// The library never uses `unsafe`. The in-crate tests mutate process
+// environment variables (`std::env::set_var` / `remove_var` are `unsafe`
+// since edition 2024), so the test build only denies the lint and scopes
+// an allow to exactly those serialised env-mutation sites.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 #[cfg(feature = "auto-discovery")]
 pub mod discovery;
@@ -44,13 +49,13 @@ pub mod discovery;
 // names stable so consumers don't have to chase the move.
 
 pub use ud_emulator::com::{
-    Guid, GuidParseError, CLSID_MEMORY_ALLOCATOR, IID_IBASEFILTER, IID_ICLASSFACTORY,
+    CLSID_MEMORY_ALLOCATOR, Guid, GuidParseError, IID_IBASEFILTER, IID_ICLASSFACTORY,
     IID_IENUMPINS, IID_IFILTERGRAPH, IID_IMEDIAFILTER, IID_IMEDIASAMPLE, IID_IMEMALLOCATOR,
     IID_IMEMINPUTPIN, IID_IPERSIST, IID_IPIN, IID_IUNKNOWN, MSADDS_AUDIO_DECODER_CLSID,
     MSADDS_AUDIO_PROPERTY_PAGE_CLSID,
 };
 pub use ud_emulator::win32::vfw32::Bih;
-pub use ud_emulator::{Sandbox, DLL_PROCESS_ATTACH};
+pub use ud_emulator::{DLL_PROCESS_ATTACH, Sandbox};
 #[cfg(feature = "trace")]
 pub use ud_emulator::{TraceState, WatchMode, Watchpoint};
 

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use oxideav_core::{CodecId, CodecParameters, PixelFormat};
 use oxideav_vfw::discovery::{
-    codec_id_for, make_decoder, output_pixel_format, register_factory_for_id, DiscoveryRecord, Kind,
+    DiscoveryRecord, Kind, codec_id_for, make_decoder, output_pixel_format, register_factory_for_id,
 };
 
 #[test]

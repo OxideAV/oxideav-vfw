@@ -61,7 +61,8 @@ fn register_against_nonexistent_default_path_clean() {
     let tmp = Tmp::new("default-empty");
     let saved = env::var_os("OXIDEAV_VFW_CODEC_PATH");
     let bogus = tmp.path().join("does-not-exist");
-    env::set_var("OXIDEAV_VFW_CODEC_PATH", &bogus);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", &bogus) };
 
     let mut ctx = RuntimeContext::new();
     oxideav_vfw::register(&mut ctx);
@@ -72,8 +73,10 @@ fn register_against_nonexistent_default_path_clean() {
     // bleed into our assertions.
 
     match saved {
-        Some(v) => env::set_var("OXIDEAV_VFW_CODEC_PATH", v),
-        None => env::remove_var("OXIDEAV_VFW_CODEC_PATH"),
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", v) },
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { env::remove_var("OXIDEAV_VFW_CODEC_PATH") },
     }
 }
 
@@ -81,10 +84,13 @@ fn register_against_nonexistent_default_path_clean() {
 fn register_with_dev_null_and_nonexistent_path() {
     let saved = env::var_os("OXIDEAV_VFW_CODEC_PATH");
     let sep = if cfg!(windows) { ";" } else { ":" };
-    env::set_var(
-        "OXIDEAV_VFW_CODEC_PATH",
-        format!("/dev/null{sep}/tmp/vfw-discovery-nonexistent-xyz"),
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        env::set_var(
+            "OXIDEAV_VFW_CODEC_PATH",
+            format!("/dev/null{sep}/tmp/vfw-discovery-nonexistent-xyz"),
+        )
+    };
 
     let mut ctx = RuntimeContext::new();
     oxideav_vfw::register(&mut ctx);
@@ -93,8 +99,10 @@ fn register_with_dev_null_and_nonexistent_path() {
     // zero codecs.
 
     match saved {
-        Some(v) => env::set_var("OXIDEAV_VFW_CODEC_PATH", v),
-        None => env::remove_var("OXIDEAV_VFW_CODEC_PATH"),
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", v) },
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { env::remove_var("OXIDEAV_VFW_CODEC_PATH") },
     }
 }
 
@@ -111,7 +119,8 @@ fn cache_round_trip_via_discover() {
     let dll = codec_dir.join("synth1.dll");
     fs::write(&dll, b"this is not a real PE32 file").unwrap();
 
-    env::set_var("OXIDEAV_VFW_CODEC_PATH", &codec_dir);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", &codec_dir) };
 
     let v1 = discovery::discover(std::slice::from_ref(&codec_dir));
     assert_eq!(v1.len(), 1, "first call should record the synthetic DLL");
@@ -123,8 +132,10 @@ fn cache_round_trip_via_discover() {
     assert_eq!(v2, v1, "cache hit should produce identical entries");
 
     match saved {
-        Some(v) => env::set_var("OXIDEAV_VFW_CODEC_PATH", v),
-        None => env::remove_var("OXIDEAV_VFW_CODEC_PATH"),
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        Some(v) => unsafe { env::set_var("OXIDEAV_VFW_CODEC_PATH", v) },
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { env::remove_var("OXIDEAV_VFW_CODEC_PATH") },
     }
 }
 

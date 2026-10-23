@@ -21,8 +21,8 @@
 
 use oxideav_core::{CodecId, CodecParameters};
 use oxideav_vfw::discovery::{
-    resolve_encoder_knobs, unrecognized_encoder_knobs, ENCODER_KNOB_DATA_RATE, ENCODER_KNOB_KEYINT,
-    ENCODER_KNOB_KEYS, ENCODER_KNOB_QUALITY,
+    ENCODER_KNOB_DATA_RATE, ENCODER_KNOB_KEYINT, ENCODER_KNOB_KEYS, ENCODER_KNOB_QUALITY,
+    resolve_encoder_knobs, unrecognized_encoder_knobs,
 };
 
 /// The constants spell the exact key strings callers have stored

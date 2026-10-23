@@ -17,7 +17,7 @@
 use std::path::PathBuf;
 
 use oxideav_core::{CodecId, CodecParameters, CodecTag};
-use oxideav_vfw::discovery::{make_encoder, register_factory_for_id, DiscoveryRecord, Kind};
+use oxideav_vfw::discovery::{DiscoveryRecord, Kind, make_encoder, register_factory_for_id};
 
 fn register_vfw(id: &str) {
     register_factory_for_id(

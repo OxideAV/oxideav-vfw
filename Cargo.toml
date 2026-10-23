@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-vfw"
 version = "0.1.1"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 authors = ["Mark Karpeles"]
 description = "Thin bridge that wires the ud-emulator 32-bit x86 / PE32 / Video for Windows sandbox into the oxideav codec registry, plus the FS-walking discovery layer that probes ~/.local/share/oxideav/codecs/ for legitimately-licensed Windows codec DLLs."

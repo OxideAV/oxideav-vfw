@@ -80,16 +80,16 @@ mod codec;
 mod paths;
 mod probe;
 
-pub use cache::{Cache, CacheEntry, CURRENT_SCHEMA_VERSION};
+pub use cache::{CURRENT_SCHEMA_VERSION, Cache, CacheEntry};
 pub use codec::{
-    codec_id_for, last_codec_allocator_negotiation, lookup_record, make_decoder, make_encoder,
+    CodecAllocatorNegotiation, DiscoveryRecord, ENCODER_KNOB_DATA_RATE, ENCODER_KNOB_KEYINT,
+    ENCODER_KNOB_KEYS, ENCODER_KNOB_QUALITY, ENCODER_QUALITY_MAX, EncoderKnobs, codec_id_for,
+    last_codec_allocator_negotiation, lookup_record, make_decoder, make_encoder,
     output_pixel_format, register_factory_for_id, resolve_encoder_knobs,
-    unrecognized_encoder_knobs, CodecAllocatorNegotiation, DiscoveryRecord, EncoderKnobs,
-    ENCODER_KNOB_DATA_RATE, ENCODER_KNOB_KEYINT, ENCODER_KNOB_KEYS, ENCODER_KNOB_QUALITY,
-    ENCODER_QUALITY_MAX,
+    unrecognized_encoder_knobs,
 };
 pub use paths::{cache_file_path, discovery_paths};
-pub use probe::{probe_bytes, probe_dll, Kind, ProbeResult};
+pub use probe::{Kind, ProbeResult, probe_bytes, probe_dll};
 
 /// Whether the `register()` cascade should silently skip a missing
 /// discovery directory (the default — true) or surface it as a

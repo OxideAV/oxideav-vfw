@@ -20,7 +20,7 @@
 #![cfg(feature = "auto-discovery")]
 
 use oxideav_core::{CodecId, CodecParameters};
-use oxideav_vfw::discovery::{resolve_encoder_knobs, EncoderKnobs, ENCODER_QUALITY_MAX};
+use oxideav_vfw::discovery::{ENCODER_QUALITY_MAX, EncoderKnobs, resolve_encoder_knobs};
 
 /// The empty-options case produces an `EncoderKnobs::default()` —
 /// all three knobs land on their `0` sentinel. Locks the contract
