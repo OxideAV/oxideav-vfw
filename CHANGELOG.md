@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.2...v0.2.0) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive discovery records and Kind
+
 ### Changed
 
 - `#[non_exhaustive]`: `discovery::Kind`, `DiscoveryRecord`, `EncoderKnobs`, `CodecAllocatorNegotiation`, `CacheEntry`, `DiscoveryEntry` and `ProbeResult`. Code outside the crate builds `DiscoveryRecord` with `DiscoveryRecord::new` and `EncoderKnobs` with `Default` plus the `with_*` setters, and needs a `_ =>` arm when matching `Kind`.
