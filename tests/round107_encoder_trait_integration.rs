@@ -28,12 +28,7 @@ fn make_encoder_vfw_constructs_lazily_with_dims() {
     let id = "vfw_mp43_round107_encoder_lazy";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/dev/null"),
-            fourcc: "MP43".into(),
-            kind: Kind::Vfw,
-            clsid: None,
-        },
+        DiscoveryRecord::new(PathBuf::from("/dev/null"), "MP43".into(), Kind::Vfw, None),
     );
     let mut params = CodecParameters::video(CodecId::new(id));
     params.width = Some(176);
@@ -56,12 +51,12 @@ fn make_encoder_dshow_kind_is_rejected() {
     let id = "vfw_round107_dshow_encoder_unsupported";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/dev/null"),
-            fourcc: "WMV3".into(),
-            kind: Kind::DirectShow,
-            clsid: Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
-        },
+        DiscoveryRecord::new(
+            PathBuf::from("/dev/null"),
+            "WMV3".into(),
+            Kind::DirectShow,
+            Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
+        ),
     );
     let params = CodecParameters::video(CodecId::new(id));
     assert!(make_encoder(&params).is_err());
@@ -78,12 +73,12 @@ fn send_frame_rejects_audio_before_dll_load() {
     let id = "vfw_mp43_round107_audio_guard";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/this/dll/does/not/exist"),
-            fourcc: "MP43".into(),
-            kind: Kind::Vfw,
-            clsid: None,
-        },
+        DiscoveryRecord::new(
+            PathBuf::from("/this/dll/does/not/exist"),
+            "MP43".into(),
+            Kind::Vfw,
+            None,
+        ),
     );
     let mut params = CodecParameters::video(CodecId::new(id));
     params.width = Some(16);
@@ -114,12 +109,12 @@ fn send_frame_without_dims_errors_before_codec_open() {
     let id = "vfw_mp43_round107_missing_dims";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/this/dll/does/not/exist"),
-            fourcc: "MP43".into(),
-            kind: Kind::Vfw,
-            clsid: None,
-        },
+        DiscoveryRecord::new(
+            PathBuf::from("/this/dll/does/not/exist"),
+            "MP43".into(),
+            Kind::Vfw,
+            None,
+        ),
     );
     // No width/height on params.
     let params = CodecParameters::video(CodecId::new(id));

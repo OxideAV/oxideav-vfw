@@ -31,12 +31,7 @@ fn make_decoder_without_width_constructs_with_get_format_probe_path() {
     let id = "vfw_mp43_round29_test_no_width";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/dev/null"),
-            fourcc: "MP43".into(),
-            kind: Kind::Vfw,
-            clsid: None,
-        },
+        DiscoveryRecord::new(PathBuf::from("/dev/null"), "MP43".into(), Kind::Vfw, None),
     );
     let params = CodecParameters::video(CodecId::new(id));
     let decoder = make_decoder(&params).expect("make_decoder constructs lazily");
@@ -52,12 +47,12 @@ fn make_decoder_dshow_kind_now_constructs_lazily() {
     let id = "vfw_round29_dshow_lazy_construct";
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/dev/null"),
-            fourcc: "WMV3".into(),
-            kind: Kind::DirectShow,
-            clsid: Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
-        },
+        DiscoveryRecord::new(
+            PathBuf::from("/dev/null"),
+            "WMV3".into(),
+            Kind::DirectShow,
+            Some("{82CCD3E0-F71A-11D0-9FE5-00609778EA66}".into()),
+        ),
     );
     let mut params = CodecParameters::video(CodecId::new(id));
     params.width = Some(176);

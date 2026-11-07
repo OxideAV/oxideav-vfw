@@ -74,6 +74,7 @@ const DSHOW_CLSID_CANDIDATES: &[(&str, [u8; 16])] = &[
 
 /// Discovery classification for one probed DLL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// Exports `DriverProc`; `ICOpen` returned a non-NULL HIC for
     /// at least one of the [`VFW_FOURCC_CANDIDATES`].
@@ -87,6 +88,7 @@ pub enum Kind {
 
 /// Result bundle emitted by [`probe_bytes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProbeResult {
     pub kind: Kind,
     pub fourccs: Vec<String>,

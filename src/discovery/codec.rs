@@ -61,11 +61,48 @@ const SANDBOX_INSTR_LIMIT: u64 = 8_000_000_000;
 /// [`oxideav_core::DecoderFactory`] can reach it at
 /// `make_decoder` time.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DiscoveryRecord {
     pub dll_path: PathBuf,
     pub fourcc: String,
     pub kind: Kind,
     pub clsid: Option<String>,
+}
+
+impl DiscoveryRecord {
+    /// Build a record from its mandatory fields.
+    pub fn new(dll_path: PathBuf, fourcc: String, kind: Kind, clsid: Option<String>) -> Self {
+        Self {
+            dll_path,
+            fourcc,
+            kind,
+            clsid,
+        }
+    }
+
+    /// Set `dll_path`.
+    pub fn with_dll_path(mut self, dll_path: PathBuf) -> Self {
+        self.dll_path = dll_path;
+        self
+    }
+
+    /// Set `fourcc`.
+    pub fn with_fourcc(mut self, fourcc: String) -> Self {
+        self.fourcc = fourcc;
+        self
+    }
+
+    /// Set `kind`.
+    pub fn with_kind(mut self, kind: Kind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set `clsid`.
+    pub fn with_clsid(mut self, clsid: Option<String>) -> Self {
+        self.clsid = clsid;
+        self
+    }
 }
 
 /// Process-wide lookup of `codec_id` → [`DiscoveryRecord`].
@@ -105,6 +142,7 @@ pub fn lookup_record(codec_id: &str) -> Option<DiscoveryRecord> {
 /// against the codec's own allocator without having to construct
 /// a parallel sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CodecAllocatorNegotiation {
     /// `IMemInputPin::GetAllocator` HRESULT.
     pub get_allocator_hr: u32,
@@ -260,6 +298,7 @@ pub const ENCODER_KNOB_KEYS: [&str; 3] = [
 /// these as bridge hints, not codec invariants — a typo'd knob
 /// should not block the codec from running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncoderKnobs {
     /// `"quality"` — VfW quality slot, clamped to `0..=`
     /// [`ENCODER_QUALITY_MAX`]. `0` = "codec chooses".
@@ -270,6 +309,26 @@ pub struct EncoderKnobs {
     /// `"data_rate"` — per-frame byte ceiling, raw `u32` (no
     /// clamp). `0` = disabled (codec chooses).
     pub data_rate: u32,
+}
+
+impl EncoderKnobs {
+    /// Set `quality`.
+    pub fn with_quality(mut self, quality: u32) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// Set `keyint`.
+    pub fn with_keyint(mut self, keyint: u32) -> Self {
+        self.keyint = keyint;
+        self
+    }
+
+    /// Set `data_rate`.
+    pub fn with_data_rate(mut self, data_rate: u32) -> Self {
+        self.data_rate = data_rate;
+        self
+    }
 }
 
 impl Default for EncoderKnobs {

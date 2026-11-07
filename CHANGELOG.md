@@ -6,6 +6,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `#[non_exhaustive]`: `discovery::Kind`, `DiscoveryRecord`, `EncoderKnobs`, `CodecAllocatorNegotiation`, `CacheEntry`, `DiscoveryEntry` and `ProbeResult`. Code outside the crate builds `DiscoveryRecord` with `DiscoveryRecord::new` and `EncoderKnobs` with `Default` plus the `with_*` setters, and needs a `_ =>` arm when matching `Kind`.
+
+### Added
+
+- `DiscoveryRecord::new(dll_path, fourcc, kind, clsid)` plus `with_*` setters; `EncoderKnobs::with_quality` / `with_keyint` / `with_data_rate`.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-vfw/compare/v0.1.1...v0.1.2) - 2026-10-23
 
 ### Other

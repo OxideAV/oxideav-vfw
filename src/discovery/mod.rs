@@ -100,6 +100,7 @@ const ALLOW_MISSING_DIR: bool = true;
 /// One probed DLL → its (possibly empty) list of recognised
 /// FourCCs. The cache JSON stores a `Vec` of these.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiscoveryEntry {
     pub path: PathBuf,
     pub mtime_unix: i64,

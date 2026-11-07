@@ -55,6 +55,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 /// separate type exists so we can freely evolve the in-memory
 /// representation without rewriting the on-disk schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CacheEntry {
     pub path: PathBuf,
     pub mtime_unix: i64,

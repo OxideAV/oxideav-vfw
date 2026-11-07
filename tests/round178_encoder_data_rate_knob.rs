@@ -22,12 +22,7 @@ use oxideav_vfw::discovery::{DiscoveryRecord, Kind, make_encoder, register_facto
 fn register_vfw(id: &str) {
     register_factory_for_id(
         id,
-        DiscoveryRecord {
-            dll_path: PathBuf::from("/dev/null"),
-            fourcc: "MP43".into(),
-            kind: Kind::Vfw,
-            clsid: None,
-        },
+        DiscoveryRecord::new(PathBuf::from("/dev/null"), "MP43".into(), Kind::Vfw, None),
     );
 }
 
